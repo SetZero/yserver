@@ -5718,6 +5718,7 @@ fn handle_sync_request(
                 sequence,
                 alarm.counter,
                 alarm.wait_value,
+                u32::from(alarm.test_type),
                 alarm.delta,
                 alarm.events,
                 alarm.state,
@@ -61177,6 +61178,71 @@ mod tests {
             );
         }
         assert!(f.state.sync_alarms.contains_key(&ALARM));
+    }
+
+    /// QueryAlarm → (counter, value type, wait value, test type, delta,
+    /// events, state), per `xSyncQueryAlarmReply`.
+    fn query_alarm_fields(f: &mut SyncFixture, alarm: u32) -> (u32, u32, i64, u32, i64, u8, u8) {
+        use yserver_protocol::x11::sync as s;
+        f.b(s::QUERY_ALARM, &alarm.to_le_bytes());
+        let r = read_all_available(&mut f.peer_b);
+        assert_eq!((r.len(), r[0]), (40, 1), "QueryAlarm reply");
+        let i64_at = |at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(&r, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(&r, at + 4))
+        };
+        (
+            le_u32(&r, 8),
+            le_u32(&r, 12),
+            i64_at(16),
+            le_u32(&r, 24),
+            i64_at(28),
+            r[36],
+            r[37],
+        )
+    }
+
+    /// Xvfb: QueryAlarm reports the alarm's test type (a fresh alarm's
+    /// default is PositiveComparison, 2) and, as Xorg's
+    /// `ProcSyncQueryAlarm`, always value type Absolute with the resolved
+    /// wait value.
+    #[test]
+    fn sync_query_alarm_reports_the_test_type() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_0080;
+        const AN: u32 = 0x0010_0081;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(AL, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C1, 0, 10]),
+        );
+        assert_eq!(
+            query_alarm_fields(&mut f, AL),
+            (
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_COMPARISON,
+                1,
+                1,
+                s::ALARM_STATE_ACTIVE
+            )
+        );
+        f.a(s::CREATE_ALARM, &sync_alarm_body(AN, s::CA_VALUE, &[0, 5]));
+        assert_eq!(
+            query_alarm_fields(&mut f, AN),
+            (
+                0,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                1,
+                1,
+                s::ALARM_STATE_INACTIVE
+            )
+        );
     }
 
     /// Every AlarmNotify in `packets` → (alarm, counter value, alarm

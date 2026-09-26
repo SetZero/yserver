@@ -484,15 +484,18 @@ pub fn encode_query_alarm_reply(
     sequence: SequenceNumber,
     counter: u32,
     wait_value: i64,
+    test_type: u32,
     delta: i64,
     events: bool,
     state: u8,
 ) -> Vec<u8> {
     let mut out = fixed_reply(byte_order, sequence, 2);
     write_u32(byte_order, &mut out, counter);
-    write_u32(byte_order, &mut out, 0); // absolute value
+    // Xorg `ProcSyncQueryAlarm` always answers Absolute with the resolved
+    // test value (its value-type branch is `#if 0`'d out).
+    write_u32(byte_order, &mut out, VALUE_TYPE_ABSOLUTE);
     write_i64(byte_order, &mut out, wait_value);
-    write_u32(byte_order, &mut out, 0); // positive transition
+    write_u32(byte_order, &mut out, test_type);
     write_i64(byte_order, &mut out, delta);
     out.push(u8::from(events));
     out.push(state);
@@ -773,6 +776,7 @@ mod tests {
             SequenceNumber(2),
             7,
             0,
+            TEST_NEGATIVE_COMPARISON,
             0,
             false,
             0,
@@ -780,6 +784,11 @@ mod tests {
         assert_eq!(reply.len(), 40);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(reply[24..28].try_into().unwrap()),
+            TEST_NEGATIVE_COMPARISON,
+            "test type at xSyncQueryAlarmReply offset 24"
+        );
     }
 
     // Canonical SYNC minor-opcode values, sourced from
