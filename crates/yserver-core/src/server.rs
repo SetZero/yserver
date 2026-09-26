@@ -2172,9 +2172,15 @@ pub struct SyncAlarm {
     pub delta: i64,
     /// `XSyncTestType` (PositiveTransition=0 … NegativeComparison=3).
     pub test_type: u8,
+    /// Whether the owner receives this alarm's `AlarmNotify` events
+    /// (Xorg `pAlarm->events`; what QueryAlarm reports).
     pub events: bool,
     /// `XSyncAlarmState` (Active=0, Inactive=1, Destroyed=2).
     pub state: u8,
+    /// Clients other than the owner that selected `AlarmNotify` with the
+    /// `events` attribute of a ChangeAlarm, newest first (Xorg
+    /// `pAlarm->pEventClients`; `SyncEventSelectForAlarm` prepends).
+    pub event_clients: Vec<ClientId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2364,6 +2370,7 @@ impl Default for SyncAlarm {
             test_type: 0,
             events: false,
             state: 0,
+            event_clients: Vec::new(),
         }
     }
 }
@@ -6119,6 +6126,7 @@ mod tests {
                     test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                     events: true,
                     state: x11sync::ALARM_STATE_ACTIVE,
+                    event_clients: Vec::new(),
                 },
             );
         }
@@ -6154,6 +6162,7 @@ mod tests {
                 test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6173,6 +6182,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_INACTIVE,
+                event_clients: Vec::new(),
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6201,6 +6211,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         assert!(
@@ -6228,6 +6239,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());

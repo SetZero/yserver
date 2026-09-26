@@ -5505,6 +5505,7 @@ mod tests {
                 test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
                 events: false,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         let xid_map = HostXidMap::new();
@@ -5555,6 +5556,7 @@ mod tests {
                 test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
                 events: true, // load-bearing
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         let xid_map = HostXidMap::new();

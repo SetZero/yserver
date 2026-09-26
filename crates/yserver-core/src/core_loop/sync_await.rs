@@ -12,6 +12,10 @@
 //! Xorg's `SyncAwaitTriggerFired` would and removes the entry, which makes
 //! the client runnable again (`AttendClient`). Nothing here ever blocks the
 //! loop itself.
+//!
+//! Alarm lifetime and `AlarmNotify` delivery live here too: the owner's
+//! own `events` flag plus the list of other clients that selected the
+//! alarm's events (Xorg `pEventClients`).
 
 use yserver_protocol::x11::{ClientId, sync as x11sync};
 
@@ -208,6 +212,100 @@ pub(crate) fn counter_changed(state: &mut ServerState, counter: u32, old: i64, n
     }
 }
 
+/// Xorg `SyncSendAlarmNotifyEvents`: an `AlarmNotify` for `alarm_id`
+/// (its current wait value and state, the counter at `counter_value`) to
+/// the owner if its `events` flag is set, then to every other client that
+/// selected the alarm's events. Clients already gone are skipped.
+pub(crate) fn send_alarm_notify(state: &mut ServerState, alarm_id: u32, counter_value: i64) {
+    let Some(alarm) = state.sync_alarms.get(&alarm_id) else {
+        return;
+    };
+    let mut recipients: Vec<ClientId> = Vec::with_capacity(1 + alarm.event_clients.len());
+    if alarm.events {
+        recipients.push(alarm.owner);
+    }
+    recipients.extend(alarm.event_clients.iter().copied());
+    if recipients.is_empty() {
+        return;
+    }
+    let (wait, alarm_state) = (alarm.wait_value, alarm.state);
+    let time = state.timestamp_now();
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        buf.extend_from_slice(&x11sync::encode_alarm_notify_event(
+            order,
+            crate::nested::SYNC_FIRST_EVENT,
+            seq,
+            alarm_id,
+            counter_value,
+            wait,
+            time,
+            alarm_state,
+        ));
+    });
+}
+
+/// Xorg `SyncEventSelectForAlarm`, run by CreateAlarm / ChangeAlarm for an
+/// `events` value: the owner sets its own flag; any other client joins
+/// the alarm's event-client list (once, newest first) or leaves it.
+pub(crate) fn select_alarm_events(
+    state: &mut ServerState,
+    alarm_id: u32,
+    client: ClientId,
+    want: bool,
+) {
+    let Some(alarm) = state.sync_alarms.get_mut(&alarm_id) else {
+        return;
+    };
+    if client == alarm.owner {
+        alarm.events = want;
+        return;
+    }
+    let present = alarm.event_clients.contains(&client);
+    if want && !present {
+        alarm.event_clients.insert(0, client);
+    } else if !want && present {
+        alarm.event_clients.retain(|c| *c != client);
+    }
+}
+
+/// Xorg `FreeAlarm` (DestroyAlarm, or the owner's disconnect): the alarm
+/// goes Destroyed, the owner (if selected) and every selecting client get
+/// an `AlarmNotify` saying so, and it is removed.
+pub(crate) fn destroy_alarm(state: &mut ServerState, alarm_id: u32) {
+    let Some(alarm) = state.sync_alarms.get_mut(&alarm_id) else {
+        return;
+    };
+    alarm.state = x11sync::ALARM_STATE_DESTROYED;
+    let counter = alarm.counter;
+    let value = if counter == 0 {
+        0
+    } else {
+        counter_value(state, counter).unwrap_or(0)
+    };
+    send_alarm_notify(state, alarm_id, value);
+    state.sync_alarms.remove(&alarm_id);
+}
+
+/// A client disconnected: its alarms are destroyed (notifying the other
+/// clients that selected them) and it leaves every other alarm's
+/// event-client list (Xorg `FreeAlarm` / `FreeAlarmClient` for the
+/// client's resources).
+pub(crate) fn release_client_alarms(state: &mut ServerState, client: ClientId) {
+    for alarm in state.sync_alarms.values_mut() {
+        alarm.event_clients.retain(|c| *c != client);
+    }
+    let mut owned: Vec<u32> = state
+        .sync_alarms
+        .iter()
+        .filter(|(_, a)| a.owner == client)
+        .map(|(id, _)| *id)
+        .collect();
+    owned.sort_unstable();
+    for alarm_id in owned {
+        destroy_alarm(state, alarm_id);
+    }
+}
+
 /// Xorg `FreeCounter`: `counter` (last value `last`) is gone. Its alarms
 /// go Inactive with an AlarmNotify and stop watching it
 /// (`SyncAlarmCounterDestroyed`); every await naming it fires with a
@@ -220,27 +318,14 @@ pub(crate) fn counter_destroyed(state: &mut ServerState, counter: u32, last: i64
         .map(|(id, _)| *id)
         .collect();
     alarms.sort_unstable();
-    let time = state.timestamp_now();
     for alarm_id in alarms {
         let Some(alarm) = state.sync_alarms.get_mut(&alarm_id) else {
             continue;
         };
         alarm.state = x11sync::ALARM_STATE_INACTIVE;
-        alarm.counter = 0;
-        let (owner, events, wait) = (alarm.owner, alarm.events, alarm.wait_value);
-        if events {
-            let _dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-                buf.extend_from_slice(&x11sync::encode_alarm_notify_event(
-                    order,
-                    crate::nested::SYNC_FIRST_EVENT,
-                    seq,
-                    alarm_id,
-                    last,
-                    wait,
-                    time,
-                    x11sync::ALARM_STATE_INACTIVE,
-                ));
-            });
+        send_alarm_notify(state, alarm_id, last);
+        if let Some(alarm) = state.sync_alarms.get_mut(&alarm_id) {
+            alarm.counter = 0;
         }
     }
     let fired = awaiting_clients(

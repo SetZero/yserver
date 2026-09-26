@@ -227,7 +227,9 @@ pub struct AlarmAttributes {
     pub value: Option<i64>,
     pub test_type: Option<u32>,
     pub delta: Option<i64>,
-    pub events: Option<bool>,
+    /// The raw `events` word: Xorg accepts only True (1) and False (0)
+    /// and answers anything else with BadValue naming it.
+    pub events: Option<u32>,
 }
 
 /// Parse a `CreateAlarm`/`ChangeAlarm` body: `alarm(4) value-mask(4)
@@ -284,7 +286,7 @@ pub fn parse_alarm_attributes(body: &[u8]) -> Option<(u32, AlarmAttributes)> {
         if list.len() < off + 4 {
             return None;
         }
-        attrs.events = Some(list[off] != 0);
+        attrs.events = Some(read_u32_le(&list[off..]));
     }
     Some((alarm, attrs))
 }
@@ -618,7 +620,7 @@ mod tests {
         assert_eq!(attrs.value, Some(1));
         assert_eq!(attrs.test_type, Some(TEST_POSITIVE_COMPARISON));
         assert_eq!(attrs.delta, Some(1));
-        assert_eq!(attrs.events, Some(true));
+        assert_eq!(attrs.events, Some(1));
     }
 
     #[test]
@@ -636,7 +638,7 @@ mod tests {
         assert_eq!(attrs.counter, Some(0xabcd));
         assert_eq!(attrs.value_type, None);
         assert_eq!(attrs.value, None);
-        assert_eq!(attrs.events, Some(false));
+        assert_eq!(attrs.events, Some(0));
     }
 
     /// Xorg's CreateAlarm / ChangeAlarm length rule: a word per mask bit,

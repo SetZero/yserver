@@ -5404,6 +5404,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                 events: false, // skip wire delivery; assert state mutation only
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         let mut backend = RecordingBackend::default();

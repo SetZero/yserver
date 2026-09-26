@@ -361,13 +361,14 @@ pub fn process_disconnect_reporting(
         .shape_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
     // SYNC: the client's own await dies with it (Xorg `FreeAwait`); its
-    // counters and fences are destroyed, which fires other clients' awaits
-    // on them with destroyed CounterNotify and deactivates alarms watching
-    // its counters (Xorg `FreeCounter` / `miSyncDestroyFence`).
+    // alarms are destroyed, telling the other clients that selected them
+    // (`FreeAlarm`), and it leaves other alarms' event lists
+    // (`FreeAlarmClient`); its counters and fences are destroyed, which
+    // fires other clients' awaits on them with destroyed CounterNotify and
+    // deactivates alarms watching its counters (Xorg `FreeCounter` /
+    // `miSyncDestroyFence`).
     state.sync_awaits.remove(&client_id.0);
-    state
-        .sync_alarms
-        .retain(|_, alarm| alarm.owner != client_id);
+    crate::core_loop::sync_await::release_client_alarms(state, client_id);
     let mut dead_counters: Vec<(u32, i64)> = state
         .sync_counters
         .iter()

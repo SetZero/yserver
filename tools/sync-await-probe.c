@@ -271,6 +271,18 @@ static void alarms(xcb_connection_t *a, xcb_connection_t *b) {
     drain_alarms(b, "B");
     xcb_sync_destroy_alarm(b, an);
     drain_alarms(b, "B");
+
+    printf("== counter destroyed under an alarm B selected\n");
+    xcb_sync_counter_t c2 = xcb_generate_id(a);
+    xcb_sync_create_counter(a, c2, i64(3));
+    xcb_sync_alarm_t a2 = xcb_generate_id(a);
+    { uint32_t v[] = { c2, 0, 50 }; xcb_sync_create_alarm(a, a2, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE, v); }
+    sync_rt(a);
+    alarm_events(b, a2, 1); sync_rt(b);
+    xcb_sync_destroy_counter(a, c2); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B");
+    xcb_sync_destroy_alarm(a, a2); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B");
     xcb_sync_destroy_counter(a, c); sync_rt(a);
 }
 

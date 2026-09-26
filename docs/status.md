@@ -148,9 +148,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   skips positive transitions on a never-decreasing counter), which only
   ever hangs the client. Not done: xshmfence-backed fences triggered by the
   client itself are not observed by AwaitFence/QueryFence (Xorg queries
-  the shared memory); the alarm event-client list. ChangeAlarm /
-  QueryAlarm / DestroyAlarm on a missing alarm answer BadAlarm in Xorg's
-  check order (size, lookup, then the value list against the mask).
+  the shared memory). ChangeAlarm / QueryAlarm / DestroyAlarm on a missing
+  alarm answer BadAlarm in Xorg's check order (size, lookup, then the value
+  list against the mask). Alarms keep Xorg's event-client list: any client
+  may ChangeAlarm (events selects AlarmNotify for it; the owner's flag is
+  separate) or DestroyAlarm; every AlarmNotify — fired, Inactive on counter
+  destruction, Destroyed on DestroyAlarm or the owner's disconnect — goes
+  to the owner (if selected) and each selecting client; CreateAlarm uses
+  Xorg's defaults and counterless alarms behave as Xorg's. Alarm attribute
+  validation beyond `events` (BadValue test/value type, BadMatch delta
+  sign, BadCounter) is still missing.
 
 - **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
   now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,

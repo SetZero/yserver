@@ -5518,45 +5518,89 @@ fn handle_sync_request(
             crate::core_loop::sync_await::begin_await(state, client_id, waits);
         }
         x11sync::CREATE_ALARM => {
-            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body) {
-                let mut a = crate::server::SyncAlarm {
-                    owner: client_id,
-                    state: x11sync::ALARM_STATE_ACTIVE,
-                    events: true,
-                    ..crate::server::SyncAlarm::default()
-                };
-                apply_alarm_attributes(state, &mut a, &attrs);
-                let counter = a.counter;
-                let class = state
-                    .client_wm_class
-                    .get(&client_id.0)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                log::trace!(
-                    "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
-                     counter={cname}(0x{counter:x}) test={test} \
-                     wait_value={wait} delta={delta} events={events}",
-                    client_id.0,
-                    cname = sync_counter_name(counter),
-                    test = sync_test_type_name(u32::from(a.test_type)),
-                    wait = a.wait_value,
-                    delta = a.delta,
-                    events = a.events,
+            // Xorg `ProcSyncCreateAlarm`: the value list must match the mask.
+            let Some((alarm, mask)) = x11sync::parse_alarm_with_mask(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
                 );
-                state.sync_alarms.insert(alarm, a);
-                // Per the X Synchronization Extension spec the trigger is
-                // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately. For IDLETIME-family
-                // counters the value is derived from last_activity rather
-                // than `sync_counters`.
-                // System counters (SERVERTIME, IDLETIME) read the clock.
-                let now_value =
-                    crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
-                if counter == x11sync::SERVERTIME_COUNTER {
-                    state.sync_servertime_last = Some(now_value);
-                }
-                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+            };
+            if body.len() != x11sync::alarm_request_len(mask) {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
             }
+            let Some((_, attrs)) = x11sync::parse_alarm_attributes(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
+            };
+            if let Some(events) = attrs.events
+                && events > 1
+            {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_VALUE,
+                    events,
+                );
+            }
+            // Xorg's defaults: no counter, Absolute 0, PositiveComparison,
+            // delta 1, the owner selected for events.
+            let mut a = crate::server::SyncAlarm {
+                owner: client_id,
+                state: x11sync::ALARM_STATE_ACTIVE,
+                events: attrs.events != Some(0),
+                test_type: u8::try_from(x11sync::TEST_POSITIVE_COMPARISON).unwrap_or(0),
+                delta: 1,
+                ..crate::server::SyncAlarm::default()
+            };
+            apply_alarm_attributes(state, &mut a, &attrs);
+            let counter = a.counter;
+            let class = state
+                .client_wm_class
+                .get(&client_id.0)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            log::trace!(
+                "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
+                 counter={cname}(0x{counter:x}) test={test} \
+                 wait_value={wait} delta={delta} events={events}",
+                client_id.0,
+                cname = sync_counter_name(counter),
+                test = sync_test_type_name(u32::from(a.test_type)),
+                wait = a.wait_value,
+                delta = a.delta,
+                events = a.events,
+            );
+            if counter == 0 {
+                // "NULL counter will not trigger in CreateAlarm and sets
+                // alarm state to Inactive" (Xorg).
+                a.state = x11sync::ALARM_STATE_INACTIVE;
+                state.sync_alarms.insert(alarm, a);
+                return Ok(RequestOutcome::Handled);
+            }
+            state.sync_alarms.insert(alarm, a);
+            // The trigger is tested at creation: a comparison whose
+            // condition already holds fires at once. System counters
+            // (SERVERTIME, IDLETIME) read the clock.
+            check_new_alarm_trigger(state, alarm, counter);
         }
         x11sync::CHANGE_ALARM => {
             // Xorg `ProcSyncChangeAlarm`: minimum size, then the alarm
@@ -5585,41 +5629,67 @@ fn handle_sync_request(
                     alarm,
                 );
             }
-            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body)
-                && let Some(mut a) = state.sync_alarms.get(&alarm).cloned()
-            {
-                apply_alarm_attributes(state, &mut a, &attrs);
-                a.state = x11sync::ALARM_STATE_ACTIVE;
-                let counter = a.counter;
-                let class = state
-                    .client_wm_class
-                    .get(&client_id.0)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                log::trace!(
-                    "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
-                     counter={cname}(0x{counter:x}) test={test} \
-                     wait_value={wait} delta={delta} events={events}",
-                    client_id.0,
-                    cname = sync_counter_name(counter),
-                    test = sync_test_type_name(u32::from(a.test_type)),
-                    wait = a.wait_value,
-                    delta = a.delta,
-                    events = a.events,
+            let Some((_, attrs)) = x11sync::parse_alarm_attributes(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
                 );
-                state.sync_alarms.insert(alarm, a);
-                // Per the X Synchronization Extension spec the trigger is
-                // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately. For IDLETIME-family
-                // counters the value is derived from last_activity rather
-                // than `sync_counters`.
-                // System counters (SERVERTIME, IDLETIME) read the clock.
-                let now_value =
-                    crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
-                if counter == x11sync::SERVERTIME_COUNTER {
-                    state.sync_servertime_last = Some(now_value);
+            };
+            // Xorg `SyncChangeAlarmAttributes`: any client may change an
+            // alarm. `events` must be True or False; it selects AlarmNotify
+            // for the requesting client — the owner's own flag, or a place
+            // on the alarm's event-client list for anyone else.
+            if let Some(events) = attrs.events {
+                if events > 1 {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        events,
+                    );
                 }
-                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+                crate::core_loop::sync_await::select_alarm_events(
+                    state,
+                    alarm,
+                    client_id,
+                    events == 1,
+                );
+            }
+            let Some(mut a) = state.sync_alarms.get(&alarm).cloned() else {
+                return Ok(RequestOutcome::Handled);
+            };
+            apply_alarm_attributes(state, &mut a, &attrs);
+            a.state = x11sync::ALARM_STATE_ACTIVE;
+            let counter = a.counter;
+            let class = state
+                .client_wm_class
+                .get(&client_id.0)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            log::trace!(
+                "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
+                 counter={cname}(0x{counter:x}) test={test} \
+                 wait_value={wait} delta={delta} events={events}",
+                client_id.0,
+                cname = sync_counter_name(counter),
+                test = sync_test_type_name(u32::from(a.test_type)),
+                wait = a.wait_value,
+                delta = a.delta,
+                events = a.events,
+            );
+            state.sync_alarms.insert(alarm, a);
+            if counter == 0 {
+                // "NULL counter WILL trigger in ChangeAlarm" (Xorg): the
+                // alarm goes Inactive with an AlarmNotify.
+                alarm_trigger_fired(state, alarm, 0);
+            } else {
+                check_new_alarm_trigger(state, alarm, counter);
             }
         }
         x11sync::QUERY_ALARM => {
@@ -5674,7 +5744,9 @@ fn handle_sync_request(
             if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
                 return outcome;
             }
-            state.sync_alarms.remove(&alarm);
+            // Xorg `FreeAlarm`: any client may destroy it; a Destroyed
+            // AlarmNotify goes to the owner and the selecting clients.
+            crate::core_loop::sync_await::destroy_alarm(state, alarm);
         }
         x11sync::CREATE_FENCE => {
             if let Some(req) = x11sync::parse_create_fence(body) {
@@ -5831,9 +5903,9 @@ fn handle_sync_request(
 /// resolving the `wait_value` against the watched counter's current
 /// value (Relative alarms add `value` to the counter; Absolute alarms
 /// take `value` directly). Only attributes whose mask bit was set are
-/// applied. muffin sets every attribute in a single `CreateAlarm`, so
-/// the per-field defaults below are not load-bearing for the Cinnamon
-/// path.
+/// applied. `events` is not an attribute of the alarm but an event
+/// selection by the requesting client (`select_alarm_events`), so the
+/// caller handles it.
 fn apply_alarm_attributes(
     state: &ServerState,
     alarm: &mut crate::server::SyncAlarm,
@@ -5848,9 +5920,6 @@ fn apply_alarm_attributes(
     }
     if let Some(delta) = attrs.delta {
         alarm.delta = delta;
-    }
-    if let Some(events) = attrs.events {
-        alarm.events = events;
     }
     if attrs.value.is_some() || attrs.value_type.is_some() {
         let value = attrs.value.unwrap_or(0);
@@ -6045,9 +6114,11 @@ fn sync_alarm_state_name(state: u8) -> &'static str {
     }
 }
 
-/// This is the frame-timing signal mutter/muffin waits on before
-/// compositing a client frame and emitting `_NET_WM_FRAME_DRAWN`, and
-/// also the idle/wake pair used by mate-power-manager.
+/// Run the alarms watching `counter` for a change from `old` to `new`
+/// (Xorg `SyncChangeCounter` → each alarm trigger's `CheckTrigger`). This
+/// is the frame-timing signal mutter/muffin waits on before compositing a
+/// client frame and emitting `_NET_WM_FRAME_DRAWN`, and also the
+/// idle/wake pair used by mate-power-manager.
 pub(crate) fn evaluate_alarms_for_counter(
     state: &mut ServerState,
     counter: u32,
@@ -6055,107 +6126,108 @@ pub(crate) fn evaluate_alarms_for_counter(
     new: i64,
 ) {
     use yserver_protocol::x11::sync as x11sync;
-    let candidates: Vec<u32> = state
+    let mut candidates: Vec<u32> = state
         .sync_alarms
         .iter()
-        .filter(|(_, a)| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE)
+        .filter(|(_, a)| {
+            a.counter == counter
+                && a.state == x11sync::ALARM_STATE_ACTIVE
+                && x11sync::trigger_fires(a.test_type.into(), old, new, a.wait_value)
+        })
         .map(|(id, _)| *id)
         .collect();
-    if candidates.is_empty() {
+    candidates.sort_unstable();
+    for alarm_id in candidates {
+        alarm_trigger_fired(state, alarm_id, new);
+    }
+}
+
+/// The trigger test CreateAlarm / ChangeAlarm run on the one alarm they
+/// set up: its counter's current value, as both old and new (so only a
+/// comparison can already hold).
+fn check_new_alarm_trigger(state: &mut ServerState, alarm_id: u32, counter: u32) {
+    use yserver_protocol::x11::sync as x11sync;
+    let now_value = crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
+    if counter == x11sync::SERVERTIME_COUNTER {
+        state.sync_servertime_last = Some(now_value);
+    }
+    let holds = state.sync_alarms.get(&alarm_id).is_some_and(|a| {
+        x11sync::trigger_fires(a.test_type.into(), now_value, now_value, a.wait_value)
+    });
+    if holds {
+        alarm_trigger_fired(state, alarm_id, now_value);
+    }
+}
+
+/// Xorg `SyncAlarmTriggerFired`: alarm `alarm_id` went off with its
+/// counter at `value` (0 and no counter for a counterless alarm). A
+/// counterless alarm, or a comparison with delta 0, goes Inactive;
+/// otherwise the wait value advances by delta until the test no longer
+/// holds (Inactive, value kept, on INT64 overflow). The `AlarmNotify`
+/// carries the new state and the old wait value; the new wait value is
+/// stored after it is sent.
+pub(crate) fn alarm_trigger_fired(state: &mut ServerState, alarm_id: u32, value: i64) {
+    use yserver_protocol::x11::sync as x11sync;
+    let Some(a) = state.sync_alarms.get(&alarm_id) else {
+        return;
+    };
+    if a.state != x11sync::ALARM_STATE_ACTIVE {
         return;
     }
-    let time = state.timestamp_now();
-    for alarm_id in candidates {
-        let Some(a) = state.sync_alarms.get(&alarm_id) else {
-            continue;
-        };
-        let test_type: u32 = a.test_type.into();
-        if !x11sync::trigger_fires(test_type, old, new, a.wait_value) {
-            continue;
-        }
-        let owner = a.owner;
-        let events = a.events;
-        let fired_wait = a.wait_value;
-        let delta = a.delta;
-
-        // Per Xorg sync.c:548-555: state → Inactive when
-        // delta==0 AND test_type is Comparison.
-        // Transitions with delta=0 stay Active — once the edge passes,
-        // the alarm sits quiescent waiting for the next crossing.
-        // Per Xorg sync.c:589-597: re-arm overflow → state Inactive
-        // (test_value left unmodified).
-        let is_comparison = matches!(
-            test_type,
-            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
-        );
-        let (new_wait, new_state) = if delta == 0 && is_comparison {
-            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
-        } else if delta == 0 {
-            // Transition + delta=0: stay Active, wait_value unchanged.
-            (fired_wait, x11sync::ALARM_STATE_ACTIVE)
-        } else {
-            // delta != 0: re-arm by adding delta until trigger stops firing.
-            // Overflow on the addition → state Inactive, wait_value reverts
-            // to fired_wait (Xorg sync.c:589-597).
-            let mut w = fired_wait;
-            let mut guard = 0u32;
-            let mut overflowed = false;
-            while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
-                match w.checked_add(delta) {
-                    Some(next) if next != w => {
-                        w = next;
-                        guard += 1;
-                    }
-                    Some(_) => break, // unreachable: delta != 0 (outer branch) + no overflow ⇒ next != w; defensive
-                    None => {
-                        overflowed = true;
-                        break;
-                    }
+    let test_type: u32 = a.test_type.into();
+    let (owner, counter, fired_wait, delta) = (a.owner, a.counter, a.wait_value, a.delta);
+    let is_comparison = matches!(
+        test_type,
+        x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
+    );
+    let (new_wait, new_state) = if counter == 0 || (delta == 0 && is_comparison) {
+        (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+    } else if delta == 0 {
+        // Transition + delta 0: stays Active with the same wait value;
+        // it fires again on the next crossing.
+        (fired_wait, x11sync::ALARM_STATE_ACTIVE)
+    } else {
+        let mut w = fired_wait;
+        let mut guard = 0u32;
+        let mut overflowed = false;
+        while x11sync::comparison_satisfied(test_type, value, w) && guard < 1_000_000 {
+            match w.checked_add(delta) {
+                Some(next) => {
+                    w = next;
+                    guard += 1;
+                }
+                None => {
+                    overflowed = true;
+                    break;
                 }
             }
-            if overflowed {
-                (fired_wait, x11sync::ALARM_STATE_INACTIVE)
-            } else {
-                (w, x11sync::ALARM_STATE_ACTIVE)
-            }
-        };
-
-        if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
-            a.wait_value = new_wait;
-            a.state = new_state;
         }
-
-        let owner_class = state
-            .client_wm_class
-            .get(&owner.0)
-            .map(String::as_str)
-            .unwrap_or("<unknown>");
-        log::debug!(
-            "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
-             counter={counter_name}(0x{counter:x}) test={test} \
-             old={old} new={new} wait={fired_wait} \
-             → state={state_name} (events={events})",
-            owner_id = owner.0,
-            counter_name = sync_counter_name(counter),
-            test = sync_test_type_name(test_type),
-            state_name = sync_alarm_state_name(new_state),
-        );
-
-        if events {
-            let _dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-                let evt = x11sync::encode_alarm_notify_event(
-                    order,
-                    crate::nested::SYNC_FIRST_EVENT,
-                    seq,
-                    alarm_id,
-                    new,
-                    fired_wait,
-                    time,
-                    new_state,
-                );
-                buf.extend_from_slice(&evt);
-            });
+        if overflowed {
+            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else {
+            (w, x11sync::ALARM_STATE_ACTIVE)
         }
+    };
+    let owner_class = state
+        .client_wm_class
+        .get(&owner.0)
+        .map(String::as_str)
+        .unwrap_or("<unknown>");
+    log::debug!(
+        "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
+         counter={counter_name}(0x{counter:x}) test={test} \
+         value={value} wait={fired_wait} → state={state_name}",
+        owner_id = owner.0,
+        counter_name = sync_counter_name(counter),
+        test = sync_test_type_name(test_type),
+        state_name = sync_alarm_state_name(new_state),
+    );
+    if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+        a.state = new_state;
+    }
+    crate::core_loop::sync_await::send_alarm_notify(state, alarm_id, value);
+    if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+        a.wait_value = new_wait;
     }
 }
 
@@ -60511,6 +60583,9 @@ mod tests {
         fn b_packets(&mut self) -> Vec<[u8; 32]> {
             wire_packets(&mut self.peer_b)
         }
+        fn a_packets(&mut self) -> Vec<[u8; 32]> {
+            wire_packets(&mut self._peer_a)
+        }
     }
 
     /// Xvfb: B awaits c1 >= 5 (PositiveComparison); A sets 3 → B stays
@@ -60753,6 +60828,7 @@ mod tests {
                 test_type: u8::try_from(s::TEST_POSITIVE_COMPARISON).unwrap(),
                 events: true,
                 state: s::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
         f.a(s::DESTROY_COUNTER, &SYNC_C1.to_le_bytes());
@@ -61093,6 +61169,239 @@ mod tests {
             );
         }
         assert!(f.state.sync_alarms.contains_key(&ALARM));
+    }
+
+    /// Every AlarmNotify in `packets` → (alarm, counter value, alarm
+    /// value, state).
+    fn alarm_notifies(packets: &[[u8; 32]]) -> Vec<(u32, i64, i64, u8)> {
+        let i64_at = |p: &[u8; 32], at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(p, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(p, at + 4))
+        };
+        packets
+            .iter()
+            .filter(|p| p[0] == crate::nested::SYNC_FIRST_EVENT + 1)
+            .map(|p| {
+                assert_eq!(p[1], 1, "kind AlarmNotify");
+                (le_u32(p, 4), i64_at(p, 8), i64_at(p, 16), p[28])
+            })
+            .collect()
+    }
+
+    fn sync_events_body(alarm: u32, on: u32) -> Vec<u8> {
+        use yserver_protocol::x11::sync as s;
+        sync_alarm_body(alarm, s::CA_EVENTS, &[on])
+    }
+
+    /// Xvfb (tools/sync-await-probe.c, "AlarmNotify selection"): an alarm
+    /// owned by A (c >= 10, delta 1, events). B and D select AlarmNotify
+    /// with ChangeAlarm(events=True) — any client may — and every firing
+    /// reaches the owner (while its own flag is set) and each selecting
+    /// client once. events=False by B removes B; by A clears only the
+    /// owner's flag (what QueryAlarm reports). A selecting client that
+    /// disconnects drops off the list. A non-owner may change other
+    /// attributes too. DestroyAlarm sends a Destroyed notify to the
+    /// selecting clients. An `events` value other than True/False is
+    /// BadValue naming it and selects nothing.
+    #[test]
+    fn sync_alarm_notify_reaches_every_client_that_selected_it() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_0040;
+        const D: u32 = 3;
+        let mut f = sync_fixture();
+        let mut peer_d = install_client(&mut f.state, D);
+        let d_req = |f: &mut SyncFixture, minor: u8, body: &[u8]| {
+            sync_req(&mut f.state, &mut f.backend, D, minor, body);
+        };
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        let mut create = AL.to_le_bytes().to_vec();
+        create.extend_from_slice(
+            &(s::CA_COUNTER
+                | s::CA_VALUE_TYPE
+                | s::CA_VALUE
+                | s::CA_TEST_TYPE
+                | s::CA_DELTA
+                | s::CA_EVENTS)
+                .to_le_bytes(),
+        );
+        for v in [
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            0,
+            10,
+            s::TEST_POSITIVE_COMPARISON,
+            0,
+            1,
+            1,
+        ] {
+            create.extend_from_slice(&v.to_le_bytes());
+        }
+        f.a(s::CREATE_ALARM, &create);
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        d_req(&mut f, s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        assert!(f.b_packets().is_empty(), "selecting sends nothing");
+        assert!(f.state.sync_alarms[&AL].events, "owner flag untouched");
+        assert!(f.a_packets().is_empty());
+
+        let set = |f: &mut SyncFixture, v: i64| f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, v));
+        set(&mut f, 10);
+        let fired = |v: i64| vec![(AL, v, v, s::ALARM_STATE_ACTIVE)];
+        assert_eq!(alarm_notifies(&f.a_packets()), fired(10));
+        assert_eq!(alarm_notifies(&f.b_packets()), fired(10), "B once");
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(10));
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 0));
+        set(&mut f, 11);
+        assert_eq!(alarm_notifies(&f.a_packets()), fired(11));
+        assert!(f.b_packets().is_empty(), "B deselected");
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(11));
+
+        f.a(s::CHANGE_ALARM, &sync_events_body(AL, 0));
+        set(&mut f, 12);
+        assert!(f.a_packets().is_empty(), "owner flag off");
+        assert!(!f.state.sync_alarms[&AL].events);
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(12));
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(D),
+        );
+        assert!(f.state.sync_alarms[&AL].event_clients.is_empty());
+        set(&mut f, 13);
+        assert!(f.a_packets().is_empty() && f.b_packets().is_empty());
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 9));
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_VALUE, 9, u16::from(s::CHANGE_ALARM), 142)
+        );
+        assert!(f.state.sync_alarms[&AL].event_clients.is_empty());
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        set(&mut f, 14);
+        assert_eq!(alarm_notifies(&f.b_packets()), fired(14));
+        f.b(
+            s::CHANGE_ALARM,
+            &sync_alarm_body(AL, s::CA_VALUE, &[0, 100]),
+        );
+        assert!(f.b_packets().is_empty(), "a non-owner may change the value");
+        assert_eq!(f.state.sync_alarms[&AL].wait_value, 100);
+
+        f.a(s::DESTROY_ALARM, &AL.to_le_bytes());
+        assert!(f.a_packets().is_empty());
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AL, 14, 100, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// Xvfb: a non-owner may DestroyAlarm (owner and selecting clients get
+    /// the Destroyed notify); the owner's disconnect destroys its alarms,
+    /// and the clients that selected them get the Destroyed notify with
+    /// the counter's value. A destroyed counter deactivates the alarm with
+    /// an Inactive notify to them as well.
+    #[test]
+    fn sync_alarm_destruction_notifies_every_selecting_client() {
+        use yserver_protocol::x11::sync as s;
+        const E: u32 = 3;
+        const CE: u32 = 0x0030_0001;
+        const AE1: u32 = 0x0030_0002;
+        const AE2: u32 = 0x0030_0003;
+        const A2: u32 = 0x0010_0050;
+        let mut f = sync_fixture();
+        let mut peer_e = install_client(&mut f.state, E);
+        let e_req = |f: &mut SyncFixture, minor: u8, body: &[u8]| {
+            sync_req(&mut f.state, &mut f.backend, E, minor, body);
+        };
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        e_req(&mut f, s::CREATE_COUNTER, &sync_counter_body(CE, 0));
+        e_req(
+            &mut f,
+            s::CREATE_ALARM,
+            &sync_alarm_body(AE1, s::CA_COUNTER | s::CA_VALUE, &[CE, 0, 50]),
+        );
+        e_req(
+            &mut f,
+            s::CREATE_ALARM,
+            &sync_alarm_body(AE2, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C1, 0, 50]),
+        );
+        f.b(s::CHANGE_ALARM, &sync_events_body(AE1, 1));
+        f.b(s::CHANGE_ALARM, &sync_events_body(AE2, 1));
+        f.b(s::DESTROY_ALARM, &AE1.to_le_bytes());
+        let destroyed = vec![(AE1, 0, 50, s::ALARM_STATE_DESTROYED)];
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_e)), destroyed);
+        assert_eq!(alarm_notifies(&f.b_packets()), destroyed);
+        assert!(!f.state.sync_alarms.contains_key(&AE1));
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(E),
+        );
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AE2, 14, 50, s::ALARM_STATE_DESTROYED)]
+        );
+        assert!(!f.state.sync_alarms.contains_key(&AE2));
+
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 3));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(A2, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C2, 0, 50]),
+        );
+        f.b(s::CHANGE_ALARM, &sync_events_body(A2, 1));
+        f.a(s::DESTROY_COUNTER, &SYNC_C2.to_le_bytes());
+        let inactive = vec![(A2, 3, 50, s::ALARM_STATE_INACTIVE)];
+        assert_eq!(alarm_notifies(&f.a_packets()), inactive);
+        assert_eq!(alarm_notifies(&f.b_packets()), inactive);
+        f.a(s::DESTROY_ALARM, &A2.to_le_bytes());
+        let destroyed = vec![(A2, 0, 50, s::ALARM_STATE_DESTROYED)];
+        assert_eq!(alarm_notifies(&f.a_packets()), destroyed);
+        assert_eq!(alarm_notifies(&f.b_packets()), destroyed);
+    }
+
+    /// Xvfb: CreateAlarm defaults are Xorg's (PositiveComparison, value 0,
+    /// delta 1, events): on a counter at 0 it fires at once and re-arms to
+    /// a wait value of 1. Without a counter the alarm starts Inactive and
+    /// silent; a ChangeAlarm on it then fires Inactive with counter value
+    /// 0 ("NULL counter WILL trigger in ChangeAlarm").
+    #[test]
+    fn sync_alarm_defaults_and_counterless_alarms_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        const GONE: u32 = 0x0010_0060;
+        const AN: u32 = 0x0020_0060;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(GONE, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(GONE, 0, 0, s::ALARM_STATE_ACTIVE)]
+        );
+        f.a(s::DESTROY_ALARM, &GONE.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(GONE, 0, 1, s::ALARM_STATE_DESTROYED)]
+        );
+
+        f.b(s::CREATE_ALARM, &sync_alarm_body(AN, s::CA_VALUE, &[0, 5]));
+        assert!(f.b_packets().is_empty());
+        assert_eq!(f.state.sync_alarms[&AN].state, s::ALARM_STATE_INACTIVE);
+        f.b(s::CHANGE_ALARM, &sync_events_body(AN, 1));
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AN, 0, 5, s::ALARM_STATE_INACTIVE)]
+        );
+        f.b(s::DESTROY_ALARM, &AN.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AN, 0, 5, s::ALARM_STATE_DESTROYED)]
+        );
     }
 
     /// SERVERTIME awaits wake when the clock reaches the value (Xvfb: an
@@ -69788,6 +70097,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
 
@@ -69830,6 +70140,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_COMPARISON as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
 
@@ -69869,6 +70180,7 @@ mod tests {
                 test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
             },
         );
 
