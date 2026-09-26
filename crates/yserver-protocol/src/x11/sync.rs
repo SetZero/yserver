@@ -218,79 +218,6 @@ pub fn alarm_request_len(mask: u32) -> usize {
     8 + 4 * words as usize
 }
 
-/// Attributes carried by a `CreateAlarm`/`ChangeAlarm` value-list.
-/// Each field is `Some` only when its value-mask bit was set.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AlarmAttributes {
-    pub counter: Option<u32>,
-    pub value_type: Option<u32>,
-    pub value: Option<i64>,
-    pub test_type: Option<u32>,
-    pub delta: Option<i64>,
-    /// The raw `events` word: Xorg accepts only True (1) and False (0)
-    /// and answers anything else with BadValue naming it.
-    pub events: Option<u32>,
-}
-
-/// Parse a `CreateAlarm`/`ChangeAlarm` body: `alarm(4) value-mask(4)
-/// value-list(var)`. Fields appear in ascending value-mask bit order;
-/// CARD32/enum/BOOL fields occupy 4 bytes, INT64 (`VALUE`, `DELTA`)
-/// occupy 8 (INT32 hi, CARD32 lo). Returns `None` on truncation.
-#[must_use]
-pub fn parse_alarm_attributes(body: &[u8]) -> Option<(u32, AlarmAttributes)> {
-    if body.len() < 8 {
-        return None;
-    }
-    let alarm = read_u32_le(body);
-    let mask = read_u32_le(&body[4..]);
-    let list = &body[8..];
-    let mut off = 0usize;
-    let mut attrs = AlarmAttributes::default();
-
-    if mask & CA_COUNTER != 0 {
-        if list.len() < off + 4 {
-            return None;
-        }
-        attrs.counter = Some(read_u32_le(&list[off..]));
-        off += 4;
-    }
-    if mask & CA_VALUE_TYPE != 0 {
-        if list.len() < off + 4 {
-            return None;
-        }
-        attrs.value_type = Some(read_u32_le(&list[off..]));
-        off += 4;
-    }
-    if mask & CA_VALUE != 0 {
-        if list.len() < off + 8 {
-            return None;
-        }
-        attrs.value = Some(read_i64(&list[off..], &list[off + 4..]));
-        off += 8;
-    }
-    if mask & CA_TEST_TYPE != 0 {
-        if list.len() < off + 4 {
-            return None;
-        }
-        attrs.test_type = Some(read_u32_le(&list[off..]));
-        off += 4;
-    }
-    if mask & CA_DELTA != 0 {
-        if list.len() < off + 8 {
-            return None;
-        }
-        attrs.delta = Some(read_i64(&list[off..], &list[off + 4..]));
-        off += 8;
-    }
-    if mask & CA_EVENTS != 0 {
-        if list.len() < off + 4 {
-            return None;
-        }
-        attrs.events = Some(read_u32_le(&list[off..]));
-    }
-    Some((alarm, attrs))
-}
-
 /// Does a counter transition from `old` to `new` satisfy an alarm's
 /// trigger test against `wait_value`? Transition tests require an actual
 /// crossing; comparison tests look only at the new value (see the X
@@ -614,36 +541,6 @@ mod tests {
         body
     }
 
-    #[test]
-    fn parse_alarm_attributes_decodes_muffin_create_alarm() {
-        let (alarm, attrs) = parse_alarm_attributes(&muffin_create_alarm_body()).unwrap();
-        assert_eq!(alarm, 0x01e0_0019);
-        assert_eq!(attrs.counter, Some(0x0260_0006));
-        assert_eq!(attrs.value_type, Some(VALUE_TYPE_RELATIVE));
-        assert_eq!(attrs.value, Some(1));
-        assert_eq!(attrs.test_type, Some(TEST_POSITIVE_COMPARISON));
-        assert_eq!(attrs.delta, Some(1));
-        assert_eq!(attrs.events, Some(1));
-    }
-
-    #[test]
-    fn parse_alarm_attributes_respects_partial_mask() {
-        // Only counter + events set: the value-list packs just those
-        // two 4-byte fields, in bit order.
-        let mut body = Vec::new();
-        body.extend_from_slice(&0x55u32.to_le_bytes()); // alarm
-        body.extend_from_slice(&(CA_COUNTER | CA_EVENTS).to_le_bytes());
-        body.extend_from_slice(&0xabcdu32.to_le_bytes()); // counter
-        body.push(0); // events = false
-        body.extend_from_slice(&[0u8; 3]);
-        let (alarm, attrs) = parse_alarm_attributes(&body).unwrap();
-        assert_eq!(alarm, 0x55);
-        assert_eq!(attrs.counter, Some(0xabcd));
-        assert_eq!(attrs.value_type, None);
-        assert_eq!(attrs.value, None);
-        assert_eq!(attrs.events, Some(0));
-    }
-
     /// Xorg's CreateAlarm / ChangeAlarm length rule: a word per mask bit,
     /// two for VALUE and DELTA; muffin's full CreateAlarm is 8 + 32 bytes.
     #[test]
@@ -659,15 +556,6 @@ mod tests {
             40
         );
         assert_eq!(alarm_request_len(1 << 7), 12, "unknown bits count too");
-    }
-
-    #[test]
-    fn parse_alarm_attributes_rejects_truncated_list() {
-        let mut body = Vec::new();
-        body.extend_from_slice(&1u32.to_le_bytes()); // alarm
-        body.extend_from_slice(&CA_VALUE.to_le_bytes()); // claims an INT64 value
-        body.extend_from_slice(&[0u8; 4]); // only 4 bytes, INT64 needs 8
-        assert!(parse_alarm_attributes(&body).is_none());
     }
 
     #[test]

@@ -5539,39 +5539,24 @@ fn handle_sync_request(
                     alarm,
                 );
             }
-            let Some((_, attrs)) = x11sync::parse_alarm_attributes(body) else {
-                return sync_error(
-                    state,
-                    client_id,
-                    sequence,
-                    header,
-                    x11::error::BAD_LENGTH,
-                    alarm,
-                );
-            };
-            if let Some(events) = attrs.events
-                && events > 1
-            {
-                return sync_error(
-                    state,
-                    client_id,
-                    sequence,
-                    header,
-                    x11::error::BAD_VALUE,
-                    events,
-                );
-            }
-            // Xorg's defaults: no counter, Absolute 0, PositiveComparison,
-            // delta 1, the owner selected for events.
+            // Xorg's defaults (`ProcSyncCreateAlarm` + `SyncInitTrigger` on
+            // None): no counter, Absolute 0, PositiveComparison, delta 1,
+            // the owner selected for events. An error discards the alarm.
             let mut a = crate::server::SyncAlarm {
                 owner: client_id,
-                state: x11sync::ALARM_STATE_ACTIVE,
-                events: attrs.events != Some(0),
-                test_type: u8::try_from(x11sync::TEST_POSITIVE_COMPARISON).unwrap_or(0),
+                state: x11sync::ALARM_STATE_INACTIVE,
+                events: true,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON,
+                check_type: x11sync::TEST_POSITIVE_COMPARISON,
                 delta: 1,
                 ..crate::server::SyncAlarm::default()
             };
-            apply_alarm_attributes(state, &mut a, &attrs);
+            let values = alarm_value_words(body);
+            if let Err((code, value)) =
+                change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values)
+            {
+                return sync_error(state, client_id, sequence, header, code, value);
+            }
             let counter = a.counter;
             let class = state
                 .client_wm_class
@@ -5584,7 +5569,7 @@ fn handle_sync_request(
                  wait_value={wait} delta={delta} events={events}",
                 client_id.0,
                 cname = sync_counter_name(counter),
-                test = sync_test_type_name(u32::from(a.test_type)),
+                test = sync_test_type_name(a.test_type),
                 wait = a.wait_value,
                 delta = a.delta,
                 events = a.events,
@@ -5629,43 +5614,20 @@ fn handle_sync_request(
                     alarm,
                 );
             }
-            let Some((_, attrs)) = x11sync::parse_alarm_attributes(body) else {
-                return sync_error(
-                    state,
-                    client_id,
-                    sequence,
-                    header,
-                    x11::error::BAD_LENGTH,
-                    alarm,
-                );
-            };
             // Xorg `SyncChangeAlarmAttributes`: any client may change an
-            // alarm. `events` must be True or False; it selects AlarmNotify
-            // for the requesting client — the owner's own flag, or a place
-            // on the alarm's event-client list for anyone else.
-            if let Some(events) = attrs.events {
-                if events > 1 {
-                    return sync_error(
-                        state,
-                        client_id,
-                        sequence,
-                        header,
-                        x11::error::BAD_VALUE,
-                        events,
-                    );
-                }
-                crate::core_loop::sync_await::select_alarm_events(
-                    state,
-                    alarm,
-                    client_id,
-                    events == 1,
-                );
-            }
+            // alarm; `events` selects AlarmNotify for the requesting client
+            // (the owner's own flag, or the event-client list). A failure
+            // part-way keeps what Xorg keeps (see change_alarm_attributes),
+            // so the copy is written back either way.
             let Some(mut a) = state.sync_alarms.get(&alarm).cloned() else {
                 return Ok(RequestOutcome::Handled);
             };
-            apply_alarm_attributes(state, &mut a, &attrs);
-            a.state = x11sync::ALARM_STATE_ACTIVE;
+            let values = alarm_value_words(body);
+            let outcome = change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values);
+            if let Err((code, value)) = outcome {
+                state.sync_alarms.insert(alarm, a);
+                return sync_error(state, client_id, sequence, header, code, value);
+            }
             let counter = a.counter;
             let class = state
                 .client_wm_class
@@ -5678,7 +5640,7 @@ fn handle_sync_request(
                  wait_value={wait} delta={delta} events={events}",
                 client_id.0,
                 cname = sync_counter_name(counter),
-                test = sync_test_type_name(u32::from(a.test_type)),
+                test = sync_test_type_name(a.test_type),
                 wait = a.wait_value,
                 delta = a.delta,
                 events = a.events,
@@ -5718,7 +5680,7 @@ fn handle_sync_request(
                 sequence,
                 alarm.counter,
                 alarm.wait_value,
-                u32::from(alarm.test_type),
+                alarm.test_type,
                 alarm.delta,
                 alarm.events,
                 alarm.state,
@@ -5906,39 +5868,149 @@ fn handle_sync_request(
     Ok(RequestOutcome::Handled)
 }
 
-/// Merge a `CreateAlarm`/`ChangeAlarm` value-list into an alarm,
-/// resolving the `wait_value` against the watched counter's current
-/// value (Relative alarms add `value` to the counter; Absolute alarms
-/// take `value` directly). Only attributes whose mask bit was set are
-/// applied. `events` is not an attribute of the alarm but an event
-/// selection by the requesting client (`select_alarm_events`), so the
-/// caller handles it.
-fn apply_alarm_attributes(
+/// Xorg `SyncChangeAlarmAttributes` + `SyncInitTrigger` for CreateAlarm
+/// (on a fresh alarm) and ChangeAlarm (on a copy the caller writes back
+/// whatever the outcome). `values` is the value list, one word each and
+/// two for VALUE and DELTA, already length-checked against `mask`.
+///
+/// Order and partial effects, as Xorg (captured on Xvfb):
+/// 1. The list is walked in mask-bit order; an `events` word other than
+///    True/False is BadValue naming it, an unknown bit BadValue naming the
+///    mask bits above it. Nothing is changed yet.
+/// 2. `events` selects AlarmNotify for `client` — it stays selected even
+///    if the request then fails.
+/// 3. With DELTA or TEST_TYPE in the mask, a positive test with a
+///    negative delta or a negative test with a positive delta is
+///    BadMatch; nothing else is changed.
+/// 4. Delta, value type, value and test type are stored.
+/// 5. The trigger is initialised: an unknown counter is BadCounter, an
+///    invalid value type BadValue naming it; the wait value resolves
+///    (Relative without a counter is BadMatch; an INT64 overflow is
+///    BadValue naming the value's high word, with the wrapped sum stored);
+///    an invalid test type is BadValue naming it. Only then do the counter
+///    and the test the trigger runs change, and the alarm goes Active.
+///
+/// So a failing ChangeAlarm can leave step 4 behind: a stored bad test
+/// type is what QueryAlarm reports, while the alarm keeps running its old
+/// test.
+fn change_alarm_attributes(
     state: &ServerState,
+    alarm_id: u32,
     alarm: &mut crate::server::SyncAlarm,
-    attrs: &yserver_protocol::x11::sync::AlarmAttributes,
-) {
+    client: ClientId,
+    mask: u32,
+    values: &[u32],
+) -> Result<(), (u8, u32)> {
     use yserver_protocol::x11::sync as x11sync;
-    if let Some(counter) = attrs.counter {
-        alarm.counter = counter;
+    let int64 = |hi: u32, lo: u32| (i64::from(hi.cast_signed()) << 32) | i64::from(lo);
+    let mut words = values.iter().copied();
+    let mut next = || words.next().unwrap_or(0);
+    let (mut counter, mut value_type, mut raw_wait, mut test_type, mut delta) = (
+        alarm.counter,
+        alarm.value_type,
+        alarm.raw_wait,
+        alarm.test_type,
+        alarm.delta,
+    );
+    let mut select = None;
+    let mut remaining = mask;
+    while remaining != 0 {
+        let bit = 1u32 << remaining.trailing_zeros();
+        remaining &= !bit;
+        match bit {
+            x11sync::CA_COUNTER => counter = next(),
+            x11sync::CA_VALUE_TYPE => value_type = next(),
+            x11sync::CA_VALUE => raw_wait = int64(next(), next()),
+            x11sync::CA_TEST_TYPE => test_type = next(),
+            x11sync::CA_DELTA => delta = int64(next(), next()),
+            x11sync::CA_EVENTS => {
+                let events = next();
+                if events > 1 {
+                    return Err((x11::error::BAD_VALUE, events));
+                }
+                select = Some(events == 1);
+            }
+            _ => return Err((x11::error::BAD_VALUE, remaining)),
+        }
     }
-    if let Some(test_type) = attrs.test_type {
-        alarm.test_type = u8::try_from(test_type).unwrap_or(0);
+    if let Some(want) = select {
+        crate::core_loop::sync_await::select_alarm_events(alarm, client, want);
     }
-    if let Some(delta) = attrs.delta {
-        alarm.delta = delta;
+    if mask & (x11sync::CA_DELTA | x11sync::CA_TEST_TYPE) != 0 {
+        let positive = matches!(
+            test_type,
+            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_POSITIVE_TRANSITION
+        );
+        let negative = matches!(
+            test_type,
+            x11sync::TEST_NEGATIVE_COMPARISON | x11sync::TEST_NEGATIVE_TRANSITION
+        );
+        if (positive && delta < 0) || (negative && delta > 0) {
+            return Err((x11::error::BAD_MATCH, alarm_id));
+        }
     }
-    if attrs.value.is_some() || attrs.value_type.is_some() {
-        let value = attrs.value.unwrap_or(0);
-        let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
-        alarm.wait_value = if relative {
-            let current =
-                crate::core_loop::sync_await::counter_value(state, alarm.counter).unwrap_or(0);
-            current.saturating_add(value)
+    alarm.delta = delta;
+    alarm.value_type = value_type;
+    alarm.raw_wait = raw_wait;
+    alarm.test_type = test_type;
+
+    let mut new_counter = alarm.counter;
+    if mask & x11sync::CA_COUNTER != 0 {
+        if counter != 0
+            && !crate::core_loop::sync_await::is_system_counter(counter)
+            && !state.sync_counters.contains_key(&counter)
+        {
+            return Err((
+                crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                counter,
+            ));
+        }
+        new_counter = counter;
+    }
+    let current = if new_counter == 0 {
+        None
+    } else {
+        crate::core_loop::sync_await::counter_value(state, new_counter)
+    };
+    if mask & x11sync::CA_VALUE_TYPE != 0
+        && value_type != x11sync::VALUE_TYPE_ABSOLUTE
+        && value_type != x11sync::VALUE_TYPE_RELATIVE
+    {
+        return Err((x11::error::BAD_VALUE, value_type));
+    }
+    if mask & (x11sync::CA_VALUE_TYPE | x11sync::CA_VALUE) != 0 {
+        if value_type == x11sync::VALUE_TYPE_ABSOLUTE {
+            alarm.wait_value = raw_wait;
         } else {
-            value
-        };
+            let Some(value) = current else {
+                return Err((x11::error::BAD_MATCH, alarm_id));
+            };
+            let (sum, overflow) = value.overflowing_add(raw_wait);
+            alarm.wait_value = sum;
+            if overflow {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return Err((x11::error::BAD_VALUE, (raw_wait >> 32) as u32));
+            }
+        }
     }
+    if mask & x11sync::CA_TEST_TYPE != 0 {
+        if test_type > x11sync::TEST_NEGATIVE_COMPARISON {
+            return Err((x11::error::BAD_VALUE, test_type));
+        }
+        alarm.check_type = test_type;
+    }
+    alarm.counter = new_counter;
+    alarm.state = x11sync::ALARM_STATE_ACTIVE;
+    Ok(())
+}
+
+/// The value list of a length-checked CreateAlarm / ChangeAlarm body.
+fn alarm_value_words(body: &[u8]) -> Vec<u32> {
+    body.get(8..)
+        .unwrap_or_default()
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect()
 }
 
 fn handle_xinerama_request(
@@ -6139,7 +6211,7 @@ pub(crate) fn evaluate_alarms_for_counter(
         .filter(|(_, a)| {
             a.counter == counter
                 && a.state == x11sync::ALARM_STATE_ACTIVE
-                && x11sync::trigger_fires(a.test_type.into(), old, new, a.wait_value)
+                && x11sync::trigger_fires(a.check_type, old, new, a.wait_value)
         })
         .map(|(id, _)| *id)
         .collect();
@@ -6158,9 +6230,10 @@ fn check_new_alarm_trigger(state: &mut ServerState, alarm_id: u32, counter: u32)
     if counter == x11sync::SERVERTIME_COUNTER {
         state.sync_servertime_last = Some(now_value);
     }
-    let holds = state.sync_alarms.get(&alarm_id).is_some_and(|a| {
-        x11sync::trigger_fires(a.test_type.into(), now_value, now_value, a.wait_value)
-    });
+    let holds = state
+        .sync_alarms
+        .get(&alarm_id)
+        .is_some_and(|a| x11sync::trigger_fires(a.check_type, now_value, now_value, a.wait_value));
     if holds {
         alarm_trigger_fired(state, alarm_id, now_value);
     }
@@ -6181,7 +6254,10 @@ pub(crate) fn alarm_trigger_fired(state: &mut ServerState, alarm_id: u32, value:
     if a.state != x11sync::ALARM_STATE_ACTIVE {
         return;
     }
-    let test_type: u32 = a.test_type.into();
+    // Xorg reads the stored test type for the "delta 0 on a comparison"
+    // rule but re-arms with the trigger's check function; the two differ
+    // only after a ChangeAlarm that failed on an invalid test type.
+    let (test_type, check_type) = (a.test_type, a.check_type);
     let (owner, counter, fired_wait, delta) = (a.owner, a.counter, a.wait_value, a.delta);
     let is_comparison = matches!(
         test_type,
@@ -6197,7 +6273,11 @@ pub(crate) fn alarm_trigger_fired(state: &mut ServerState, alarm_id: u32, value:
         let mut w = fired_wait;
         let mut guard = 0u32;
         let mut overflowed = false;
-        while x11sync::comparison_satisfied(test_type, value, w) && guard < 1_000_000 {
+        // The guard bounds what Xorg does not: after that failed
+        // ChangeAlarm a delta of the wrong sign passes the (unmatched)
+        // sign check, and Xorg's loop then steps toward INT64 overflow
+        // one delta at a time — a hung server (seen on Xvfb).
+        while x11sync::comparison_satisfied(check_type, value, w) && guard < 1_000_000 {
             match w.checked_add(delta) {
                 Some(next) => {
                     w = next;
@@ -10002,9 +10082,8 @@ pub(crate) fn emit_screen_saver_notify(
 
 /// Current idle value for an IDLETIME-family counter, expressed as
 /// milliseconds since `state.idletime_baseline(counter)`. Used by
-/// CREATE_ALARM, CHANGE_ALARM, and apply_alarm_attributes' Relative
-/// branch for resolving counter values that aren't stored in
-/// `state.sync_counters`.
+/// CREATE_ALARM / CHANGE_ALARM (Relative values, trigger checks) for
+/// counter values that aren't stored in `state.sync_counters`.
 pub(crate) fn idletime_current_idle(state: &ServerState, counter: u32) -> i64 {
     let baseline = state.idletime_baseline(counter);
     #[allow(clippy::cast_possible_truncation)]
@@ -60832,10 +60911,13 @@ mod tests {
                 counter: SYNC_C1,
                 wait_value: 1000,
                 delta: 1,
-                test_type: u8::try_from(s::TEST_POSITIVE_COMPARISON).unwrap(),
+                test_type: s::TEST_POSITIVE_COMPARISON,
                 events: true,
                 state: s::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 1000,
+                check_type: s::TEST_POSITIVE_COMPARISON,
             },
         );
         f.a(s::DESTROY_COUNTER, &SYNC_C1.to_le_bytes());
@@ -61243,6 +61325,254 @@ mod tests {
                 s::ALARM_STATE_INACTIVE
             )
         );
+    }
+
+    /// Xvfb ("CreateAlarm attribute errors"): Xorg's checks, in its order —
+    /// the value list in mask-bit order (`events` not True/False, unknown
+    /// bits naming the bits above), the delta sign against the test type
+    /// (the default delta 1 counts), then the trigger: unknown counter,
+    /// value type, Relative without a counter, INT64 overflow (naming the
+    /// value's high word), test type. BadMatch names the alarm. A failing
+    /// CreateAlarm creates nothing.
+    #[test]
+    fn sync_create_alarm_attribute_errors_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        let (value, matchh) = (x11::error::BAD_VALUE, x11::error::BAD_MATCH);
+        let c = SYNC_C1;
+        let unknown = 0x0bad_bad0;
+        // (mask, values, expected error (code, value; None = the alarm id)).
+        type Case = (u32, Vec<u32>, Option<(u8, Option<u32>)>);
+        let cases: Vec<Case> = vec![
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![c, 9],
+                Some((value, Some(9))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_VALUE_TYPE,
+                vec![c, 7],
+                Some((value, Some(7))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_EVENTS,
+                vec![c, 2],
+                Some((value, Some(2))),
+            ),
+            (
+                s::CA_COUNTER,
+                vec![unknown],
+                Some((bad_counter, Some(unknown))),
+            ),
+            (
+                s::CA_VALUE_TYPE,
+                vec![s::VALUE_TYPE_RELATIVE],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE | s::CA_DELTA,
+                vec![c, s::TEST_POSITIVE_COMPARISON, u32::MAX, u32::MAX],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![c, s::TEST_NEGATIVE_COMPARISON],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE | s::CA_DELTA,
+                vec![c, s::TEST_NEGATIVE_COMPARISON, 0, 0],
+                None,
+            ),
+            (
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE,
+                vec![c, s::VALUE_TYPE_RELATIVE, 0x7fff_ffff, u32::MAX],
+                Some((value, Some(0x7fff_ffff))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![unknown, 9],
+                Some((bad_counter, Some(unknown))),
+            ),
+            (
+                s::CA_VALUE_TYPE | s::CA_TEST_TYPE,
+                vec![7, 9],
+                Some((value, Some(7))),
+            ),
+            (1 << 6, vec![0], Some((value, Some(0)))),
+            (s::CA_EVENTS | 1 << 6, vec![2, 0], Some((value, Some(2)))),
+        ];
+        for (index, (mask, values, expect)) in cases.into_iter().enumerate() {
+            let alarm = 0x0020_0100 + u32::try_from(index).unwrap();
+            f.b(s::CREATE_ALARM, &sync_alarm_body(alarm, mask, &values));
+            let packets = f.b_packets();
+            match expect {
+                Some((code, bad)) => {
+                    assert_eq!(
+                        error_fields(&packets[0]),
+                        (code, bad.unwrap_or(alarm), u16::from(s::CREATE_ALARM), 142),
+                        "case {index}"
+                    );
+                    assert!(!f.state.sync_alarms.contains_key(&alarm), "case {index}");
+                }
+                None => {
+                    assert!(packets.is_empty(), "case {index}");
+                    assert!(f.state.sync_alarms.contains_key(&alarm), "case {index}");
+                }
+            }
+        }
+    }
+
+    /// Xvfb ("ChangeAlarm attribute errors: what sticks"): a failing
+    /// ChangeAlarm keeps what Xorg's `SyncChangeAlarmAttributes` stored
+    /// before `SyncInitTrigger` failed — delta, value type, value and the
+    /// test type — while the counter, the resolved wait value (except an
+    /// overflowing Relative sum, which is stored wrapped), the test the
+    /// trigger runs and the state stay. A stored bad value type makes a
+    /// later value-only change Relative; a stored bad test type is what
+    /// QueryAlarm reports, passes the delta-sign check, and the alarm keeps
+    /// firing on its old PositiveComparison.
+    #[test]
+    fn sync_change_alarm_failures_keep_what_xorg_keeps() {
+        use yserver_protocol::x11::sync as s;
+        const X: u32 = 0x0010_0090;
+        let mut f = sync_fixture();
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        let (value, matchh) = (x11::error::BAD_VALUE, x11::error::BAD_MATCH);
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 20));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(
+                X,
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE | s::CA_DELTA,
+                &[SYNC_C1, 0, 0, 30, s::TEST_POSITIVE_COMPARISON, 0, 1],
+            ),
+        );
+        let q = |f: &mut SyncFixture| query_alarm_fields(f, X);
+        let pc = s::TEST_POSITIVE_COMPARISON;
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 30, pc, 1, 1, 0));
+        let change = |f: &mut SyncFixture, mask: u32, values: &[u32]| {
+            f.a(s::CHANGE_ALARM, &sync_alarm_body(X, mask, values));
+            f.a_packets()
+                .first()
+                .map(error_fields)
+                .map(|(code, bad, minor, _)| {
+                    assert_eq!(minor, u16::from(s::CHANGE_ALARM));
+                    (code, bad)
+                })
+        };
+        let m = u32::MAX;
+        assert_eq!(
+            change(&mut f, s::CA_VALUE_TYPE | s::CA_VALUE, &[7, 0, 50]),
+            Some((value, 7))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 30, pc, 1, 1, 0));
+        assert_eq!(change(&mut f, s::CA_VALUE, &[0, 5]), None);
+        assert_eq!(
+            q(&mut f),
+            (SYNC_C1, 0, 25, pc, 1, 1, 0),
+            "stored type 7 acts Relative"
+        );
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_COUNTER | s::CA_VALUE | s::CA_DELTA,
+                &[0x0bad_bad0, 0, 70, 0, 3]
+            ),
+            Some((bad_counter, 0x0bad_bad0))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, pc, 3, 1, 0), "delta sticks");
+        assert_eq!(change(&mut f, s::CA_DELTA, &[m, m]), Some((matchh, X)));
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE,
+                &[0, 0, 100, s::TEST_NEGATIVE_TRANSITION]
+            ),
+            Some((matchh, X))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, pc, 3, 1, 0));
+        assert_eq!(change(&mut f, s::CA_TEST_TYPE, &[9]), Some((value, 9)));
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, 9, 3, 1, 0));
+        assert_eq!(
+            change(&mut f, s::CA_DELTA, &[m, m]),
+            None,
+            "no sign for test type 9"
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, 9, -1, 1, 0));
+        assert_eq!(change(&mut f, s::CA_DELTA, &[0, 1]), None);
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 25));
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 25, 25, s::ALARM_STATE_ACTIVE)]
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 21));
+        assert!(f.a_packets().is_empty());
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 26, 9, 1, 1, 0));
+        f.a(s::CHANGE_ALARM, &sync_alarm_body(X, s::CA_COUNTER, &[0]));
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 0, 26, s::ALARM_STATE_INACTIVE)]
+        );
+        assert_eq!(
+            change(&mut f, s::CA_VALUE_TYPE, &[s::VALUE_TYPE_RELATIVE]),
+            Some((matchh, X))
+        );
+        assert_eq!(q(&mut f), (0, 0, 26, 9, 1, 1, s::ALARM_STATE_INACTIVE));
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE,
+                &[SYNC_C1, s::VALUE_TYPE_RELATIVE, 0x7fff_ffff, m]
+            ),
+            Some((value, 0x7fff_ffff))
+        );
+        let wrapped = 21i64.wrapping_add(i64::MAX);
+        assert_eq!(q(&mut f), (0, 0, wrapped, 9, 1, 1, s::ALARM_STATE_INACTIVE));
+        assert_eq!(change(&mut f, 1 << 6, &[0]), Some((value, 0)));
+        f.a(s::DESTROY_ALARM, &X.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 0, wrapped, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// Xvfb (the "bad test type" line of "AlarmNotify selection"): B's
+    /// ChangeAlarm {test type 9, events True} on A's alarm is BadValue(9),
+    /// yet B is selected (the selection precedes the check) and the alarm,
+    /// still running PositiveComparison, notifies B when the counter
+    /// reaches it; QueryAlarm reports test type 9.
+    #[test]
+    fn sync_alarm_bad_test_type_still_selects_and_fires() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_00a0;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 13));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(
+                AL,
+                s::CA_COUNTER | s::CA_VALUE | s::CA_EVENTS,
+                &[SYNC_C1, 0, 14, 0],
+            ),
+        );
+        f.b(
+            s::CHANGE_ALARM,
+            &sync_alarm_body(AL, s::CA_TEST_TYPE | s::CA_EVENTS, &[9, 1]),
+        );
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_VALUE, 9, u16::from(s::CHANGE_ALARM), 142)
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AL, 14, 14, s::ALARM_STATE_ACTIVE)]
+        );
+        assert!(f.a_packets().is_empty());
+        assert_eq!(query_alarm_fields(&mut f, AL), (SYNC_C1, 0, 15, 9, 1, 0, 0));
     }
 
     /// Every AlarmNotify in `packets` → (alarm, counter value, alarm
@@ -70253,10 +70583,13 @@ mod tests {
                 counter,
                 wait_value: 100,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 100,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
 
@@ -70296,10 +70629,13 @@ mod tests {
                 counter,
                 wait_value: 100,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_COMPARISON as u8,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 100,
+                check_type: x11sync::TEST_POSITIVE_COMPARISON,
             },
         );
 
@@ -70336,10 +70672,13 @@ mod tests {
                 counter,
                 wait_value: near_max,
                 delta: 100, // would overflow on first add
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: near_max,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
 

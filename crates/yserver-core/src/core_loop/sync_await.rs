@@ -24,7 +24,7 @@ use yserver_protocol::x11::{ClientId, sync as x11sync};
 use crate::{
     backend::Backend,
     core_loop::fanout::fanout_event_to_clients,
-    server::{ServerState, SyncAwait, SyncAwaitCondition},
+    server::{ServerState, SyncAlarm, SyncAwait, SyncAwaitCondition},
 };
 
 /// SERVERTIME and the IDLETIME family: server-owned counters whose value
@@ -265,15 +265,7 @@ pub(crate) fn send_alarm_notify(state: &mut ServerState, alarm_id: u32, counter_
 /// Xorg `SyncEventSelectForAlarm`, run by CreateAlarm / ChangeAlarm for an
 /// `events` value: the owner sets its own flag; any other client joins
 /// the alarm's event-client list (once, newest first) or leaves it.
-pub(crate) fn select_alarm_events(
-    state: &mut ServerState,
-    alarm_id: u32,
-    client: ClientId,
-    want: bool,
-) {
-    let Some(alarm) = state.sync_alarms.get_mut(&alarm_id) else {
-        return;
-    };
+pub(crate) fn select_alarm_events(alarm: &mut SyncAlarm, client: ClientId, want: bool) {
     if client == alarm.owner {
         alarm.events = want;
         return;
@@ -454,7 +446,7 @@ pub(crate) fn system_counter_deadline(state: &ServerState) -> Option<std::time::
         .filter(|a| {
             a.counter == x11sync::SERVERTIME_COUNTER
                 && a.state == x11sync::ALARM_STATE_ACTIVE
-                && positive(u32::from(a.test_type))
+                && positive(a.check_type)
         })
         .filter_map(|a| servertime_at(a.wait_value))
         .collect();

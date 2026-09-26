@@ -160,9 +160,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   separate) or DestroyAlarm; every AlarmNotify — fired, Inactive on counter
   destruction, Destroyed on DestroyAlarm or the owner's disconnect — goes
   to the owner (if selected) and each selecting client; CreateAlarm uses
-  Xorg's defaults and counterless alarms behave as Xorg's. Alarm attribute
-  validation beyond `events` (BadValue test/value type, BadMatch delta
-  sign, BadCounter) is still missing.
+  Xorg's defaults and counterless alarms behave as Xorg's. CreateAlarm /
+  ChangeAlarm port `SyncChangeAlarmAttributes` + `SyncInitTrigger`: BadValue
+  (events, unknown mask bits, value type, INT64 overflow, test type),
+  BadMatch (delta sign, Relative without a counter), BadCounter, in Xorg's
+  order, with Xorg's partial effects on a failing ChangeAlarm (the event
+  selection, delta, value type, raw value and test type stick; a stored bad
+  test type is what QueryAlarm reports while the alarm keeps its old test).
+  One bound Xorg lacks: after that quirk a wrong-sign delta can reach the
+  re-arm loop, which on Xorg steps toward INT64 overflow (a hung Xvfb);
+  yserver caps it.
 
 - **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
   now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,

@@ -284,6 +284,101 @@ static void alarms(xcb_connection_t *a, xcb_connection_t *b) {
     drain_alarms(a, "A"); drain_alarms(b, "B");
     xcb_sync_destroy_alarm(a, a2); sync_rt(a);
     drain_alarms(a, "A"); drain_alarms(b, "B");
+
+    printf("== CreateAlarm attribute errors (each after a GetInputFocus)\n");
+    {
+        struct { const char *what; uint32_t mask; uint32_t v[8]; } cc[] = {
+            { "CreateAlarm test type 9", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_TEST_TYPE, { c, 9 } },
+            { "CreateAlarm value type 7", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE_TYPE, { c, 7 } },
+            { "CreateAlarm events 2", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_EVENTS, { c, 2 } },
+            { "CreateAlarm unknown counter", XCB_SYNC_CA_COUNTER, { 0x0badbad0 } },
+            { "CreateAlarm relative, no counter", XCB_SYNC_CA_VALUE_TYPE, { XCB_SYNC_VALUETYPE_RELATIVE } },
+            { "CreateAlarm PosCmp delta -1", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_TEST_TYPE | XCB_SYNC_CA_DELTA,
+              { c, XCB_SYNC_TESTTYPE_POSITIVE_COMPARISON, 0xffffffff, 0xffffffff } },
+            { "CreateAlarm NegCmp, default delta", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_TEST_TYPE,
+              { c, XCB_SYNC_TESTTYPE_NEGATIVE_COMPARISON } },
+            { "CreateAlarm NegCmp delta 0", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_TEST_TYPE | XCB_SYNC_CA_DELTA,
+              { c, XCB_SYNC_TESTTYPE_NEGATIVE_COMPARISON, 0, 0 } },
+            { "CreateAlarm relative overflow", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_VALUE,
+              { c, XCB_SYNC_VALUETYPE_RELATIVE, 0x7fffffff, 0xffffffff } },
+            { "CreateAlarm test 9 + unknown counter", XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_TEST_TYPE, { 0x0badbad0, 9 } },
+            { "CreateAlarm value type 7 + test 9", XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_TEST_TYPE, { 7, 9 } },
+        };
+        for (unsigned i = 0; i < sizeof cc / sizeof cc[0]; i++) {
+            xcb_sync_alarm_t x = xcb_generate_id(b);
+            sync_rt(b);
+            show_err(cc[i].what, xcb_request_check(b, xcb_sync_create_alarm_checked(b, x, cc[i].mask, cc[i].v)));
+            xcb_generic_error_t *e = NULL;
+            xcb_sync_query_alarm_reply_t *r = xcb_sync_query_alarm_reply(b, xcb_sync_query_alarm(b, x), &e);
+            if (r) { printf("  (alarm exists)\n"); free(r); xcb_sync_destroy_alarm(b, x); } else free(e);
+        }
+        {
+            uint32_t body[3] = { xcb_generate_id(b), 1u << 6, 0 };
+            sync_rt(b);
+            show_err("CreateAlarm unknown mask bit", xcb_request_check(b, raw_sync(b, XCB_SYNC_CREATE_ALARM, body, 12)));
+            uint32_t body2[4] = { xcb_generate_id(b), XCB_SYNC_CA_EVENTS | (1u << 6), 2, 0 };
+            show_err("CreateAlarm events 2 + unknown bit", xcb_request_check(b, raw_sync(b, XCB_SYNC_CREATE_ALARM, body2, 16)));
+        }
+        drain_alarms(b, "B");
+    }
+
+    printf("== ChangeAlarm attribute errors: what sticks (alarm on c, c=%d)\n", 20);
+    xcb_sync_set_counter(a, c, i64(20)); sync_rt(a);
+    {
+        xcb_sync_alarm_t x = xcb_generate_id(a);
+        uint32_t v[] = { c, XCB_SYNC_VALUETYPE_ABSOLUTE, 0, 30, XCB_SYNC_TESTTYPE_POSITIVE_COMPARISON, 0, 1 };
+        xcb_sync_create_alarm(a, x, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_VALUE |
+                              XCB_SYNC_CA_TEST_TYPE | XCB_SYNC_CA_DELTA, v);
+        sync_rt(a);
+        show_alarm(a, "start", x);
+        { uint32_t w[] = { 7, 0, 50 };
+          show_err("value type 7 + value 50", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_VALUE, w))); }
+        show_alarm(a, "after", x);
+        { uint32_t w[] = { 0, 5 };
+          show_err("then value 5 alone", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_VALUE, w))); }
+        show_alarm(a, "after (stored type 7 = relative?)", x);
+        drain_alarms(a, "A");
+        { uint32_t w[] = { 0x0badbad0, 0, 70, 0, 3 };
+          show_err("unknown counter + value 70 + delta 3", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE | XCB_SYNC_CA_DELTA, w))); }
+        show_alarm(a, "after", x);
+        { uint32_t w[] = { 0xffffffff, 0xffffffff };
+          show_err("delta -1 (PosCmp)", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_DELTA, w))); }
+        show_alarm(a, "after", x);
+        { uint32_t w[] = { XCB_SYNC_VALUETYPE_ABSOLUTE, 0, 100, XCB_SYNC_TESTTYPE_NEGATIVE_TRANSITION };
+          show_err("value 100 + NegTrans, delta 3", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_VALUE | XCB_SYNC_CA_TEST_TYPE, w))); }
+        show_alarm(a, "after", x);
+        { uint32_t w[] = { 9 };
+          show_err("test type 9", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_TEST_TYPE, w))); }
+        show_alarm(a, "after", x);
+        { uint32_t w[] = { 0xffffffff, 0xffffffff };
+          show_err("then delta -1 (field 9)", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_DELTA, w))); }
+        show_alarm(a, "after", x);
+        // Xorg's re-arm loop would now step the wait value by -1 while the
+        // (still PositiveComparison) check holds: ~2^63 iterations, a hung
+        // server. Put delta back before firing it.
+        { uint32_t w[] = { 0, 1 };
+          show_err("then delta 1", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_DELTA, w))); }
+        drain_alarms(a, "A");
+        printf("  A: set c 25, then 21\n");
+        xcb_sync_set_counter(a, c, i64(25)); sync_rt(a); drain_alarms(a, "A");
+        xcb_sync_set_counter(a, c, i64(21)); sync_rt(a); drain_alarms(a, "A");
+        show_alarm(a, "after sets", x);
+        { uint32_t w[] = { 0 };
+          show_err("counter None", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_COUNTER, w))); }
+        drain_alarms(a, "A");
+        { uint32_t w[] = { XCB_SYNC_VALUETYPE_RELATIVE };
+          show_err("relative, no counter", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_VALUE_TYPE, w))); }
+        show_alarm(a, "after", x);
+        { uint32_t w[] = { c, XCB_SYNC_VALUETYPE_RELATIVE, 0x7fffffff, 0xffffffff };
+          show_err("counter c + relative overflow", xcb_request_check(a, xcb_sync_change_alarm_checked(a, x, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_VALUE, w))); }
+        show_alarm(a, "after", x);
+        {
+            uint32_t body[3] = { x, 1u << 6, 0 };
+            show_err("unknown mask bit", xcb_request_check(a, raw_sync(a, XCB_SYNC_CHANGE_ALARM, body, 12)));
+        }
+        drain_alarms(a, "A");
+        xcb_sync_destroy_alarm(a, x); sync_rt(a); drain_alarms(a, "A");
+    }
     xcb_sync_destroy_counter(a, c); sync_rt(a);
 }
 

@@ -5401,10 +5401,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: false, // skip wire delivery; assert state mutation only
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         let mut backend = RecordingBackend::default();

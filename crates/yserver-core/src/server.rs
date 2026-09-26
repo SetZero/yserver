@@ -1839,7 +1839,7 @@ impl ServerState {
             ) {
                 continue;
             }
-            let test_type = u32::from(alarm.test_type);
+            let test_type = alarm.check_type;
             if !matches!(
                 test_type,
                 x11sync::TEST_POSITIVE_TRANSITION | x11sync::TEST_POSITIVE_COMPARISON
@@ -2166,12 +2166,27 @@ pub struct SyncFence {
 pub struct SyncAlarm {
     pub owner: ClientId,
     pub counter: u32,
-    /// Absolute counter value the trigger tests against. For a Relative
-    /// alarm this is resolved at create/change time (counter + value).
+    /// Absolute counter value the trigger tests against (Xorg's
+    /// `trigger.test_value`). For a Relative alarm this is resolved at
+    /// create/change time (counter + value).
     pub wait_value: i64,
+    /// The `value-type` last given (Xorg `trigger.value_type`): anything
+    /// but Absolute (0) resolves `raw_wait` relative to the counter when a
+    /// later ChangeAlarm sets the value or value type.
+    pub value_type: u32,
+    /// The `value` last given (Xorg `trigger.wait_value`), before
+    /// resolution.
+    pub raw_wait: i64,
     pub delta: i64,
-    /// `XSyncTestType` (PositiveTransition=0 … NegativeComparison=3).
-    pub test_type: u8,
+    /// The `test-type` last given (Xorg `trigger.test_type`): what
+    /// QueryAlarm reports and what the delta-sign check and "delta 0 on a
+    /// comparison goes Inactive" read. A ChangeAlarm that fails on an
+    /// invalid test type still stores it, as Xorg does.
+    pub test_type: u32,
+    /// The test the trigger actually runs (Xorg's `trigger.CheckTrigger`):
+    /// set only when a test type validates, so it can differ from
+    /// `test_type` after such a failed ChangeAlarm.
+    pub check_type: u32,
     /// Whether the owner receives this alarm's `AlarmNotify` events
     /// (Xorg `pAlarm->events`; what QueryAlarm reports).
     pub events: bool,
@@ -2366,8 +2381,11 @@ impl Default for SyncAlarm {
             owner: ClientId(0),
             counter: 0,
             wait_value: 0,
+            value_type: 0,
+            raw_wait: 0,
             delta: 0,
             test_type: 0,
+            check_type: 0,
             events: false,
             state: 0,
             event_clients: Vec::new(),
@@ -6123,10 +6141,13 @@ mod tests {
                     counter: x11sync::IDLETIME_COUNTER,
                     wait_value: *wait,
                     delta: 0,
-                    test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                    test_type: x11sync::TEST_POSITIVE_TRANSITION,
                     events: true,
                     state: x11sync::ALARM_STATE_ACTIVE,
                     event_clients: Vec::new(),
+                    value_type: 0,
+                    raw_wait: *wait,
+                    check_type: x11sync::TEST_POSITIVE_TRANSITION,
                 },
             );
         }
@@ -6159,10 +6180,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6179,10 +6203,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_INACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6208,10 +6235,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(
@@ -6236,10 +6266,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
                 event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
