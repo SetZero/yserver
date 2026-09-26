@@ -534,7 +534,7 @@ pub fn raw_key_event_to_state(
 /// the event is finally processed, as on Xorg.
 pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent) -> Vec<ClientId> {
     let evtype = event.evtype();
-    let bit = 1u32 << evtype;
+    let bit = 1u64 << evtype;
     let master_devices = [
         XI2_MASTER_KEYBOARD_DEVICE_ID,
         XI2_ALL_MASTER_DEVICES,
@@ -562,7 +562,7 @@ pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent
             && state.clients.get(&g.owner.0).is_some_and(|c| {
                 xi2_mask_for_client(c, ROOT_WINDOW, ROOT_WINDOW, &master_devices) & bit != 0
             });
-        if natural || g.xi2_mask & bit != 0 {
+        if natural || u64::from(g.xi2_mask) & bit != 0 {
             merge_dropped(
                 &mut dropped,
                 send_raw_key(state, &[g.owner], event, XI2_MASTER_KEYBOARD_DEVICE_ID),
@@ -1615,7 +1615,7 @@ mod tests {
             let client = state.clients.get_mut(&id).unwrap();
             client.xi2_masks.clear();
             for d in devices {
-                client.xi2_masks.insert((ROOT_WINDOW, *d), mask);
+                client.xi2_masks.insert((ROOT_WINDOW, *d), u64::from(mask));
             }
             if let Some(v) = xi_version {
                 state.xi2_client_versions.insert(ClientId(id), v);
