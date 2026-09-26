@@ -2831,6 +2831,15 @@ pub trait Backend {
     /// its test window ("Expected event not received" en masse).
     fn warp_pointer_root(&mut self, _state: &mut ServerState, _x: i32, _y: i32) {}
 
+    /// After the server moved the pointer on its own (XTEST fake motion),
+    /// hand the new position to whatever tracks physical pointer input, so
+    /// the next real motion continues from there instead of jumping back.
+    /// The KMS backend's direct-mode input thread accumulates relative
+    /// deltas from its own copy of the position ([`Self::warp_pointer_root`]
+    /// resyncs it the same way). Default no-op: host-forwarding backends get
+    /// their position from the host.
+    fn resync_input_position(&mut self) {}
+
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;
 
     fn list_fonts_proxy(

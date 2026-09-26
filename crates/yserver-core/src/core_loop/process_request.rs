@@ -9870,6 +9870,9 @@ fn dispatch_fake_input_with_body(
                 }
             };
             backend.on_host_input(state, motion);
+            // Like WarpPointer: the physical-input tracker must continue
+            // from the faked position, or the next real motion jumps back.
+            backend.resync_input_position();
         }
         other => {
             log::debug!("XTEST FakeInput: unknown event type {other}, dropping");

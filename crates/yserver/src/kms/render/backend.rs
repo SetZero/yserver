@@ -27684,6 +27684,10 @@ impl Backend for KmsBackend {
         // next relative delta marches the cursor back past the wall. Also
         // closes the pre-existing confine-drift gap. No-op in test fixtures
         // where `input_thread_control` is None.
+        self.resync_input_position();
+    }
+
+    fn resync_input_position(&mut self) {
         if let Some(ctrl) = &self.input_thread_control {
             ctrl.push_position(self.core.cursor_x as i32, self.core.cursor_y as i32);
         }
@@ -50356,6 +50360,11 @@ mod tests {
             body
         };
         let mut backend = KmsBackend::for_tests();
+        // The direct-mode input thread accumulates physical deltas from its
+        // own position; every fake move must hand it the new one, as
+        // WarpPointer does, or the next real mouse motion jumps back.
+        let ctrl = std::sync::Arc::new(crate::input_thread::InputThreadControl::new().unwrap());
+        backend.input_thread_control = Some(ctrl.clone());
         let mut state = yserver_core::server::ServerState::new();
         let _peer = kbd_map_client(&mut state);
         kbd_map_request(
@@ -50366,6 +50375,11 @@ mod tests {
             &fake_motion(0, 200, 200),
         );
         assert_eq!(state.pointer_root, (200, 200), "absolute fake motion");
+        assert_eq!(
+            ctrl.take_position(),
+            Some((200, 200)),
+            "input thread resynced (absolute)"
+        );
         kbd_map_request(
             &mut state,
             &mut backend,
@@ -50374,6 +50388,11 @@ mod tests {
             &fake_motion(1, 10, -5),
         );
         assert_eq!(state.pointer_root, (210, 195), "relative +10,-5");
+        assert_eq!(
+            ctrl.take_position(),
+            Some((210, 195)),
+            "input thread resynced (relative)"
+        );
         kbd_map_request(
             &mut state,
             &mut backend,
@@ -50385,6 +50404,11 @@ mod tests {
             state.pointer_root,
             (0, 0),
             "relative move clipped to the screen"
+        );
+        assert_eq!(
+            ctrl.take_position(),
+            Some((0, 0)),
+            "input thread gets the clipped position"
         );
     }
 
