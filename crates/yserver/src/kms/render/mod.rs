@@ -27,6 +27,7 @@ pub(crate) mod root_overlay;
 pub(crate) mod scanout_damage;
 pub(crate) mod scene;
 pub(crate) mod scene_diff;
+pub(crate) mod size_class_pool;
 pub(crate) mod store;
 pub(crate) mod stroke;
 pub(crate) mod submit_group;

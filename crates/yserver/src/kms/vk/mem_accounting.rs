@@ -602,6 +602,8 @@ fn allocate_impl(
     // SAFETY: `info` is a valid allocate-info chain built by the caller.
     #[allow(clippy::disallowed_methods)]
     let mem = unsafe { device.allocate_memory(info, None)? };
+    #[cfg(test)]
+    THREAD_ALLOC_CALLS.with(|c| c.set(c.get() + 1));
     note_alloc(
         mem,
         info.allocation_size,
@@ -611,6 +613,20 @@ fn allocate_impl(
         small,
     );
     Ok(mem)
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_ALLOC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Successful [`allocate_memory`] calls made on the current thread. The
+/// ledger is process-global and tests run in parallel; a backend under test
+/// allocates on its own thread, so a delta of this counter is exactly that
+/// backend's `vkAllocateMemory` count.
+#[cfg(test)]
+pub(crate) fn thread_alloc_calls() -> u64 {
+    THREAD_ALLOC_CALLS.with(std::cell::Cell::get)
 }
 
 /// `vkFreeMemory`, removing `mem` from the ledger first.

@@ -40118,6 +40118,131 @@ mod tests {
         );
     }
 
+    /// #177: every glyph run and every trapezoid/triangle request used to
+    /// `vkAllocateMemory` + `vkFreeMemory` its own 1–10 KiB instance/vertex
+    /// buffer — 85–96% of all alloc/free calls, and on RADV each free walks
+    /// libdrm's VA hole list. Once the retired buffers are back in the
+    /// size-classed pool, N requests across N frames must cost O(classes)
+    /// allocations, not O(N).
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn glyph_and_trap_requests_reuse_upload_buffers_across_frames() {
+        use crate::kms::vk::mem_accounting;
+        use yserver_core::backend::{AnyHandle, Backend};
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // A real pixmap destination: the frames below are submitted, so the
+        // dst must have storage.
+        let pix = b.create_pixmap(None, 32, 100, 100).expect("pixmap");
+        let dst_pic = b
+            .render_create_picture(None, AnyHandle::Pixmap(pix), 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some")
+            .as_raw();
+        let src_pic = b
+            .render_create_solid_fill(None, [0xFF; 8])
+            .expect("solid_fill")
+            .expect("Some")
+            .as_raw();
+
+        let gs = b
+            .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+            .expect("glyphset")
+            .expect("Some");
+        let mut add_body: Vec<u8> = Vec::new();
+        add_body.extend_from_slice(&1_u32.to_le_bytes()); // n
+        add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1
+        add_body.extend_from_slice(&u16::to_le_bytes(8)); // width
+        add_body.extend_from_slice(&u16::to_le_bytes(8)); // height
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+        add_body.extend_from_slice(&i16::to_le_bytes(8)); // x_off
+        add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+        add_body.extend_from_slice(&[0xFFu8; 64]); // A8, stride 8
+        b.render_add_glyphs(None, gs.as_raw(), &add_body)
+            .expect("add_glyphs");
+        // One element of 8 glyphs (CompositeGlyphs8): a text-run-sized
+        // instance buffer.
+        let mut items: Vec<u8> = vec![8u8, 0, 0, 0];
+        items.extend_from_slice(&i16::to_le_bytes(0)); // dx
+        items.extend_from_slice(&i16::to_le_bytes(0)); // dy
+        items.extend_from_slice(&[1u8; 8]); // 8 × id=1
+
+        // One trapezoid: axis-aligned box (0,0)-(40,40), 16.16 fixed.
+        let f = |v: i32| (v << 16).to_le_bytes();
+        let mut traps = Vec::new();
+        for v in [0, 40, 0, 0, 0, 40, 40, 0, 40, 40] {
+            traps.extend_from_slice(&f(v));
+        }
+
+        // Submit the frame, wait for the GPU, retire (as before_block does).
+        fn settle(b: &mut KmsBackend) {
+            b.engine
+                .close_open_frame(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("close frame");
+            b.engine
+                .flush_submit_group(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::submit_group::FlushReason::SyncBoundary,
+                )
+                .expect("flush");
+            b.platform.wait_idle_bounded();
+            b.for_tests_poll_retired();
+        }
+        let draw = |b: &mut KmsBackend| {
+            b.render_composite_glyphs(
+                None,
+                23,
+                3,
+                src_pic,
+                dst_pic,
+                0,
+                gs.as_raw(),
+                0,
+                0,
+                &items,
+                0,
+                0,
+            )
+            .expect("render_composite_glyphs");
+            b.render_trapezoids(None, 3, src_pic, dst_pic, 0, 0, 0, &traps, 0, 0)
+                .expect("render_trapezoids");
+        };
+
+        // Warm-up: atlas, glyph upload, mask scratch, pipelines, and the
+        // first buffer of each size class.
+        for _ in 0..2 {
+            draw(&mut b);
+            settle(&mut b);
+        }
+
+        const FRAMES: u64 = 32;
+        let before = mem_accounting::thread_alloc_calls();
+        for _ in 0..FRAMES {
+            draw(&mut b);
+            settle(&mut b);
+        }
+        let allocs = mem_accounting::thread_alloc_calls() - before;
+        eprintln!("{FRAMES} frames × (1 glyph run + 1 trapezoid request): {allocs} allocations");
+        // Two requests per frame; the steady state reuses the buffers the
+        // warm-up returned. Pre-fix this is 2 × FRAMES.
+        assert!(
+            allocs <= 2,
+            "{allocs} vkAllocateMemory calls for {FRAMES} frames of glyph + trapezoid \
+             requests: per-request buffers are not being reused",
+        );
+    }
+
     #[test]
     fn collect_fill_rects_for_inferiors_translates_root_to_top_level_child() {
         let mut b = KmsBackend::for_tests();

@@ -735,14 +735,30 @@ pub(crate) struct StagingBuffer {
     /// `HOST_CACHED`-only readback type), CPU reads of `mapped` must be
     /// preceded by `invalidate_for_read` so they observe the GPU's writes.
     coherent: bool,
-    /// True if this buffer was handed out by [`StagingPool::acquire`] (the
-    /// `put_image` upload path) and should be RETURNED to the pool at retire
-    /// instead of destroyed. Fresh `new*` buffers (readback, custom usage) are
-    /// `false` and drop normally. Perf: avoids per-upload
-    /// vkCreateBuffer/vkAllocateMemory churn, which is costly on NVIDIA. Remove
-    /// with the rest of this investigation if the pool doesn't pan out.
-    from_pool: bool,
+    /// Which pool, if any, takes this buffer back at frame retire instead of
+    /// destroying it. Fresh `new*` buffers (readback, custom usage,
+    /// oversize uploads) are [`PoolOrigin::None`] and drop normally.
+    origin: PoolOrigin,
 }
+
+/// Where a [`StagingBuffer`] goes when the frame that used it retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolOrigin {
+    /// Destroyed on drop.
+    None,
+    /// Returned to the exact-size `put_image` [`StagingPool`].
+    Staging,
+    /// Returned to the size-classed upload pool (#177), in this class.
+    SizeClass(usize),
+}
+
+/// Usage of every size-classed upload buffer: instance/vertex data for the
+/// glyph and trapezoid pipelines, and the source of glyph-atlas uploads. One
+/// pool serves both; both are core usages with no feature requirement, and
+/// the memory type is still chosen from this buffer's own requirements.
+const UPLOAD_POOL_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::VERTEX_BUFFER.as_raw() | vk::BufferUsageFlags::TRANSFER_SRC.as_raw(),
+);
 
 impl std::fmt::Debug for StagingBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -879,7 +895,7 @@ impl StagingBuffer {
             mapped,
             size,
             coherent,
-            from_pool: false,
+            origin: PoolOrigin::None,
         })
     }
 
@@ -984,7 +1000,7 @@ const STAGING_POOL_TOTAL_BYTES_CAP: u64 = 64 * 1024 * 1024;
 
 impl StagingPool {
     /// Reuse a same-size buffer, or allocate a fresh one. The returned buffer
-    /// is flagged `from_pool` so retire routes it back here.
+    /// is tagged [`PoolOrigin::Staging`] so retire routes it back here.
     fn acquire(&mut self, vk: &Arc<VkContext>, size: u64) -> Result<StagingBuffer, vk::Result> {
         if let Some(buf) = self.buckets.get_mut(&size).and_then(Vec::pop) {
             self.pooled_bytes = self.pooled_bytes.saturating_sub(buf.size);
@@ -1003,12 +1019,13 @@ impl StagingPool {
             size,
             crate::kms::vk::mem_accounting::ChurnClass::StagingPool,
         )?;
-        buf.from_pool = true;
+        buf.origin = PoolOrigin::Staging;
         Ok(buf)
     }
 
-    /// Return a retired `from_pool` buffer for reuse, or drop it (destroy) if
-    /// the bucket/byte caps are exceeded. Caller guarantees `buf.from_pool`.
+    /// Return a retired pooled buffer for reuse, or drop it (destroy) if the
+    /// bucket/byte caps are exceeded. Caller guarantees
+    /// `buf.origin == PoolOrigin::Staging`.
     fn release(&mut self, buf: StagingBuffer) {
         let bucket = self.buckets.entry(buf.size).or_default();
         if bucket.len() >= STAGING_POOL_BUCKET_CAP
@@ -1136,6 +1153,12 @@ struct RenderEngineInner {
     /// `put_image`, to avoid per-upload vkCreateBuffer/vkAllocateMemory churn
     /// (costly on NVIDIA). See [`StagingPool`].
     staging_pool: StagingPool,
+    /// #177: size-classed reuse of the small per-request upload buffers —
+    /// glyph-run / ImageText instance buffers, trapezoid/triangle vertex
+    /// buffers and glyph-atlas upload staging. Entries go back only from the
+    /// `pending_frames` retire walk, once the frame's fence has signalled.
+    /// See [`RenderEngineInner::acquire_upload_buffer`].
+    upload_pool: super::size_class_pool::SizeClassPool<StagingBuffer>,
     /// Stage 3b: per-picture GPU-side state. Today only carries
     /// gradient `GradientPicture` instances built lazily by Stage
     /// 3c's first `render_composite`; Stage 3b just ensures
@@ -1322,6 +1345,46 @@ struct RenderEngineInner {
 }
 
 impl RenderEngineInner {
+    /// #177: a host-visible, host-coherent, mapped buffer of at least `size`
+    /// bytes with [`UPLOAD_POOL_USAGE`], for one request's instance/vertex
+    /// data or glyph upload. Served from the size-classed upload pool when
+    /// an idle buffer of the class exists, else freshly allocated at the
+    /// class size. Pin it in the open frame: the frame-retire walk in
+    /// [`RenderEngine::poll_retired`] returns it to the pool once the frame's
+    /// fence has signalled. Requests above
+    /// [`super::size_class_pool::MAX_CLASS_BYTES`] get a dedicated buffer
+    /// that is destroyed at retire.
+    fn acquire_upload_buffer(
+        &mut self,
+        size: u64,
+        churn: crate::kms::vk::mem_accounting::ChurnClass,
+    ) -> Result<StagingBuffer, vk::Result> {
+        use super::size_class_pool::{class_bytes, class_for};
+        // `churn` names the requesting site for the churn telemetry. It
+        // only matters when memory is actually allocated (a pool miss or
+        // an oversize request); a pool hit allocates nothing.
+        let Some(class) = class_for(size) else {
+            self.upload_pool.note_oversize();
+            return StagingBuffer::new_with_usage(
+                Arc::clone(&self.vk),
+                size,
+                UPLOAD_POOL_USAGE,
+                churn,
+            );
+        };
+        if let Some(buf) = self.upload_pool.take(class) {
+            return Ok(buf);
+        }
+        let mut buf = StagingBuffer::new_with_usage(
+            Arc::clone(&self.vk),
+            class_bytes(class),
+            UPLOAD_POOL_USAGE,
+            churn,
+        )?;
+        buf.origin = PoolOrigin::SizeClass(class);
+        Ok(buf)
+    }
+
     /// Look up or lazily build the text pipeline for
     /// `(op, dst_format, dst_has_alpha, component_alpha)`. Mirrors
     /// the RENDER `Composite` pipeline cache's get-or-build
@@ -1802,6 +1865,7 @@ impl RenderEngine {
                 vk,
                 submitted: VecDeque::new(),
                 staging_pool: StagingPool::default(),
+                upload_pool: super::size_class_pool::SizeClassPool::default(),
                 picture_paint: HashMap::new(),
                 glyph_atlas: None,
                 text_pipelines: HashMap::new(),
@@ -1915,22 +1979,34 @@ impl RenderEngine {
             for r in record.pins.retired_resources.drain(..) {
                 r.release(&inner.vk);
             }
-            // #nvidia perf: reclaim pooled upload staging buffers for reuse
-            // instead of destroying them (avoids per-upload vkCreateBuffer/
-            // vkAllocateMemory churn, costly on NVIDIA). The pin holds the sole
-            // staging Arc at retire (put_image's local dropped after recording;
-            // RecordedPutImage keeps only an index), so try_unwrap succeeds;
-            // from_pool buffers go back to the pool, others drop.
+            // Reclaim pooled buffers for reuse instead of destroying them
+            // (#nvidia perf for put_image staging; #177 for the per-request
+            // instance/vertex/glyph-upload buffers). This is the ONLY place
+            // either pool gets a buffer back, and it runs only after this
+            // frame's ticket has signalled, so a pooled buffer is never in
+            // flight. The pin holds the sole Arc at retire (the recording
+            // site's local dropped after recording; recorded ops keep only an
+            // index), so try_unwrap succeeds; a buffer still shared elsewhere
+            // just drops (destroyed) when its last holder does.
+            let retired_at = std::time::Instant::now();
             for arc in record.pins.staging_buffers.drain(..) {
-                if let Ok(buf) = Arc::try_unwrap(arc)
-                    && buf.from_pool
-                {
-                    inner.staging_pool.release(buf);
+                if let Ok(buf) = Arc::try_unwrap(arc) {
+                    match buf.origin {
+                        PoolOrigin::None => {}
+                        PoolOrigin::Staging => inner.staging_pool.release(buf),
+                        PoolOrigin::SizeClass(class) => {
+                            inner.upload_pool.put(class, buf, retired_at);
+                        }
+                    }
                 }
             }
             // The Arcs inside the record drop here, releasing pinned resources.
             drop(record);
         }
+        // #177: destroy upload buffers idle past the eviction age, so a burst
+        // doesn't leave live VA ranges parked (each one makes every other
+        // free on amdgpu dearer). Bounded per class even when this doesn't run.
+        inner.upload_pool.trim(std::time::Instant::now());
         // GLX-TFP (Task 1.2): free old promotion-displaced images whose
         // guarding fence has signaled. No ordering relationship to the
         // queues above (each rides its own ticket), so retain-filter
@@ -2234,6 +2310,20 @@ impl RenderEngine {
         // #nvidia perf: destroy pooled upload staging buffers (all submitted
         // work above is waited out, so none is in flight).
         inner.staging_pool.drain();
+        let upload_stats = inner.upload_pool.stats();
+        log::info!(
+            "upload pool: hits={} misses={} oversize={} returned={} rejected={} evicted={} \
+             idle={} idle_bytes={}",
+            upload_stats.hits,
+            upload_stats.misses,
+            upload_stats.oversize,
+            upload_stats.returned,
+            upload_stats.rejected,
+            upload_stats.evicted,
+            inner.upload_pool.idle_total(),
+            inner.upload_pool.idle_bytes(),
+        );
+        inner.upload_pool.drain();
         // Phase B.1: drain in-flight frame pins. wait() ensures Vk-side
         // completion before the Arc<StagingBuffer> drops would otherwise
         // race with GPU reads. Off-hot-path; one wait per pending frame
@@ -6111,9 +6201,8 @@ impl RenderEngine {
                 };
                 stats.atlas_interns += 1;
                 let upload_bytes = u64::from(w_u) * u64::from(h_u);
-                let staging = Arc::new(StagingBuffer::new(
-                    Arc::clone(&inner.vk),
-                    upload_bytes.max(1),
+                let staging = Arc::new(inner.acquire_upload_buffer(
+                    upload_bytes,
                     crate::kms::vk::mem_accounting::ChurnClass::GlyphUpload,
                 )?);
                 let src_slice = &g.pixels[..copy_len];
@@ -6264,10 +6353,8 @@ impl RenderEngine {
         }
         let instance_buf = {
             let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
-            let buf = StagingBuffer::new_with_usage(
-                Arc::clone(&inner.vk),
+            let buf = inner.acquire_upload_buffer(
                 needed,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
                 crate::kms::vk::mem_accounting::ChurnClass::ImageText,
             )?;
             unsafe {
@@ -6798,9 +6885,8 @@ impl RenderEngine {
                 };
                 stats.atlas_interns += 1;
                 let upload_bytes = copy_len as u64;
-                let staging = Arc::new(StagingBuffer::new(
-                    Arc::clone(&inner.vk),
-                    upload_bytes.max(1),
+                let staging = Arc::new(inner.acquire_upload_buffer(
+                    upload_bytes,
                     crate::kms::vk::mem_accounting::ChurnClass::GlyphUpload,
                 )?);
                 let src_slice: &[u8] = &atlas_bytes;
@@ -7213,10 +7299,8 @@ impl RenderEngine {
 
         let instance_buf = {
             let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
-            let buf = StagingBuffer::new_with_usage(
-                Arc::clone(&inner.vk),
+            let buf = inner.acquire_upload_buffer(
                 needed,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
                 crate::kms::vk::mem_accounting::ChurnClass::GlyphRun,
             )?;
             unsafe {
@@ -8293,12 +8377,8 @@ impl RenderEngine {
         let instance_buf = {
             let inner = self.inner.as_mut().expect("inner");
             let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
-            let buf = StagingBuffer::new_with_usage(
-                Arc::clone(&inner.vk),
-                needed,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                crate::kms::vk::mem_accounting::ChurnClass::Traps,
-            )?;
+            let buf = inner
+                .acquire_upload_buffer(needed, crate::kms::vk::mem_accounting::ChurnClass::Traps)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     instance_data.as_ptr(),
@@ -17276,6 +17356,146 @@ mod tests {
         );
 
         engine.drain_all(&mut platform);
+    }
+
+    /// #177: a pooled upload buffer must never be handed out again while
+    /// the GPU can still read it. Buffers pinned in the open frame, and in a
+    /// closed frame whose fence has not signalled (recorded into the submit
+    /// group but not yet submitted), stay out of the pool; only the retire
+    /// walk after the fence signals returns them, and the next request then
+    /// reuses one without allocating.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn upload_buffers_return_to_pool_only_after_frame_fence_signals() {
+        use crate::kms::vk::mem_accounting::thread_alloc_calls;
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
+        let pixels = [0xFFu8; 4];
+        let glyphs = [CompositeGlyphInput {
+            gs_xid: 0x7001,
+            glyph_id: 1,
+            w: 2,
+            h: 2,
+            pixels: GlyphPixels::A8(&pixels),
+            dst_x: 1,
+            dst_y: 1,
+        }];
+        let draw = |engine: &mut RenderEngine,
+                    store: &mut DrawableStore,
+                    platform: &mut PlatformBackend| {
+            engine
+                .composite_glyphs(
+                    store,
+                    platform,
+                    Dst::server_internal(target),
+                    3, // Over
+                    0,
+                    [1.0, 1.0, 1.0, 1.0],
+                    &glyphs,
+                    None,
+                )
+                .expect("composite_glyphs");
+        };
+        let idle = |engine: &RenderEngine| {
+            engine
+                .inner
+                .as_ref()
+                .expect("inner")
+                .upload_pool
+                .idle_total()
+        };
+
+        // Frame 1: the first request uploads the glyph (1 buffer) and its
+        // instance data (1 buffer); the second, in the SAME open frame,
+        // must get a fresh instance buffer — the first is still pinned.
+        let before = thread_alloc_calls();
+        draw(&mut engine, &mut store, &mut platform);
+        draw(&mut engine, &mut store, &mut platform);
+        assert_eq!(idle(&engine), 0);
+        let frame1_allocs = thread_alloc_calls() - before;
+        assert!(
+            frame1_allocs >= 3,
+            "glyph upload + two instance buffers: {frame1_allocs} allocations"
+        );
+
+        // Closed but not submitted: the fence cannot have signalled.
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close frame");
+        engine.poll_retired(&platform);
+        assert_eq!(
+            idle(&engine),
+            0,
+            "a frame whose fence has not signalled must not return its buffers"
+        );
+
+        // Submitted and complete: the retire walk returns all three.
+        engine
+            .flush_submit_group(
+                &mut store,
+                &mut platform,
+                super::super::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush");
+        platform.wait_idle_bounded();
+        engine.poll_retired(&platform);
+        assert_eq!(idle(&engine), 3);
+
+        // Frame 2: the glyph is cached; the instance buffer is reused.
+        let before = thread_alloc_calls();
+        draw(&mut engine, &mut store, &mut platform);
+        assert_eq!(thread_alloc_calls() - before, 0, "reused, not allocated");
+        assert_eq!(idle(&engine), 2);
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// #177: upload buffers come from their power-of-two class; a request
+    /// above the largest class gets a dedicated buffer that retire destroys
+    /// instead of pooling.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn upload_buffer_classes_and_oversize_fallback() {
+        use super::super::size_class_pool::{MAX_CLASS_BYTES, class_bytes};
+        let Some(platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let inner = engine.inner.as_mut().expect("inner");
+
+        let small = inner
+            .acquire_upload_buffer(100, crate::kms::vk::mem_accounting::ChurnClass::Other)
+            .expect("small");
+        assert_eq!(small.origin, PoolOrigin::SizeClass(0));
+        assert_eq!(small.size, class_bytes(0));
+        let mid = inner
+            .acquire_upload_buffer(10 * 1024, crate::kms::vk::mem_accounting::ChurnClass::Other)
+            .expect("mid");
+        assert_eq!(mid.origin, PoolOrigin::SizeClass(2));
+        assert_eq!(mid.size, 16 * 1024);
+        let big = inner
+            .acquire_upload_buffer(
+                MAX_CLASS_BYTES,
+                crate::kms::vk::mem_accounting::ChurnClass::Other,
+            )
+            .expect("largest class");
+        assert_eq!(big.origin, PoolOrigin::SizeClass(6));
+
+        let oversize = inner
+            .acquire_upload_buffer(
+                MAX_CLASS_BYTES + 1,
+                crate::kms::vk::mem_accounting::ChurnClass::Other,
+            )
+            .expect("oversize");
+        assert_eq!(oversize.origin, PoolOrigin::None, "not pooled");
+        assert_eq!(oversize.size, MAX_CLASS_BYTES + 1, "exact size");
+        assert_eq!(inner.upload_pool.stats().oversize, 1);
     }
 
     /// `image_text`'s identical hole (`render/engine.rs:5954`'s
