@@ -20,6 +20,7 @@
 use yserver_protocol::x11::{ClientId, sync as x11sync};
 
 use crate::{
+    backend::Backend,
     core_loop::fanout::fanout_event_to_clients,
     server::{ServerState, SyncAwait, SyncAwaitCondition},
 };
@@ -66,6 +67,7 @@ pub(crate) fn client_is_suspended(state: &ServerState, client: ClientId) -> bool
 /// that holds fires the await straight away.
 pub(crate) fn begin_await(
     state: &mut ServerState,
+    backend: &dyn Backend,
     client: ClientId,
     conditions: Vec<SyncAwaitCondition>,
 ) {
@@ -90,14 +92,28 @@ pub(crate) fn begin_await(
             ..
         } => counter_value(state, counter)
             .is_some_and(|value| x11sync::trigger_fires(test_type, value, value, test_value)),
-        SyncAwaitCondition::Fence { fence } => {
-            state.sync_fences.get(&fence).is_some_and(|f| f.triggered)
-        }
+        SyncAwaitCondition::Fence { fence } => fence_is_triggered(state, backend, fence),
     });
     state.sync_awaits.insert(client.0, SyncAwait { conditions });
     if already {
         fire_await(state, client, None);
     }
+}
+
+/// Xorg `pFence->funcs.CheckTriggered`: a fence backed by memory shared
+/// with the client (a DRI3 xshmfence, which the client can trigger or
+/// reset itself) is whatever that memory says (`miSyncShmFenceCheckTriggered`
+/// → `xshmfence_query`); any other fence is the server's triggered bit.
+///
+/// Nothing watches that memory: as in Xorg, an AwaitFence already
+/// suspended on such a fence is only re-checked when a TriggerFence
+/// request triggers it (`miSyncTriggerFence`) or it is destroyed, not
+/// when the client triggers it in memory.
+#[must_use]
+pub(crate) fn fence_is_triggered(state: &ServerState, backend: &dyn Backend, fence: u32) -> bool {
+    backend
+        .dri3_fence_triggered(fence)
+        .unwrap_or_else(|| state.sync_fences.get(&fence).is_some_and(|f| f.triggered))
 }
 
 /// Xorg `SyncAwaitTriggerFired`: send `client` the `CounterNotify` events

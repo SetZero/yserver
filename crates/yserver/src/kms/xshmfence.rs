@@ -91,15 +91,15 @@ impl FenceMapping {
     }
 
     /// Reset the fence back to untriggered.
-    #[allow(dead_code)]
     pub fn reset(&self) {
+        // SAFETY: ptr is valid for the lifetime of self.
         unsafe { xshmfence_reset(self.ptr) };
     }
 
     /// Whether the fence has been triggered. Returns 0 if reset, 1
     /// if triggered.
-    #[allow(dead_code)]
     pub fn query(&self) -> i32 {
+        // SAFETY: ptr is valid for the lifetime of self.
         unsafe { xshmfence_query(self.ptr) }
     }
 }

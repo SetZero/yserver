@@ -1,6 +1,7 @@
 // SYNC ground-truth probe: Await / AwaitFence suspension, CounterNotify, errors,
 // SERVERTIME waits, BadAlarm and AlarmNotify selection by clients other than the
-// alarm's owner. Client A drives counters and fences, client B awaits and then
+// alarm's owner. Not covered: DRI3 FenceFromFD (xshmfence) fences — Xvfb has
+// no DRI3, so their behaviour follows Xorg's miext/sync/misyncshm.c. Client A drives counters and fences, client B awaits and then
 // sends GetInputFocus; "blocked" means B's reply had not arrived after A's round
 // trip. Run against Xvfb and yserver and compare (XIDs and times differ).
 //   gcc -o /tmp/sync-await-probe tools/sync-await-probe.c -lxcb -lxcb-sync

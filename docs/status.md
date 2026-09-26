@@ -146,9 +146,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Deliberate deviation: a PositiveTransition on SERVERTIME fires when the
   clock crosses it; Xorg never wakes for it (`SyncComputeBracketValues`
   skips positive transitions on a never-decreasing counter), which only
-  ever hangs the client. Not done: xshmfence-backed fences triggered by the
-  client itself are not observed by AwaitFence/QueryFence (Xorg queries
-  the shared memory). ChangeAlarm / QueryAlarm / DestroyAlarm on a missing
+  ever hangs the client. DRI3 FenceFromFD xshmfences are read from their
+  shared memory, as Xorg's `misyncshm.c`: QueryFence, the AwaitFence
+  check and ResetFence's BadMatch test see the client's own
+  `xshmfence_trigger` / `xshmfence_reset`; ResetFence resets the memory and
+  DestroyFence (or the owner's disconnect) triggers it before unmapping.
+  As in Xorg nothing watches the memory, so an AwaitFence already suspended
+  on such a fence resumes on a TriggerFence request or the fence's
+  destruction, not on the client's in-memory trigger. ChangeAlarm / QueryAlarm / DestroyAlarm on a missing
   alarm answer BadAlarm in Xorg's check order (size, lookup, then the value
   list against the mask). Alarms keep Xorg's event-client list: any client
   may ChangeAlarm (events selects AlarmNotify for it; the owner's flag is

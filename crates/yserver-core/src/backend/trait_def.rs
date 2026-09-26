@@ -2489,6 +2489,25 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Xorg `miSyncShmFenceCheckTriggered`: for a fence whose state lives
+    /// in memory shared with the client (a DRI3 `FenceFromFD` xshmfence),
+    /// whether that memory says triggered — the client may trigger or
+    /// reset it itself, so this, not the server's bit, is the fence's
+    /// state. `None` for a fence without shared state.
+    fn dri3_fence_triggered(&self, _fence_xid: u32) -> Option<bool> {
+        None
+    }
+
+    /// Xorg `miSyncShmFenceReset`: SYNC `ResetFence` resets a
+    /// shared-memory fence's memory too (`xshmfence_reset`).
+    fn dri3_reset_fence(&mut self, _fence_xid: u32) {}
+
+    /// Xorg `miSyncShmScreenDestroyFence`: the fence resource is gone
+    /// (DestroyFence, owner disconnect). A shared-memory fence is
+    /// triggered — releasing anything the client waits on — and unmapped;
+    /// any other backing keyed by the xid is dropped.
+    fn dri3_destroy_fence(&mut self, _fence_xid: u32) {}
+
     /// Stage 5 Task 6.1: take an Arc clone of the xshmfence's
     /// underlying primitive, suitable for deferred completion paths
     /// that need to survive an intervening `XFixesDestroyFence`.

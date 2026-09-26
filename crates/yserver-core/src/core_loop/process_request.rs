@@ -5515,7 +5515,7 @@ fn handle_sync_request(
                 sequence.0,
                 waits.len()
             );
-            crate::core_loop::sync_await::begin_await(state, client_id, waits);
+            crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::CREATE_ALARM => {
             // Xorg `ProcSyncCreateAlarm`: the value list must match the mask.
@@ -5770,6 +5770,7 @@ fn handle_sync_request(
                 }
                 crate::core_loop::sync_await::fence_destroyed(state, fence);
                 state.sync_fences.remove(&fence);
+                backend.dri3_destroy_fence(fence);
                 debug!(
                     "client {} #{} SYNC::DestroyFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
@@ -5804,8 +5805,9 @@ fn handle_sync_request(
                     return outcome;
                 }
                 // Xorg `ProcSyncResetFence`: only a triggered fence can be
-                // reset (Xvfb: BadMatch naming the fence).
-                if state.sync_fences.get(&fence).is_some_and(|f| !f.triggered) {
+                // reset (Xvfb: BadMatch naming the fence); a shared-memory
+                // fence is tested, and reset, in that memory.
+                if !crate::core_loop::sync_await::fence_is_triggered(state, &*backend, fence) {
                     return sync_error(
                         state,
                         client_id,
@@ -5815,6 +5817,7 @@ fn handle_sync_request(
                         fence,
                     );
                 }
+                backend.dri3_reset_fence(fence);
                 if let Some(f) = state.sync_fences.get_mut(&fence) {
                     f.triggered = false;
                 }
@@ -5825,7 +5828,10 @@ fn handle_sync_request(
             if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
                 return outcome;
             }
-            let triggered = state.sync_fences.get(&fence).is_some_and(|f| f.triggered);
+            // Xorg `ProcSyncQueryFence` → `CheckTriggered`: shared memory
+            // for a DRI3 xshmfence, the server's bit otherwise.
+            let triggered =
+                crate::core_loop::sync_await::fence_is_triggered(state, &*backend, fence);
             let reply = x11sync::encode_query_fence_reply(byte_order, sequence, triggered);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -5871,7 +5877,7 @@ fn handle_sync_request(
                 .into_iter()
                 .map(|fence| crate::server::SyncAwaitCondition::Fence { fence })
                 .collect();
-            crate::core_loop::sync_await::begin_await(state, client_id, waits);
+            crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::SET_PRIORITY => {
             // Stub.
@@ -61402,6 +61408,91 @@ mod tests {
             alarm_notifies(&f.b_packets()),
             vec![(AN, 0, 5, s::ALARM_STATE_DESTROYED)]
         );
+    }
+
+    /// A DRI3 FenceFromFD xshmfence keeps its state in memory the client
+    /// can trigger and reset itself (`xshmfence_trigger` /
+    /// `xshmfence_reset`). Xorg's shm fence (`misyncshm.c`) answers every
+    /// `CheckTriggered` from that memory — QueryFence, the AwaitFence
+    /// epilogue, ResetFence's BadMatch test, and `miSyncTriggerFence`'s
+    /// re-check — and never from the server's own bit; ResetFence resets
+    /// the memory and DestroyFence triggers it before unmapping. Nothing in
+    /// Xorg watches the memory, so an AwaitFence already suspended stays
+    /// suspended when the client triggers it in memory, until a
+    /// TriggerFence request or the fence's destruction. Xvfb has no DRI3,
+    /// so this follows the source (`miSyncShmFenceCheckTriggered`,
+    /// `miSyncShmFenceReset`, `miSyncShmScreenDestroyFence`,
+    /// `SyncAwaitEpilogue`, `miSyncTriggerFence`).
+    #[test]
+    fn sync_shm_fence_state_is_read_from_shared_memory() {
+        use yserver_protocol::x11::sync as s;
+        const F: u32 = 0x0010_0070;
+        const G: u32 = 0x0010_0071;
+        let mut f = sync_fixture();
+        for fence in [F, G] {
+            f.state.sync_fences.insert(
+                fence,
+                crate::server::SyncFence {
+                    owner: ClientId(SYNC_A),
+                    triggered: false,
+                },
+            );
+            f.backend.shm_fences.insert(fence, false);
+        }
+        let query = |f: &mut SyncFixture| {
+            f.b(s::QUERY_FENCE, &F.to_le_bytes());
+            let reply = f.b_packets();
+            assert_eq!(reply[0][0], 1, "QueryFence reply");
+            reply[0][8] != 0
+        };
+
+        // The client triggers it in memory: QueryFence sees it and an
+        // AwaitFence returns at once.
+        f.backend.shm_fences.insert(F, true);
+        assert!(query(&mut f));
+        f.b(s::AWAIT_FENCE, &F.to_le_bytes());
+        assert!(!f.suspended());
+
+        // The client resets it in memory after the server triggered it:
+        // the memory wins over the server's bit.
+        f.a(s::TRIGGER_FENCE, &F.to_le_bytes());
+        assert!(f.state.sync_fences[&F].triggered);
+        f.backend.shm_fences.insert(F, false);
+        assert!(!query(&mut f));
+        f.b(s::RESET_FENCE, &F.to_le_bytes());
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_MATCH, F, u16::from(s::RESET_FENCE), 142),
+            "untriggered in memory"
+        );
+        f.b(s::AWAIT_FENCE, &F.to_le_bytes());
+        assert!(f.suspended(), "untriggered in memory");
+
+        // A trigger in memory alone wakes nothing (Xorg never looks);
+        // a TriggerFence request does.
+        f.backend.shm_fences.insert(F, true);
+        assert!(f.suspended());
+        f.a(s::TRIGGER_FENCE, &F.to_le_bytes());
+        assert!(!f.suspended());
+
+        // ResetFence of a fence triggered in memory resets the memory.
+        f.b(s::RESET_FENCE, &F.to_le_bytes());
+        assert!(f.b_packets().is_empty());
+        assert_eq!(f.backend.shm_fences.get(&F), Some(&false));
+        assert!(!query(&mut f));
+
+        // DestroyFence triggers the memory (releasing client waiters) and
+        // unmaps it; so does the owner's disconnect.
+        f.a(s::DESTROY_FENCE, &F.to_le_bytes());
+        assert_eq!(f.backend.destroyed_shm_fences, vec![(F, true)]);
+        assert!(!f.backend.shm_fences.contains_key(&F));
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(SYNC_A),
+        );
+        assert_eq!(f.backend.destroyed_shm_fences, vec![(F, true), (G, true)]);
+        assert!(f.backend.shm_fences.is_empty());
     }
 
     /// SERVERTIME awaits wake when the clock reaches the value (Xvfb: an

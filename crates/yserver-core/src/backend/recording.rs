@@ -381,6 +381,13 @@ pub struct RecordingBackend {
     /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
     /// teardown/lifecycle tests can assert idle-fence release.
     pub triggered_dri3_fences: Vec<u32>,
+    /// Shared-memory fences (DRI3 FenceFromFD xshmfences) by xid, with
+    /// their in-memory triggered state; tests flip it to model the client
+    /// calling `xshmfence_trigger` / `xshmfence_reset` itself.
+    pub shm_fences: std::collections::HashMap<u32, bool>,
+    /// `(xid, triggered)` of each shared-memory fence `dri3_destroy_fence`
+    /// unmapped, with its in-memory state at unmap time.
+    pub destroyed_shm_fences: Vec<(u32, bool)>,
     /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
     /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
     /// release be asserted the same way `triggered_dri3_fences` covers
@@ -576,6 +583,8 @@ impl RecordingBackend {
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
+            shm_fences: std::collections::HashMap::new(),
+            destroyed_shm_fences: Vec::new(),
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
@@ -788,7 +797,26 @@ impl Backend for RecordingBackend {
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
+        if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
+            *triggered = true;
+        }
         Ok(())
+    }
+
+    fn dri3_fence_triggered(&self, fence_xid: u32) -> Option<bool> {
+        self.shm_fences.get(&fence_xid).copied()
+    }
+
+    fn dri3_reset_fence(&mut self, fence_xid: u32) {
+        if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
+            *triggered = false;
+        }
+    }
+
+    fn dri3_destroy_fence(&mut self, fence_xid: u32) {
+        if self.shm_fences.remove(&fence_xid).is_some() {
+            self.destroyed_shm_fences.push((fence_xid, true));
+        }
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {

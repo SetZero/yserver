@@ -390,6 +390,7 @@ pub fn process_disconnect_reporting(
     for fence in dead_fences {
         crate::core_loop::sync_await::fence_destroyed(state, fence);
         state.sync_fences.remove(&fence);
+        backend.dri3_destroy_fence(fence);
     }
     state.glx_contexts.retain(|_, c| c.owner != client_id);
     // Release export-lifetime refs for any GLXPixmaps the client still held.

@@ -26881,6 +26881,28 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    fn dri3_fence_triggered(&self, fence_xid: u32) -> Option<bool> {
+        self.dri3_xshmfences
+            .get(&fence_xid)
+            .map(|mapping| mapping.query() != 0)
+    }
+
+    fn dri3_reset_fence(&mut self, fence_xid: u32) {
+        if let Some(mapping) = self.dri3_xshmfences.get(&fence_xid) {
+            mapping.reset();
+        }
+    }
+
+    fn dri3_destroy_fence(&mut self, fence_xid: u32) {
+        // Xorg `miSyncShmScreenDestroyFence`: trigger, then unmap. A
+        // deferred Present completion holding an Arc clone keeps the
+        // mapping alive until it lets go.
+        if let Some(mapping) = self.dri3_xshmfences.remove(&fence_xid) {
+            mapping.trigger();
+        }
+        self.dri3_sync_resources.remove(&fence_xid);
+    }
+
     fn dri3_xshmfence_handle(
         &self,
         fence_xid: u32,
@@ -41573,6 +41595,50 @@ mod tests {
         assert_eq!(post, 1, "after trigger, xshmfence query() == 1");
         // Defensive: pre and post differ in the expected direction.
         assert_ne!(pre, post, "trigger() should have changed the fence state");
+    }
+
+    /// An imported xshmfence is shared with the client, which triggers and
+    /// resets it in memory itself. The backend's fence state is that
+    /// memory (Xorg `miSyncShmFenceCheckTriggered` → `xshmfence_query`),
+    /// ResetFence resets it, and DestroyFence triggers it before
+    /// unmapping (`miSyncShmScreenDestroyFence`). A second mapping of the
+    /// same memfd plays the client.
+    #[test]
+    fn dri3_shm_fence_state_is_the_shared_memory() {
+        use std::os::fd::{AsFd as _, FromRawFd, OwnedFd};
+        use yserver_core::backend::Backend as _;
+        #[cfg(target_os = "linux")]
+        let raw_result =
+            unsafe { libc::syscall(libc::SYS_memfd_create, c"yserver_shm_fence".as_ptr(), 0u32) };
+        #[cfg(not(target_os = "linux"))]
+        let raw_result = i64::from(unsafe { libc::memfd_create(c"yserver_shm_fence".as_ptr(), 0) });
+        assert!(raw_result >= 0, "memfd_create");
+        let raw = i32::try_from(raw_result).expect("fd fits i32");
+        let page =
+            libc::off_t::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+        assert_eq!(unsafe { libc::ftruncate(raw, page) }, 0, "ftruncate");
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let client = crate::kms::xshmfence::FenceMapping::map(fd.as_fd()).expect("client map");
+        let mut b = KmsBackend::for_tests();
+        let fence: u32 = 0x4040_2222;
+        assert_eq!(b.dri3_fence_triggered(fence), None, "not imported yet");
+        b.dri3_fence_from_fd(fence, fd).expect("xshmfence import");
+        assert_eq!(b.dri3_fence_triggered(fence), Some(false));
+
+        client.trigger();
+        assert_eq!(b.dri3_fence_triggered(fence), Some(true), "client trigger");
+        client.reset();
+        assert_eq!(b.dri3_fence_triggered(fence), Some(false), "client reset");
+
+        b.dri3_trigger_fence(fence).expect("trigger");
+        assert_eq!(client.query(), 1);
+        b.dri3_reset_fence(fence);
+        assert_eq!(client.query(), 0, "ResetFence resets the memory");
+
+        b.dri3_destroy_fence(fence);
+        assert_eq!(client.query(), 1, "DestroyFence triggers before unmapping");
+        assert_eq!(b.dri3_fence_triggered(fence), None, "unmapped");
+        assert!(!b.dri3_xshmfences.contains_key(&fence));
     }
 
     /// Fences and syncobjs are different X resource types with different
