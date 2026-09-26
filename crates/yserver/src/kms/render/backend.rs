@@ -9129,6 +9129,40 @@ impl KmsBackend {
 
     /// Stage 5 Task 3 POC: drain the engine's cow-batch flush
     /// records (since the last drain), bump telemetry counters,
+    /// Drain the engine's queued submit/flush/frame-close records into
+    /// telemetry. Runs at the end of every `maybe_composite` tick, including
+    /// the dark (VT-away / DPMS-off) early returns: paint frames keep
+    /// closing while dark, and `pending_flush_outcomes` has no cap, so an
+    /// undrained dark period would grow it for as long as the display is off.
+    fn drain_paint_submit_telemetry(&mut self) {
+        self.drain_render_telemetry();
+        // Phase A Task 3.5: drain SubmitGroup flush outcomes and
+        // route each to the matching telemetry counter.
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        // Phase A telemetry retention gauges. Sample on every tick —
+        // the high-water aggregator handles bursts.
+        let pool_count =
+            u64::try_from(self.engine.descriptor_pool_ring_pool_count()).unwrap_or(u64::MAX);
+        self.telemetry
+            .record_active_descriptor_pool_high_water(pool_count);
+        let (staging_bytes, scratch_bytes) = self.engine.active_resource_bytes();
+        self.telemetry
+            .record_active_staging_high_water(staging_bytes);
+        self.telemetry
+            .record_active_scratch_high_water(scratch_bytes);
+        // Phase B.1 Task 21: drain frame-builder close events into telemetry.
+        self.drain_frame_builder_telemetry();
+        // Per-second telemetry summary emission.
+        self.telemetry.maybe_emit(self.engine.pending_count());
+    }
+
     /// Stage 5 Task 3 (render-composite generalization): drain
     /// the engine's render-batch flush records, bump telemetry
     /// counters, emit one submit-trace event per flush.
@@ -19354,11 +19388,9 @@ impl Backend for KmsBackend {
             .into_iter()
             .chain(present_deadline)
             .chain(rescan_deadline)
-            .chain(
-                allow_kms_timers
-                    .then(|| self.engine.open_frame_timeout_deadline())
-                    .flatten(),
-            )
+            // Not gated on `allow_kms_timers`: `maybe_composite` closes the
+            // paint frame on its timeout while dark too (#177).
+            .chain(self.engine.open_frame_timeout_deadline())
             .chain(
                 allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
@@ -19389,6 +19421,22 @@ impl Backend for KmsBackend {
             self.request_exit();
             return Ok(());
         }
+        // Service the paint-batch deadline ahead of every scanout gate below
+        // (VT, DPMS, direct-scanout hold). Closing the frame records its CB
+        // and submits it on the render queue — Vulkan only, no KMS commit and
+        // no DRM master — and clients keep drawing while the display is dark
+        // or held by direct scanout. Behind the VT/DPMS gates the frame stayed
+        // open until the 1024-pin ceiling forced it shut, then freed
+        // everything it pinned in one burst: a live-allocation/VRAM sawtooth
+        // with the monitor off (#177). Behind the direct-scanout gate the
+        // final gkrellm update stayed open until unrelated screen activity
+        // closed it.
+        if let Err(e) = self
+            .engine
+            .close_open_frame_if_timed_out(&mut self.store, &mut self.platform)
+        {
+            log::warn!("render maybe_composite: timeout close failed: {e:?}");
+        }
         // VT-master gate: while a VT switch is in progress or the GPU is
         // handed to another session, every
         // atomic_commit returns `EACCES`. `composite_and_flip` has
@@ -19398,6 +19446,7 @@ impl Backend for KmsBackend {
         // (observed 2026-05-31 — 77 WARNs in 3 seconds on
         // `just startx` + VT switch under MATE).
         if !self.scanout_allowed() {
+            self.drain_paint_submit_telemetry();
             return Ok(());
         }
         // DPMS gate: outputs are inactive (every CRTC has ACTIVE=0 +
@@ -19409,22 +19458,12 @@ impl Backend for KmsBackend {
         // maybe_composite is a separate scene.tick caller).
         // See project_einval_atomic_commit_storm_wedge memory entry.
         if !self.kms_outputs_active {
+            self.drain_paint_submit_telemetry();
             return Ok(());
         }
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
-        // Service the paint-batch deadline before the direct-scanout hold
-        // gate. Direct scanout suppresses scene composition, but it must not
-        // suppress GPU submission of client drawing into redirected pixmaps:
-        // otherwise the final gkrellm update remains open until unrelated
-        // screen activity happens to close it.
-        if let Err(e) = self
-            .engine
-            .close_open_frame_if_timed_out(&mut self.store, &mut self.platform)
-        {
-            log::warn!("render maybe_composite: timeout close failed: {e:?}");
-        }
         if self.scanout_m2.active() {
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
@@ -19568,32 +19607,7 @@ impl Backend for KmsBackend {
                 }
             }
         };
-        self.drain_render_telemetry();
-        // Phase A Task 3.5: drain SubmitGroup flush outcomes and
-        // route each to the matching telemetry counter.
-        for outcome in self.engine.drain_flush_outcomes() {
-            if outcome.aborted {
-                self.telemetry.record_submit_group_abort();
-            } else {
-                self.telemetry
-                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
-            }
-        }
-        // Phase A telemetry retention gauges. Sample on every tick —
-        // the high-water aggregator handles bursts.
-        let pool_count =
-            u64::try_from(self.engine.descriptor_pool_ring_pool_count()).unwrap_or(u64::MAX);
-        self.telemetry
-            .record_active_descriptor_pool_high_water(pool_count);
-        let (staging_bytes, scratch_bytes) = self.engine.active_resource_bytes();
-        self.telemetry
-            .record_active_staging_high_water(staging_bytes);
-        self.telemetry
-            .record_active_scratch_high_water(scratch_bytes);
-        // Phase B.1 Task 21: drain frame-builder close events into telemetry.
-        self.drain_frame_builder_telemetry();
-        // Per-second telemetry summary emission.
-        self.telemetry.maybe_emit(self.engine.pending_count());
+        self.drain_paint_submit_telemetry();
         result
     }
 
@@ -29776,6 +29790,144 @@ mod tests {
         assert!(
             b.next_wakeup().is_none(),
             "dirty scene must not busy-wake while scanout is disallowed",
+        );
+    }
+
+    /// #177: with the display dark — DPMS off, or the VT handed away — the
+    /// paint frame clients keep drawing into must still close on its 16 ms
+    /// timeout, and `next_wakeup` must still schedule that close. Closing a
+    /// frame submits paint work on the render queue only; the compose tick
+    /// (scene compose, page-flips, cursor) stays gated. Before the fix both
+    /// gates returned ahead of the timeout close, so the frame stayed open
+    /// until the 1024-pin ceiling forced it shut and freed everything it
+    /// pinned at once.
+    fn assert_frame_timeout_serviced_while_dark(
+        darken: fn(&mut KmsBackend),
+        undo: fn(&mut KmsBackend),
+        what: &str,
+    ) {
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // init_root_storage's fill leaves the construction frame open.
+        if b.frame_builder_is_open_for_tests() {
+            b.engine_close_open_frame_for_timeout_for_tests()
+                .expect("close construction frame");
+        }
+
+        let pix = b.create_pixmap(None, 32, 4, 4).expect("pixmap");
+        b.fill_rectangle(None, pix.as_raw(), 0xFF00_00FF, 0, 0, 4, 4)
+            .expect("fill_rectangle");
+        assert!(
+            b.frame_builder_is_open_for_tests(),
+            "fixture sanity: fill_rectangle records into an open frame"
+        );
+
+        darken(&mut b);
+        // A compose is owed; only the dark gate may keep the tick from it.
+        b.scene.scene_structure_dirty = true;
+
+        let deadline = b
+            .engine
+            .open_frame_timeout_deadline()
+            .expect("open frame has a timeout deadline");
+        let wake = b
+            .next_wakeup()
+            .unwrap_or_else(|| panic!("{what}: next_wakeup must schedule the frame timeout"));
+        assert!(
+            wake <= deadline,
+            "{what}: next_wakeup {wake:?} must not sleep past the frame timeout {deadline:?}"
+        );
+
+        let now = std::time::Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now + std::time::Duration::from_millis(2));
+        }
+        // Baseline after draining the construction-frame close.
+        b.drain_paint_submit_telemetry();
+        let frame_id_before = b.telemetry.frame_id();
+        let compose_closes_before = b
+            .telemetry
+            .lifetime
+            .frame_builder_close_reason_legacy_sc_compose;
+        let timeout_closes_before = b.telemetry.lifetime.frame_builder_close_reason_timeout;
+        let flushes_before = b.telemetry.lifetime.submit_group_flushes;
+
+        b.tick_maybe_composite_for_tests();
+
+        assert!(
+            !b.frame_builder_is_open_for_tests(),
+            "{what}: the paint frame must close on its timeout"
+        );
+        assert_eq!(
+            b.telemetry.lifetime.frame_builder_close_reason_timeout,
+            timeout_closes_before + 1,
+            "{what}: the close is a timeout close, drained into telemetry"
+        );
+        assert!(
+            b.telemetry.lifetime.submit_group_flushes > flushes_before,
+            "{what}: the frame's submit is drained into telemetry"
+        );
+        assert_eq!(
+            b.telemetry.frame_id(),
+            frame_id_before,
+            "{what}: no compose tick while dark"
+        );
+        assert_eq!(
+            b.telemetry
+                .lifetime
+                .frame_builder_close_reason_legacy_sc_compose,
+            compose_closes_before,
+            "{what}: no compose-boundary close while dark"
+        );
+        assert!(
+            b.next_wakeup().is_none(),
+            "{what}: nothing left to wake for once the frame closed"
+        );
+
+        // Control: with the display back, the same tick enters the compose
+        // path, which closes a fresh frame at the compose boundary. So the
+        // no-compose assertions above are the dark gate, not the fixture.
+        b.fill_rectangle(None, pix.as_raw(), 0xFF00_FF00, 0, 0, 4, 4)
+            .expect("fill_rectangle");
+        undo(&mut b);
+        b.tick_maybe_composite_for_tests();
+        assert_ne!(
+            b.telemetry.frame_id(),
+            frame_id_before,
+            "{what}: control — the compose tick runs once the display is back"
+        );
+        assert_eq!(
+            b.telemetry
+                .lifetime
+                .frame_builder_close_reason_legacy_sc_compose,
+            compose_closes_before + 1,
+            "{what}: control — the compose boundary closes the frame"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn frame_timeout_closes_and_is_scheduled_with_dpms_off() {
+        assert_frame_timeout_serviced_while_dark(
+            |b| b.kms_outputs_active = false,
+            |b| b.kms_outputs_active = true,
+            "DPMS off",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn frame_timeout_closes_and_is_scheduled_with_vt_away() {
+        use crate::vt::state::VtState;
+        assert_frame_timeout_serviced_while_dark(
+            |b| b.vt_state = VtState::Suspended,
+            |b| b.vt_state = VtState::Active,
+            "VT away",
         );
     }
 
