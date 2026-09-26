@@ -12278,9 +12278,11 @@ impl KmsBackend {
         if target_mscs.is_empty() {
             return Ok(0);
         }
-        // Master loss / DPMS off / VT suspend: the kernel discarded any
-        // queued sequences; drop our bookkeeping and skip arming.
-        if !self.scanout_allowed() {
+        // Master loss / VT suspend (`scanout_allowed`) or DPMS off
+        // (`kms_outputs_active`): the kernel discarded any queued sequences
+        // and a powered-down CRTC rejects new ones with EINVAL, so drop our
+        // bookkeeping and skip arming rather than retry every iteration.
+        if !self.scanout_allowed() || !self.kms_outputs_active {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
@@ -12330,9 +12332,11 @@ impl KmsBackend {
         if targets.is_empty() {
             return Ok(0);
         }
-        // Master loss / DPMS off / VT suspend: the kernel discarded any
-        // queued sequences; drop our bookkeeping and skip arming.
-        if !self.scanout_allowed() {
+        // Master loss / VT suspend (`scanout_allowed`) or DPMS off
+        // (`kms_outputs_active`): the kernel discarded any queued sequences
+        // and a powered-down CRTC rejects new ones with EINVAL, so drop our
+        // bookkeeping and skip arming rather than retry every iteration.
+        if !self.scanout_allowed() || !self.kms_outputs_active {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
@@ -46340,6 +46344,47 @@ mod tests {
         assert!(!b.present_flip_in_flight(crtc_id));
         assert!(!b.present_absolute_vblank_arm_supported(crtc_id));
         assert!(!b.direct_present_crtc_eligible(crtc_id, 0));
+    }
+
+    /// With DPMS off the CRTCs are powered down and CRTC_QUEUE_SEQUENCE
+    /// fails with EINVAL; arming anyway retried on every loop iteration
+    /// (~160 `PRESENT-DBG ... ERR Invalid argument` warnings/s on bee).
+    /// Xorg arms no kernel vblank for a blanked screen either (modesetting's
+    /// get_crtc finds no active CRTC, so Present falls back to its fake
+    /// clock). Neither arm may issue the ioctl while the outputs are off.
+    #[test]
+    fn vblank_arms_skip_the_ioctl_while_outputs_are_off() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        b.kms_outputs_active = false;
+        let mut calls = 0u32;
+        let armed = b
+            .arm_idle_vblanks_with(primary, &[100], |_| {
+                calls += 1;
+                Ok(true)
+            })
+            .unwrap();
+        let absolute = b
+            .arm_present_absolute_vblank_with(primary, &[500], |_, _| {
+                calls += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(
+            (armed, absolute, calls),
+            (0, 0, 0),
+            "no ioctl with the outputs off"
+        );
+
+        // Outputs back on: arming works again.
+        b.kms_outputs_active = true;
+        let armed = b
+            .arm_idle_vblanks_with(primary, &[100], |_| {
+                calls += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!((armed, calls), (1, 1));
     }
 
     #[test]
