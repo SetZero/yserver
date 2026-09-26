@@ -1422,11 +1422,26 @@ pub struct SyncPendingAwait {
 /// GLX context resource. We never run server-side GL — direct-
 /// rendering clients use the tag we assign at MakeCurrent to label
 /// rendering requests, but no actual GL state is tracked here.
+///
+/// The remaining fields are what Xorg's `__GLXcontext` answers
+/// `QueryContext` (`GLX_EXT_import_context`) and `IsDirect` from
+/// (glxcmds.c `DoQueryContext` / `__glXDisp_IsDirect`): the share list,
+/// the config's visual and FBConfig IDs, the screen, the render type and
+/// the client's `isDirect` flag, all recorded at creation.
 #[derive(Clone, Debug)]
 pub struct GlxContext {
     pub owner: ClientId,
+    pub screen: u32,
+    /// X visual of the context's config; 0 for a visual-less FBConfig
+    /// (Xorg `ctx->config->visualID`).
+    pub visual_id: u32,
+    /// FBConfig ID of the context's config; 0 when a GLX 1.0 visual has
+    /// no synthesised FBConfig.
     pub fbconfig: u32,
     pub render_type: u32,
+    /// `shareList` from the creation request (Xorg `ctx->share_id`).
+    pub share_list: u32,
+    pub is_direct: bool,
 }
 
 /// Which kind of drawable a `GlxDrawable` record wraps. Drives the
@@ -1467,6 +1482,17 @@ pub struct GlxDrawable {
     /// re-resolve `x_drawable → host_xid` (the resource is gone), leaking
     /// the export ref forever. `None` for the window/pbuffer cases.
     pub glx_export_host_xid: Option<u32>,
+    /// `GLX_TEXTURE_TARGET_EXT` value `GetDrawableAttributes` reports.
+    /// Xorg answers `GLX_TEXTURE_2D_EXT` only when `pGlxDraw->target` is
+    /// `GL_TEXTURE_2D`, else `GLX_TEXTURE_RECTANGLE_EXT`
+    /// (glxcmds.c:1896-1897). A GLX 1.0 `CreateGLXPixmap` never runs
+    /// `determineTextureTarget`, so its target stays 0 and Xorg reports
+    /// RECTANGLE; Mesa adopts the reported target for a GLX 1.0 pixmap
+    /// (glx_pbuffer.c `__glXGetDrawableAttribute`), because
+    /// `glXCreateGLXPixmap` takes no attribute list. Every other creation
+    /// path records `GLX_TEXTURE_2D_EXT`, the value yserver has always
+    /// reported for them.
+    pub texture_target: u32,
 }
 
 impl ServerState {
@@ -6376,8 +6402,12 @@ mod tests {
             id_glx_ctx,
             GlxContext {
                 owner,
+                screen: 0,
+                visual_id: 0,
                 fbconfig: 0,
                 render_type: 0,
+                share_list: 0,
+                is_direct: true,
             },
         );
         expect.push(id_glx_ctx);
@@ -6395,6 +6425,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
         expect.push(id_glx_draw);

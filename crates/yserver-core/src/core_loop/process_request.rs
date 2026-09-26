@@ -13602,7 +13602,7 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     attribs.push((g::GLX_HEIGHT, height));
     attribs.push((g::GLX_SCREEN, 0));
     if let Some(d) = drawable {
-        attribs.push((g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT));
+        attribs.push((g::GLX_TEXTURE_TARGET_EXT, d.texture_target));
         attribs.push((g::GLX_EVENT_MASK, d.event_mask));
         attribs.push((g::GLX_FBCONFIG_ID, d.fbconfig));
         if d.kind == crate::server::GlxDrawableKind::Pbuffer {
@@ -14671,10 +14671,27 @@ fn handle_glx_request(
             );
         }
         x11glx::IS_DIRECT => {
-            // We always claim direct rendering; the actual GL execution
-            // happens client-side via libGLX_mesa hitting our DRI3
-            // backend.
-            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, true);
+            // Xorg answers the context's recorded isDirect and
+            // GLXBadContext for an XID that is not a context
+            // (glxcmds.c:702-726, glx/vnd_dispatch_stubs.c:509-525). Mesa's
+            // glXImportContextEXT sends this first and returns NULL for a
+            // direct context without ever sending QueryContext.
+            let context = match glx_request_context(state, body) {
+                Ok(context) => context,
+                Err((code, value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let is_direct = state.glx_contexts[&context].is_direct;
+            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, is_direct);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -14722,37 +14739,46 @@ fn handle_glx_request(
         x11glx::CREATE_CONTEXT
         | x11glx::CREATE_NEW_CONTEXT
         | x11glx::CREATE_CONTEXT_ATTRIBS_ARB => {
-            // Allocate a GlxContext resource keyed by the client-
-            // chosen XID at body[0..4]. The fbconfig at body[4..8]
-            // and renderType at body[8..12] are recorded for the
-            // eventual MakeCurrent reply but otherwise unused — we
-            // never execute server-side GL.
-            let xid = if body.len() >= 4 {
-                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
-            } else {
-                0
+            // Allocate a GlxContext resource keyed by the client-chosen
+            // XID. We never execute server-side GL; the recorded config,
+            // share list, render type and isDirect flag are what
+            // QueryContext / IsDirect report back (Xorg DoCreateContext
+            // stores the same fields, glxcmds.c:318-325).
+            let Some(req) = x11glx::parse_create_context(minor, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
             };
-            let fbconfig = if body.len() >= 8 {
-                u32::from_le_bytes([body[4], body[5], body[6], body[7]])
-            } else {
-                0
-            };
-            let render_type = if body.len() >= 12 {
-                u32::from_le_bytes([body[8], body[9], body[10], body[11]])
-            } else {
-                0
+            let (visual_id, fbconfig) = match req.config {
+                x11glx::ContextConfigRef::Visual(visual) => {
+                    (visual, glx_visual_fbconfig(visual).unwrap_or(0))
+                }
+                x11glx::ContextConfigRef::FbConfig(fbconfig) => {
+                    (glx_fbconfig_visual(fbconfig), fbconfig)
+                }
             };
             state.glx_contexts.insert(
-                xid,
+                req.context,
                 crate::server::GlxContext {
                     owner: client_id,
+                    screen: req.screen,
+                    visual_id,
                     fbconfig,
-                    render_type,
+                    render_type: req.render_type,
+                    share_list: req.share_list,
+                    is_direct: req.is_direct,
                 },
             );
             debug!(
-                "client {} #{} GLX::CreateContext xid=0x{:x} fbconfig=0x{:x}",
-                client_id.0, sequence.0, xid, fbconfig
+                "client {} #{} GLX::CreateContext minor={minor} xid=0x{:x} fbconfig=0x{:x} \
+                 visual=0x{visual_id:x} share=0x{:x} direct={}",
+                client_id.0, sequence.0, req.context, fbconfig, req.share_list, req.is_direct
             );
         }
         x11glx::DESTROY_CONTEXT => {
@@ -14846,43 +14872,31 @@ fn handle_glx_request(
                     );
                 }
 
-                // For CREATE_PIXMAP: resolve the host_xid NOW and store it on
-                // the GlxDrawable so release is robust to the X pixmap being
-                // freed (X11 FreePixmap) before glXDestroyPixmap/disconnect —
-                // re-resolving x_drawable→host_xid at release time would fail
-                // once the resource is gone, leaking the export ref forever.
-                let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
-                    state
-                        .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
-                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+                if minor == x11glx::CREATE_PIXMAP {
+                    insert_glx_pixmap_record(
+                        state,
+                        backend,
+                        client_id,
+                        req.glx_window,
+                        req.x_window,
+                        req.fbconfig,
+                        x11glx::GLX_TEXTURE_2D_EXT,
+                    );
                 } else {
-                    None
-                };
-
-                state.glx_drawables.insert(
-                    req.glx_window,
-                    crate::server::GlxDrawable {
-                        owner: client_id,
-                        kind: if minor == x11glx::CREATE_PIXMAP {
-                            crate::server::GlxDrawableKind::Pixmap
-                        } else {
-                            crate::server::GlxDrawableKind::Window
+                    state.glx_drawables.insert(
+                        req.glx_window,
+                        crate::server::GlxDrawable {
+                            owner: client_id,
+                            kind: crate::server::GlxDrawableKind::Window,
+                            x_drawable: req.x_window,
+                            fbconfig: req.fbconfig,
+                            width: 0,
+                            height: 0,
+                            event_mask: 0,
+                            glx_export_host_xid: None,
+                            texture_target: x11glx::GLX_TEXTURE_2D_EXT,
                         },
-                        x_drawable: req.x_window,
-                        fbconfig: req.fbconfig,
-                        width: 0,
-                        height: 0,
-                        event_mask: 0,
-                        glx_export_host_xid: acquire_host_xid,
-                    },
-                );
-
-                // Acquire an export-lifetime ref on the backing so the
-                // ExportedBacking entry (and its dmabuf fd) outlives any early
-                // FreePixmap until glXDestroyPixmap.
-                if let Some(host_xid) = acquire_host_xid {
-                    backend.acquire_glx_pixmap_export(host_xid);
+                    );
                 }
 
                 debug!(
@@ -14916,6 +14930,7 @@ fn handle_glx_request(
                         height: req.height,
                         event_mask: 0,
                         glx_export_host_xid: None,
+                        texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
                     },
                 );
                 // #96 tier-2: back the pbuffer with a real GPU pixmap under its
@@ -14960,6 +14975,117 @@ fn handle_glx_request(
                     client_id.0, sequence.0
                 );
             }
+        }
+        x11glx::CREATE_GLX_PIXMAP => {
+            // GLX 1.0 glXCreateGLXPixmap: the visual-based counterpart of
+            // CreatePixmap. Checks run in Xorg's order — GLXVND's
+            // dispatch_CreateGLXPixmap (size, LEGAL_NEW_RESOURCE, screen →
+            // BadMatch; glx/vnd_dispatch_stubs.c:143-169), then
+            // __glXDisp_CreateGLXPixmap (visual → BadValue) and
+            // DoCreateGLXPixmap (dixLookupDrawable → BadDrawable, a window →
+            // BadPixmap; glxcmds.c:1198-1220, :1267-1280). Xorg compares
+            // neither the pixmap depth nor its visual with the config.
+            let glx_error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                )
+            };
+            let Some(req) = x11glx::parse_create_glx_pixmap(body) else {
+                return glx_error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let owned = state.clients.get(&client_id.0).is_some_and(|c| {
+                crate::server::IdAllocator::validate_owned(
+                    req.glx_pixmap,
+                    c.resource_id_base,
+                    c.resource_id_mask,
+                )
+            });
+            if !owned || state.xid_occupied(req.glx_pixmap) {
+                return glx_error(state, x11::error::BAD_ID_CHOICE, req.glx_pixmap);
+            }
+            // yserver has exactly one screen (screenInfo.numScreens == 1).
+            if req.screen != 0 {
+                return glx_error(state, x11::error::BAD_MATCH, req.screen);
+            }
+            let Some(fbconfig) = glx_visual_fbconfig(req.visual) else {
+                return glx_error(state, x11::error::BAD_VALUE, req.visual);
+            };
+            if state.resources.pixmap(ResourceId(req.pixmap)).is_none() {
+                let code = if state.resources.window(ResourceId(req.pixmap)).is_some() {
+                    x11::error::BAD_PIXMAP
+                } else {
+                    x11::error::BAD_DRAWABLE
+                };
+                return glx_error(state, code, req.pixmap);
+            }
+            // Xorg never runs determineTextureTarget for the GLX 1.0 form,
+            // so the target stays 0 and GetDrawableAttributes reports
+            // GLX_TEXTURE_RECTANGLE_EXT (glxcmds.c:1896-1897).
+            insert_glx_pixmap_record(
+                state,
+                backend,
+                client_id,
+                req.glx_pixmap,
+                req.pixmap,
+                fbconfig,
+                x11glx::GLX_TEXTURE_RECTANGLE_EXT,
+            );
+            debug!(
+                "client {} #{} GLX::CreateGLXPixmap glx_xid=0x{:x} x_pixmap=0x{:x} \
+                 visual=0x{:x} fbconfig=0x{fbconfig:x}",
+                client_id.0, sequence.0, req.glx_pixmap, req.pixmap, req.visual
+            );
+        }
+        x11glx::DESTROY_GLX_PIXMAP => {
+            // GLX 1.0 glXDestroyGLXPixmap. Only a live GLX pixmap — created
+            // by either CreateGLXPixmap or CreatePixmap, which Xorg keeps as
+            // the same GLX_DRAWABLE_PIXMAP type — may be destroyed; any other
+            // XID is GLXBadPixmap (glx/vnd_dispatch_stubs.c:189-205,
+            // glxcmds.c validGlxDrawable / DoDestroyDrawable).
+            let Some(xid) = x11glx::parse_single_xid(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            };
+            let is_glx_pixmap = state
+                .glx_drawables
+                .get(&xid)
+                .is_some_and(|d| d.kind == crate::server::GlxDrawableKind::Pixmap);
+            if !is_glx_pixmap {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::GLX_FIRST_ERROR + x11glx::ERROR_GLX_BAD_PIXMAP,
+                    xid,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            }
+            // Release the export ref through the host xid stored at create
+            // time, never by re-resolving the X pixmap: it may already be
+            // freed (see the DESTROY_PIXMAP arm).
+            if let Some(record) = state.glx_drawables.remove(&xid)
+                && let Some(host_xid) = record.glx_export_host_xid
+            {
+                backend.release_glx_pixmap_export(host_xid);
+            }
+            debug!(
+                "client {} #{} GLX::DestroyGLXPixmap glx_xid=0x{xid:x}",
+                client_id.0, sequence.0
+            );
         }
         x11glx::DELETE_WINDOW | x11glx::DESTROY_PIXMAP | x11glx::DESTROY_PBUFFER => {
             let xid = if body.len() >= 4 {
@@ -15099,10 +15225,37 @@ fn handle_glx_request(
             );
         }
         x11glx::QUERY_CONTEXT => {
-            // Reply with zero attribs — Mesa direct-rendering doesn't
-            // act on what comes back here.
-            let reply = x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &[]);
-            debug!("client {} #{} GLX::QueryContext", client_id.0, sequence.0);
+            // GLX_EXT_import_context: Xorg's DoQueryContext reports five
+            // attributes, in this order, for a live context of ANY client
+            // (glxcmds.c:1659-1708); an XID that is not a context is
+            // GLXBadContext (glx/vnd_dispatch_stubs.c:492-508).
+            let context = match glx_request_context(state, body) {
+                Ok(context) => context,
+                Err((code, value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let ctx = &state.glx_contexts[&context];
+            let attribs = [
+                (x11glx::GLX_SHARE_CONTEXT_EXT, ctx.share_list),
+                (x11glx::GLX_VISUAL_ID, ctx.visual_id),
+                (x11glx::GLX_SCREEN, ctx.screen),
+                (x11glx::GLX_FBCONFIG_ID, ctx.fbconfig),
+                (x11glx::GLX_RENDER_TYPE, ctx.render_type),
+            ];
+            let reply = x11glx::encode_query_context_reply(byte_order, sequence, &attribs);
+            debug!(
+                "client {} #{} GLX::QueryContext 0x{context:x} -> {attribs:x?}",
+                client_id.0, sequence.0
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -15272,8 +15425,12 @@ fn handle_glx_request(
                             req.context,
                             crate::server::GlxContext {
                                 owner: client_id,
+                                screen: req.screen,
+                                visual_id: glx_fbconfig_visual(req.fbconfig),
                                 fbconfig: req.fbconfig,
                                 render_type: req.render_type,
+                                share_list: req.share_list,
+                                is_direct: req.is_direct,
                             },
                         );
                         debug!(
@@ -15325,30 +15482,15 @@ fn handle_glx_request(
                                 crate::nested::GLX_MAJOR_OPCODE,
                             );
                         }
-                        // Resolve host_xid at create time (same lifetime
-                        // semantics as CREATE_PIXMAP — see comment there).
-                        let acquire_host_xid = state
-                            .resources
-                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
-                            .and_then(|p| p.host_xid.map(|h| h.as_raw()));
-
-                        state.glx_drawables.insert(
+                        insert_glx_pixmap_record(
+                            state,
+                            backend,
+                            client_id,
                             req.glx_pixmap,
-                            crate::server::GlxDrawable {
-                                owner: client_id,
-                                kind: crate::server::GlxDrawableKind::Pixmap,
-                                x_drawable: req.pixmap,
-                                fbconfig: req.fbconfig,
-                                width: 0,
-                                height: 0,
-                                event_mask: 0,
-                                glx_export_host_xid: acquire_host_xid,
-                            },
+                            req.pixmap,
+                            req.fbconfig,
+                            x11glx::GLX_TEXTURE_2D_EXT,
                         );
-
-                        if let Some(host_xid) = acquire_host_xid {
-                            backend.acquire_glx_pixmap_export(host_xid);
-                        }
 
                         debug!(
                             "client {} #{} GLX::CreateGLXPixmapWithConfigSGIX \
@@ -31560,6 +31702,113 @@ fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11
     })
 }
 
+/// Record a GLXPixmap over the (already validated) X pixmap `x_pixmap` and
+/// take its export-lifetime ref — the one resource model behind GLX 1.0
+/// `CreateGLXPixmap`, GLX 1.3 `CreatePixmap` and
+/// `CreateGLXPixmapWithConfigSGIX`, as Xorg funnels all three through
+/// `DoCreateGLXPixmap` (glxcmds.c:1198-1220).
+///
+/// The host xid is resolved NOW and stored on the record so release is
+/// robust to the X pixmap being freed (X11 `FreePixmap`) before the GLX
+/// destroy / disconnect — re-resolving `x_drawable → host_xid` at release
+/// time would fail once the resource is gone, leaking the ref forever. The
+/// ref keeps the `ExportedBacking` entry (and its dmabuf fd) alive past an
+/// early `FreePixmap`, the counterpart of Xorg's `pixmap->refcnt++`.
+fn insert_glx_pixmap_record(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    owner: ClientId,
+    glx_pixmap: u32,
+    x_pixmap: u32,
+    fbconfig: u32,
+    texture_target: u32,
+) {
+    let acquire_host_xid = state
+        .resources
+        .pixmap(ResourceId(x_pixmap))
+        .and_then(|p| p.host_xid.map(|h| h.as_raw()));
+    state.glx_drawables.insert(
+        glx_pixmap,
+        crate::server::GlxDrawable {
+            owner,
+            kind: crate::server::GlxDrawableKind::Pixmap,
+            x_drawable: x_pixmap,
+            fbconfig,
+            width: 0,
+            height: 0,
+            event_mask: 0,
+            glx_export_host_xid: acquire_host_xid,
+            texture_target,
+        },
+    );
+    if let Some(host_xid) = acquire_host_xid {
+        backend.acquire_glx_pixmap_export(host_xid);
+    }
+}
+
+/// The context XID of a `QueryContext` / `IsDirect` request, or the error
+/// Xorg sends: `BadLength` for a body that is not exactly one XID
+/// (`REQUEST_SIZE_MATCH`), `GLXBadContext` with the XID as bad value when
+/// it names no live context (glx/vnd_dispatch_stubs.c:492-525).
+fn glx_request_context(state: &ServerState, body: &[u8]) -> Result<u32, (u8, u32)> {
+    use yserver_protocol::x11::glx as g;
+    let Some(xid) = g::parse_single_xid(body) else {
+        return Err((x11::error::BAD_LENGTH, 0));
+    };
+    if state.glx_contexts.contains_key(&xid) {
+        Ok(xid)
+    } else {
+        Err((
+            crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_CONTEXT,
+            xid,
+        ))
+    }
+}
+
+/// The FBConfig behind a GLX *visual*, or `None` when `visual` is not one
+/// of the GLX visuals `GetVisualConfigs` advertises. Mirrors Xorg's
+/// `validGlxVisual`, which searches `pGlxScreen->visuals` only — an
+/// FBConfig ID, or an X visual without a GLX config, is not a GLX visual
+/// (glxcmds.c:90-107). `synthesise_glx_fb_configs` stays the single source
+/// of the visual → FBConfig pairing.
+fn glx_visual_fbconfig(visual: u32) -> Option<u32> {
+    use yserver_protocol::x11::glx as g;
+    if !synthesise_glx_visual_configs()
+        .iter()
+        .any(|v| v.visual_id == visual)
+    {
+        return None;
+    }
+    synthesise_glx_fb_configs(false).iter().find_map(|cfg| {
+        cfg.iter()
+            .any(|(a, v)| *a == g::GLX_VISUAL_ID && *v == visual)
+            .then(|| {
+                cfg.iter()
+                    .find(|(a, _)| *a == g::GLX_FBCONFIG_ID)
+                    .map(|(_, v)| *v)
+            })
+            .flatten()
+    })
+}
+
+/// The X visual of a synthesised FBConfig (`GLX_VISUAL_ID`), 0 for a
+/// visual-less or unknown FBConfig — Xorg's `ctx->config->visualID`.
+fn glx_fbconfig_visual(fbconfig: u32) -> u32 {
+    use yserver_protocol::x11::glx as g;
+    synthesise_glx_fb_configs(false)
+        .iter()
+        .find(|cfg| {
+            cfg.iter()
+                .any(|(a, v)| *a == g::GLX_FBCONFIG_ID && *v == fbconfig)
+        })
+        .and_then(|cfg| {
+            cfg.iter()
+                .find(|(a, _)| *a == g::GLX_VISUAL_ID)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
 /// Depth (24 or 32) of a synthesised GLX FBConfig, derived from the X visual
 /// it maps to (`ROOT_VISUAL` depth-24 / `ARGB_VISUAL` depth-32) — the single
 /// source of truth is `synthesise_glx_fb_configs`, so this stays correct if
@@ -32252,6 +32501,23 @@ mod tests {
         assert_eq!(glx_fbconfig_depth(0x103), 32);
         // Unknown fbconfig falls back to the depth-24 default.
         assert_eq!(glx_fbconfig_depth(0xDEAD), 24);
+    }
+
+    /// Every GLX visual `GetVisualConfigs` advertises has an FBConfig carrying
+    /// that visual (Xorg's `pGlxScreen->visuals[i]` *is* a config), and the
+    /// pairing round-trips. FBConfig IDs and the visual-less FBConfig are
+    /// not GLX visuals.
+    #[test]
+    fn glx_visual_fbconfig_pairs_every_advertised_visual() {
+        for visual in synthesise_glx_visual_configs() {
+            let fbconfig = glx_visual_fbconfig(visual.visual_id)
+                .unwrap_or_else(|| panic!("visual 0x{:x} has no FBConfig", visual.visual_id));
+            assert_eq!(glx_fbconfig_visual(fbconfig), visual.visual_id);
+        }
+        assert_eq!(glx_visual_fbconfig(0x101), None);
+        assert_eq!(glx_visual_fbconfig(0x104), None);
+        assert_eq!(glx_fbconfig_visual(0x104), 0);
+        assert_eq!(glx_fbconfig_visual(0xDEAD), 0);
     }
 
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
@@ -68559,6 +68825,668 @@ mod tests {
         );
     }
 
+    // ─── GLX 1.0 CreateGLXPixmap / DestroyGLXPixmap, QueryContext, IsDirect ───
+    //
+    // Expected wire behaviour is Xorg's, captured from Xvfb 21.1.24
+    // (llvmpipe GLX) with an xcb probe on 2026-09-26. Xvfb's GLX visual 0x21
+    // carries FBConfig 0x88; the yserver counterpart used below is
+    // ROOT_VISUAL 0x102 carrying FBConfig 0x101 (synthesise_glx_fb_configs).
+    // Error values, minors and the order in which the checks fire are
+    // Xvfb's, verbatim.
+
+    const GLX_TEST_XID_BASE: u32 = 0x0020_0000;
+    const GLX_TEST_XID_MASK: u32 = 0x001f_ffff;
+
+    /// A client whose XID range is `0x0020_0000 | 0x001f_ffff`, the range
+    /// Xvfb handed the capture probe, so `LEGAL_NEW_RESOURCE` is exercised.
+    fn glx_legacy_fixture() -> (ServerState, RecordingBackend, UnixStream) {
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        let client = state.clients.get_mut(&1).expect("test client");
+        client.resource_id_base = GLX_TEST_XID_BASE;
+        client.resource_id_mask = GLX_TEST_XID_MASK;
+        (state, RecordingBackend::new(), peer)
+    }
+
+    fn glx_legacy_x_pixmap(state: &mut ServerState, xid: u32, depth: u8, host: Option<u32>) {
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth,
+                pixmap: ResourceId(xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+        if let Some(host) = host {
+            assert!(state.resources.set_pixmap_host_xid(
+                ResourceId(xid),
+                crate::backend::PixmapHandle::from_raw(host).expect("non-zero host xid"),
+            ));
+        }
+    }
+
+    fn glx_legacy_words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Run one request for `client` and return every byte it wrote.
+    fn glx_legacy_send_major(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        client: u32,
+        (opcode, minor): (u8, u8),
+        body: &[u8],
+    ) -> Vec<u8> {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(7),
+            RequestHeader {
+                opcode,
+                data: minor,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+        read_all_or_buffered(state, client, peer)
+    }
+
+    /// Run one GLX request for `client` and return every byte it wrote.
+    fn glx_legacy_send(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        glx_legacy_send_major(
+            state,
+            backend,
+            peer,
+            client,
+            (crate::nested::GLX_MAJOR_OPCODE, minor),
+            body,
+        )
+    }
+
+    /// Assert `bytes` is exactly one X error with this code, bad value and
+    /// minor opcode on the GLX major opcode.
+    fn assert_glx_legacy_error(what: &str, bytes: &[u8], code: u8, value: u32, minor: u8) {
+        assert_eq!(bytes.len(), 32, "{what}: expected exactly one error packet");
+        assert_eq!(bytes[0], 0, "{what}: expected an X error");
+        assert_eq!(bytes[1], code, "{what}: error code");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            value,
+            "{what}: bad value"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            u16::from(minor),
+            "{what}: minor opcode"
+        );
+        assert_eq!(
+            bytes[10],
+            crate::nested::GLX_MAJOR_OPCODE,
+            "{what}: major opcode"
+        );
+    }
+
+    fn create_glx_pixmap_body(screen: u32, visual: u32, pixmap: u32, glx_pixmap: u32) -> Vec<u8> {
+        glx_legacy_words(&[screen, visual, pixmap, glx_pixmap])
+    }
+
+    /// Decode the (attribute, value) pairs of a GetDrawableAttributes /
+    /// QueryContext reply, checking the header's length and count agree.
+    fn glx_legacy_reply_pairs(bytes: &[u8]) -> Vec<(u32, u32)> {
+        assert_eq!(bytes[0], 1, "expected a reply, got {bytes:02x?}");
+        let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        assert_eq!(length, 2 * n, "reply length must be 2 * n");
+        assert_eq!(bytes.len(), 32 + 8 * n, "reply size");
+        (0..n)
+            .map(|i| {
+                let at = 32 + 8 * i;
+                (
+                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    /// GLX 1.0 `glXCreateGLXPixmap` (minor 13) used to hit the
+    /// `GLXBadRenderRequest` catch-all, so Xlib's default handler killed the
+    /// app. It must create the same GLXPixmap record GLX 1.3 `CreatePixmap`
+    /// does (config = the visual's FBConfig), hold the export ref, report
+    /// Xorg's drawable attributes, and `DestroyGLXPixmap` (15) must release
+    /// the ref — also after the X pixmap was freed first (Xorg bumps the
+    /// pixmap refcount, glxcmds.c `DoCreateGLXPixmap`).
+    #[test]
+    fn glx10_create_glx_pixmap_records_pixmap_and_destroy_releases_it() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let glx_pixmap = GLX_TEST_XID_BASE | 0x02;
+        let host = 0xdead_0001;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, Some(host));
+
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &create_glx_pixmap_body(0, crate::resources::ROOT_VISUAL.0, pixmap, glx_pixmap),
+        );
+        assert!(
+            out.is_empty(),
+            "CreateGLXPixmap succeeds silently, got {out:02x?}"
+        );
+        let record = state
+            .glx_drawables
+            .get(&glx_pixmap)
+            .expect("GLXPixmap recorded");
+        assert_eq!(record.kind, crate::server::GlxDrawableKind::Pixmap);
+        assert_eq!(record.x_drawable, pixmap);
+        assert_eq!(record.fbconfig, 0x101, "the visual's FBConfig");
+        assert_eq!(record.glx_export_host_xid, Some(host));
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::AcquireGlxPixmapExport(host))
+        );
+
+        // Xvfb: 0x20d4=0 0x801d=64 0x801e=32 0x800c=0 0x20d6=0x20dd
+        //       0x801f=0 0x8013=<fbconfig> 0x8010=GLX_PIXMAP_BIT
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::GET_DRAWABLE_ATTRIBUTES,
+            &glx_pixmap.to_le_bytes(),
+        );
+        assert_eq!(
+            glx_legacy_reply_pairs(&out),
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_RECTANGLE_EXT),
+                (g::GLX_EVENT_MASK, 0),
+                (g::GLX_FBCONFIG_ID, 0x101),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_PIXMAP_BIT),
+            ]
+        );
+
+        // FreePixmap first, then DestroyGLXPixmap: both Success on Xvfb.
+        let out = glx_legacy_send_major(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            (54, 0),
+            &pixmap.to_le_bytes(),
+        );
+        assert!(out.is_empty(), "FreePixmap: got {out:02x?}");
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::DESTROY_GLX_PIXMAP,
+            &glx_pixmap.to_le_bytes(),
+        );
+        assert!(
+            out.is_empty(),
+            "DestroyGLXPixmap succeeds silently, got {out:02x?}"
+        );
+        assert!(!state.glx_drawables.contains_key(&glx_pixmap));
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::ReleaseGlxPixmapExport(host))
+        );
+    }
+
+    /// Every CreateGLXPixmap failure Xvfb produced, with its error code,
+    /// bad value and the precedence between checks: size, then the new
+    /// XID (`LEGAL_NEW_RESOURCE`), then the screen (GLXVND: BadMatch), then
+    /// the visual (BadValue), then the pixmap (core BadDrawable, or core
+    /// BadPixmap for a window). A failed request creates nothing.
+    #[test]
+    fn glx10_create_glx_pixmap_errors_match_xorg() {
+        use yserver_protocol::x11::{error, glx as g};
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let other_pixmap = GLX_TEST_XID_BASE | 0x03;
+        let existing_glx = GLX_TEST_XID_BASE | 0x04;
+        let fresh = GLX_TEST_XID_BASE | 0x05;
+        let vis = crate::resources::ROOT_VISUAL.0;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        glx_legacy_x_pixmap(&mut state, other_pixmap, 32, None);
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &create_glx_pixmap_body(0, vis, pixmap, existing_glx),
+        );
+        assert!(out.is_empty());
+
+        let bad_id = error::BAD_ID_CHOICE;
+        let unknown = 0x5a_5a5a;
+        let root = ROOT_WINDOW.0;
+        let cases: &[(&str, [u32; 4], u8, u32)] = &[
+            (
+                "glx id in use",
+                [0, vis, pixmap, existing_glx],
+                bad_id,
+                existing_glx,
+            ),
+            (
+                "glx id = X pixmap",
+                [0, vis, pixmap, other_pixmap],
+                bad_id,
+                other_pixmap,
+            ),
+            (
+                "glx id out of range",
+                [0, vis, pixmap, 0x07f0_0001],
+                bad_id,
+                0x07f0_0001,
+            ),
+            ("screen 1", [1, vis, pixmap, fresh], error::BAD_MATCH, 1),
+            (
+                "unknown visual",
+                [0, 0xdead, pixmap, fresh],
+                error::BAD_VALUE,
+                0xdead,
+            ),
+            // An FBConfig ID is not a GLX visual (Xvfb: its visual-less
+            // FBConfig 0x41 → BadValue 0x41).
+            (
+                "visual-less fbconfig id",
+                [0, 0x104, pixmap, fresh],
+                error::BAD_VALUE,
+                0x104,
+            ),
+            (
+                "fbconfig id of a visual",
+                [0, 0x101, pixmap, fresh],
+                error::BAD_VALUE,
+                0x101,
+            ),
+            (
+                "screen 1 + bad visual",
+                [1, 0xdead, pixmap, fresh],
+                error::BAD_MATCH,
+                1,
+            ),
+            (
+                "root window as pixmap",
+                [0, vis, root, fresh],
+                error::BAD_PIXMAP,
+                root,
+            ),
+            (
+                "unknown pixmap",
+                [0, vis, unknown, fresh],
+                error::BAD_DRAWABLE,
+                unknown,
+            ),
+            (
+                "bad visual + bad pixmap",
+                [0, 0xdead, unknown, fresh],
+                error::BAD_VALUE,
+                0xdead,
+            ),
+            (
+                "bad pixmap + glx id in use",
+                [0, vis, unknown, existing_glx],
+                bad_id,
+                existing_glx,
+            ),
+        ];
+        for (what, [screen, visual, pix, glx], code, value) in cases {
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::CREATE_GLX_PIXMAP,
+                &create_glx_pixmap_body(*screen, *visual, *pix, *glx),
+            );
+            assert_glx_legacy_error(what, &out, *code, *value, g::CREATE_GLX_PIXMAP);
+        }
+        assert!(!state.glx_drawables.contains_key(&fresh));
+        assert!(!state.glx_drawables.contains_key(&other_pixmap));
+        assert_eq!(state.glx_drawables.len(), 1);
+    }
+
+    /// Xorg does not compare the pixmap depth with the visual: Xvfb accepted
+    /// depth-32, depth-8 and depth-1 pixmaps for its depth-24 visual.
+    #[test]
+    fn glx10_create_glx_pixmap_accepts_any_pixmap_depth() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        for (i, depth) in (0_u32..).zip([32_u8, 8, 1]) {
+            let pixmap = GLX_TEST_XID_BASE | (0x10 + i);
+            let glx_pixmap = GLX_TEST_XID_BASE | (0x20 + i);
+            glx_legacy_x_pixmap(&mut state, pixmap, depth, None);
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::CREATE_GLX_PIXMAP,
+                &create_glx_pixmap_body(0, crate::resources::ROOT_VISUAL.0, pixmap, glx_pixmap),
+            );
+            assert!(out.is_empty(), "depth {depth}: got {out:02x?}");
+            assert!(state.glx_drawables.contains_key(&glx_pixmap));
+        }
+    }
+
+    /// DestroyGLXPixmap takes only a live GLX *pixmap*: anything else is
+    /// `GLXBadPixmap` with the XID as bad value (GLXVND's XID map, then
+    /// `validGlxDrawable`'s type check). GLX 1.0 and GLX 1.3 pixmaps are the
+    /// same resource type, so either destroy request frees either.
+    #[test]
+    fn glx10_destroy_glx_pixmap_errors_and_cross_version_destroy_match_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let bad_pixmap = crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_PIXMAP;
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let legacy = GLX_TEST_XID_BASE | 0x02;
+        let modern = GLX_TEST_XID_BASE | 0x03;
+        let glx_window = GLX_TEST_XID_BASE | 0x04;
+        let pbuffer = GLX_TEST_XID_BASE | 0x05;
+        let vis = crate::resources::ROOT_VISUAL.0;
+
+        let mut send = |state: &mut ServerState, minor: u8, body: &[u8]| {
+            glx_legacy_send(state, &mut backend, &mut peer, 1, minor, body)
+        };
+        let window_body = glx_legacy_words(&[0, 0x101, ROOT_WINDOW.0, glx_window]);
+        assert!(send(&mut state, g::CREATE_WINDOW, &window_body).is_empty());
+        let pbuffer_body = glx_legacy_words(&[0, 0x101, pbuffer, 0]);
+        assert!(send(&mut state, g::CREATE_PBUFFER, &pbuffer_body).is_empty());
+
+        for (what, xid) in [
+            ("unknown xid", 0x5a_5a5a),
+            ("X pixmap", pixmap),
+            ("GLX window", glx_window),
+            ("GLX pbuffer", pbuffer),
+        ] {
+            let out = send(&mut state, g::DESTROY_GLX_PIXMAP, &xid.to_le_bytes());
+            assert_glx_legacy_error(what, &out, bad_pixmap, xid, g::DESTROY_GLX_PIXMAP);
+        }
+        assert!(state.glx_drawables.contains_key(&glx_window));
+        assert!(state.glx_drawables.contains_key(&pbuffer));
+
+        // GLX 1.0 pixmap destroyed by GLX 1.3 DestroyPixmap; a second
+        // destroy through DestroyGLXPixmap is GLXBadPixmap.
+        let body = create_glx_pixmap_body(0, vis, pixmap, legacy);
+        assert!(send(&mut state, g::CREATE_GLX_PIXMAP, &body).is_empty());
+        assert!(send(&mut state, g::DESTROY_PIXMAP, &legacy.to_le_bytes()).is_empty());
+        assert!(!state.glx_drawables.contains_key(&legacy));
+        let out = send(&mut state, g::DESTROY_GLX_PIXMAP, &legacy.to_le_bytes());
+        assert_glx_legacy_error(
+            "destroyed twice",
+            &out,
+            bad_pixmap,
+            legacy,
+            g::DESTROY_GLX_PIXMAP,
+        );
+
+        // GLX 1.3 pixmap destroyed by GLX 1.0 DestroyGLXPixmap.
+        let body = glx_legacy_words(&[0, 0x101, pixmap, modern, 0]);
+        assert!(send(&mut state, g::CREATE_PIXMAP, &body).is_empty());
+        assert!(send(&mut state, g::DESTROY_GLX_PIXMAP, &modern.to_le_bytes()).is_empty());
+        assert!(!state.glx_drawables.contains_key(&modern));
+    }
+
+    /// CreateGLXPixmap, DestroyGLXPixmap, QueryContext and IsDirect are all
+    /// `REQUEST_SIZE_MATCH` in Xorg's GLXVND stubs: a short or long request
+    /// is core `BadLength`, and nothing is created.
+    #[test]
+    fn glx10_fixed_size_requests_reject_wrong_length() {
+        use yserver_protocol::x11::{error, glx as g};
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let mut long_create = create_glx_pixmap_body(
+            0,
+            crate::resources::ROOT_VISUAL.0,
+            pixmap,
+            GLX_TEST_XID_BASE | 0x02,
+        );
+        long_create.extend_from_slice(&[0; 4]);
+        let short_create = &long_create[..12];
+        for (what, minor, body) in [
+            (
+                "CreateGLXPixmap long",
+                g::CREATE_GLX_PIXMAP,
+                long_create.as_slice(),
+            ),
+            ("CreateGLXPixmap short", g::CREATE_GLX_PIXMAP, short_create),
+            ("DestroyGLXPixmap long", g::DESTROY_GLX_PIXMAP, &[0; 8][..]),
+            ("DestroyGLXPixmap empty", g::DESTROY_GLX_PIXMAP, &[][..]),
+            ("QueryContext long", g::QUERY_CONTEXT, &[0; 8][..]),
+            ("QueryContext empty", g::QUERY_CONTEXT, &[][..]),
+            ("IsDirect long", g::IS_DIRECT, &[0; 8][..]),
+            ("IsDirect empty", g::IS_DIRECT, &[][..]),
+        ] {
+            let out = glx_legacy_send(&mut state, &mut backend, &mut peer, 1, minor, body);
+            assert_glx_legacy_error(what, &out, error::BAD_LENGTH, 0, minor);
+        }
+        assert!(state.glx_drawables.is_empty());
+    }
+
+    /// `QueryContext` (GLX_EXT_import_context) answers Xorg's five
+    /// attributes in Xorg's order (glxcmds.c `DoQueryContext`) for every
+    /// creation request, to any client, and `GLXBadContext` for an XID that
+    /// is not a live context. `IsDirect` reports the creation request's
+    /// `isDirect` and shares the `GLXBadContext` rule.
+    #[test]
+    fn glx_query_context_and_is_direct_match_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let mut peer2 = install_client(&mut state, 2);
+        let bad_context = crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_CONTEXT;
+        let root_visual = crate::resources::ROOT_VISUAL.0;
+        let ctx1 = GLX_TEST_XID_BASE | 0x11;
+        let ctx2 = GLX_TEST_XID_BASE | 0x12;
+        let ctx3 = GLX_TEST_XID_BASE | 0x13;
+        let ctx4 = GLX_TEST_XID_BASE | 0x14;
+        let ctx5 = GLX_TEST_XID_BASE | 0x15;
+
+        let creates: [(u8, Vec<u32>); 5] = [
+            // CreateContext: context visual screen share isDirect
+            (g::CREATE_CONTEXT, vec![ctx1, root_visual, 0, 0, 1]),
+            // CreateNewContext (visual-less FBConfig, share ctx1):
+            // context fbconfig screen renderType share isDirect
+            (
+                g::CREATE_NEW_CONTEXT,
+                vec![ctx2, 0x104, 0, g::GLX_RGBA_TYPE, ctx1, 1],
+            ),
+            // CreateContextAttribsARB (share ctx1, GL 3.0):
+            // context fbconfig screen share isDirect numAttribs attribs
+            (
+                g::CREATE_CONTEXT_ATTRIBS_ARB,
+                vec![ctx3, 0x101, 0, ctx1, 1, 2, 0x2091, 3, 0x2092, 0],
+            ),
+            // CreateContextAttribsARB with GLX_RENDER_TYPE = GLX_RGBA_TYPE.
+            (
+                g::CREATE_CONTEXT_ATTRIBS_ARB,
+                vec![
+                    ctx4,
+                    0x101,
+                    0,
+                    0,
+                    1,
+                    1,
+                    g::GLX_RENDER_TYPE,
+                    g::GLX_RGBA_TYPE,
+                ],
+            ),
+            // CreateContext asking for an indirect context (isDirect 0).
+            (g::CREATE_CONTEXT, vec![ctx5, root_visual, 0, 0, 0]),
+        ];
+        for (minor, words) in &creates {
+            let body = glx_legacy_words(words);
+            let out = glx_legacy_send(&mut state, &mut backend, &mut peer, 1, *minor, &body);
+            assert!(out.is_empty(), "create minor {minor}: got {out:02x?}");
+        }
+
+        let expect = |share: u32, visual: u32, fbconfig: u32| {
+            vec![
+                (g::GLX_SHARE_CONTEXT_EXT, share),
+                (g::GLX_VISUAL_ID, visual),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_FBCONFIG_ID, fbconfig),
+                (g::GLX_RENDER_TYPE, g::GLX_RGBA_TYPE),
+            ]
+        };
+        for (ctx, share, visual, fbconfig) in [
+            // Xvfb: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx1, 0, root_visual, 0x101),
+            // Xvfb: 0x800a=ctx1 0x800b=0 0x800c=0 0x8013=0x41 0x8011=0x8014
+            (ctx2, ctx1, 0, 0x104),
+            // Xvfb: 0x800a=ctx1 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx3, ctx1, root_visual, 0x101),
+            // Xvfb: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx4, 0, root_visual, 0x101),
+            // Xvfb +iglx: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx5, 0, root_visual, 0x101),
+        ] {
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::QUERY_CONTEXT,
+                &ctx.to_le_bytes(),
+            );
+            assert_eq!(
+                glx_legacy_reply_pairs(&out),
+                expect(share, visual, fbconfig),
+                "QueryContext(0x{ctx:x})"
+            );
+        }
+
+        // Another client may query and IsDirect it: that is what
+        // import_context is for.
+        let ctx1_body = ctx1.to_le_bytes();
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer2,
+            2,
+            g::QUERY_CONTEXT,
+            &ctx1_body,
+        );
+        assert_eq!(glx_legacy_reply_pairs(&out), expect(0, root_visual, 0x101));
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer2,
+            2,
+            g::IS_DIRECT,
+            &ctx1_body,
+        );
+        assert_eq!(out.len(), 32, "IsDirect reply is 32 bytes");
+        assert_eq!(out[0], 1, "IsDirect reply");
+        assert_eq!(&out[4..8], &[0; 4], "IsDirect reply length 0");
+        assert_eq!(out[8], 1, "IsDirect(ctx1) = True");
+        // Xvfb +iglx: IsDirect of a context created with isDirect 0 is 0.
+        // (Without +iglx Xorg refuses that CreateContext with BadValue.)
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::IS_DIRECT,
+            &ctx5.to_le_bytes(),
+        );
+        assert_eq!((out.len(), out[0], out[8]), (32, 1, 0), "IsDirect(ctx5)");
+
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let glx_pixmap = GLX_TEST_XID_BASE | 0x02;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let body = create_glx_pixmap_body(0, root_visual, pixmap, glx_pixmap);
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &body,
+        );
+        assert!(out.is_empty());
+        for (what, xid) in [
+            ("unknown", 0x5a_5a5a),
+            ("GLX pixmap", glx_pixmap),
+            ("None", 0),
+        ] {
+            for minor in [g::QUERY_CONTEXT, g::IS_DIRECT] {
+                let out = glx_legacy_send(
+                    &mut state,
+                    &mut backend,
+                    &mut peer,
+                    1,
+                    minor,
+                    &xid.to_le_bytes(),
+                );
+                assert_glx_legacy_error(what, &out, bad_context, xid, minor);
+            }
+        }
+
+        let ctx2_body = ctx2.to_le_bytes();
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::DESTROY_CONTEXT,
+            &ctx2_body,
+        );
+        assert!(out.is_empty());
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::QUERY_CONTEXT,
+            &ctx2_body,
+        );
+        assert_glx_legacy_error(
+            "destroyed context",
+            &out,
+            bad_context,
+            ctx2,
+            g::QUERY_CONTEXT,
+        );
+    }
+
     /// `GetDrawableAttributes` on a GLXPixmap/GLXWindow must report the
     /// geometry of the *backing* X drawable. The GLX XID is a fresh
     /// client-allocated id with no X resource behind it, so resolving the
@@ -68703,6 +69631,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -68758,6 +69687,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -68801,6 +69731,7 @@ mod tests {
                 height: 32,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
