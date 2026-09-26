@@ -81,6 +81,33 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   reply. A GLX pixmap whose X pixmap was freed reports 0×0, where Xorg
   still reports the pixmap's size. GLX requests from big-endian clients are
   not byte-swapped.
+- **2026-09-26 XI 2.0 XIWarpPointer / XISetFocus / XIChangeHierarchy (extension
+  audit §1):** the three XI minors that fell into a silent catch-all now
+  answer as Xorg does, and the catch-all is gone — every minor outside 1..=61
+  is BadRequest, like `ProcIDispatch`. **XIWarpPointer** runs the core warp
+  path (now shared: dst-before-src BadWindow, Xorg's source-rectangle test
+  with inclusive edges and `PointInWindowIsVisible`, clamp to the screen,
+  barrier bypass, `warp_pointer_root` motion/crossing) for the master pointer
+  only (anything else BadDevice, errorValue = id); FP16.16 coordinates
+  truncate toward zero, and the XI source test keeps Xorg's slip (right edge
+  compared against 0). Core WarpPointer picked up the same Xorg-exact source
+  test (it had exclusive right/bottom edges and no visibility check).
+  **XISetFocus** on the master keyboard is core SetInputFocus with
+  RevertToParent (core + XI2 focus events); on the slave keyboard it sets
+  that device's own focus; pointers/unknown ids BadDevice (errorValue 0).
+  FollowKeyboard on the master keyboard → BadValue (Xvfb segfaults on it).
+  **XIGetFocus(3)** now reads the core focus; pointers are BadDevice.
+  **XIChangeHierarchy** walks the change list like Xorg (length checks,
+  unknown types skipped) and gives Xorg's answer for the fixed devices:
+  RemoveMaster/Attach/Detach → BadDevice/BadValue exactly as Xvfb answers for
+  its fixed XTest slaves at the same ids, AddMaster → BadAlloc; no change
+  succeeds, so no HierarchyChanged. **XISelectEvents** keeps bit 32 (masks
+  are u64), rejects bits past XI2LASTEVENT with BadValue(bit) before applying
+  anything; XIGetSelectedEvents writes masks in device order, trimmed to 1 or
+  2 words, header fields in client byte order. All expected values are Xvfb
+  21.1.24 captures. Known gaps kept: XI1 Set/GetDeviceFocus(3) still use
+  their own record rather than the core focus, and slave-keyboard focus
+  changes emit XI1 DeviceFocus events but no XI2 FocusIn/Out.
 
 - **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
   branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports

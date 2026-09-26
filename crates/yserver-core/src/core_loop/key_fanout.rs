@@ -1041,7 +1041,7 @@ mod tests {
         id: u32,
         window: ResourceId,
         core_mask: u32,
-        xi2_mask: u32,
+        xi2_mask: u64,
     ) -> UnixStream {
         let (server_side, peer) = UnixStream::pair().unwrap();
         let client = ClientState {

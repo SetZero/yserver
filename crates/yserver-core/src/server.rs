@@ -628,10 +628,10 @@ pub struct ActivePointerGrab {
     /// this is the event window's MERGED xi2 selection captured at
     /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
     /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
-    /// sets `u32::MAX` — its wire mask is not parsed (pre-existing
+    /// sets `u64::MAX` — its wire mask is not parsed (pre-existing
     /// permissive delivery); core GrabPointer sets 0 (never consulted:
     /// the XI2 redirect delivers nothing for via_xi2=false grabs).
-    pub xi2_mask: u32,
+    pub xi2_mask: u64,
 }
 
 /// XComposite redirect mode. Both wire constants are accepted —
@@ -2375,8 +2375,10 @@ pub struct ClientState {
     /// (X11 ChangeSaveSet semantics).
     pub save_set: HashSet<ResourceId>,
     pub big_requests_enabled: bool,
-    /// XI2 event masks: (window_id, device_id) -> mask
-    pub xi2_masks: HashMap<(ResourceId, u16), u32>,
+    /// XI2 event masks: (window_id, device_id) -> mask. Bit n selects
+    /// XI2 event type n; XI 2.4 defines types up to 32
+    /// (`XI_GestureSwipeEnd`), so the mask needs more than 32 bits.
+    pub xi2_masks: HashMap<(ResourceId, u16), u64>,
     /// XI1 `XEventClass` values the client has selected via
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
@@ -2996,7 +2998,7 @@ pub(crate) fn xi2_mask_for_client(
     target: ResourceId,
     fallback: ResourceId,
     device_candidates: &[u16],
-) -> u32 {
+) -> u64 {
     // Per window, OR the masks a client stored under the concrete device
     // AND the `XIAllMasterDevices(1)` / `XIAllDevices(0)` wildcards —
     // mirroring Xorg's `dix/events.c::EventMaskForClient`. A client may
@@ -3268,7 +3270,11 @@ fn pointer_event_fanout_inner(
                         via_xi2: grab.via_xi2,
                         implicit: false,
                         passive: true,
-                        xi2_mask: if grab.via_xi2 { grab.event_mask } else { 0 },
+                        xi2_mask: if grab.via_xi2 {
+                            u64::from(grab.event_mask)
+                        } else {
+                            0
+                        },
                     });
                     target
                 }
@@ -3929,9 +3935,9 @@ mod tests {
             big_requests_enabled: false,
             xi2_masks: HashMap::from([
                 // XIAllMasterDevices(1): motion/enter/touch/gesture, NO buttons.
-                ((win, 1u16), 0x381c_00c0u32),
+                ((win, 1u16), 0x381c_00c0u64),
                 // XIAllDevices(0): includes ButtonPress(4)/ButtonRelease(5).
-                ((win, 0u16), 0x19f2u32),
+                ((win, 0u16), 0x19f2u64),
             ]),
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
@@ -4525,7 +4531,7 @@ mod tests {
                 via_xi2: true,
                 implicit: false,
                 passive: true,
-                xi2_mask: u32::MAX,
+                xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
@@ -4689,7 +4695,7 @@ mod tests {
                 via_xi2: true,
                 implicit: false,
                 passive: true,
-                xi2_mask: u32::MAX,
+                xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),

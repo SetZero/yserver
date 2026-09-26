@@ -15615,6 +15615,26 @@ fn xi1_device_valid(id: u16) -> bool {
     (2..=5).contains(&id)
 }
 
+/// The virtual core pointer (2) and keyboard (3) are the masters.
+fn xi1_device_is_master(id: u16) -> bool {
+    matches!(id, 2 | 3)
+}
+
+/// `XI2LASTEVENT` for XI 2.4 (`XI_GestureSwipeEnd`, XI2.h).
+const XI2_LAST_EVENT: u32 = 32;
+
+/// Xorg `XICheckInvalidMaskBits` (Xi/xiselectev.c): the lowest set bit
+/// above [`XI2_LAST_EVENT`] in an XI2 event mask (a bit array, bit n in
+/// byte n/8), if any.
+fn xi2_first_invalid_mask_bit(mask: &[u8]) -> Option<u32> {
+    mask.iter().enumerate().find_map(|(i, &byte)| {
+        let first_bit = u32::try_from(i * 8).ok()?;
+        (0..8u32)
+            .map(|b| first_bit + b)
+            .find(|&bit| bit > XI2_LAST_EVENT && byte & (1 << (bit - first_bit)) != 0)
+    })
+}
+
 /// Keyboards (3, 5) carry a KeyClass; pointers don't.
 pub(crate) fn xi1_device_has_keys(id: u16) -> bool {
     matches!(id, 3 | 5)
@@ -15761,6 +15781,251 @@ fn xi1_send_extension_event_resolve_targets(
         }
     }
     std::collections::HashSet::new()
+}
+
+/// XIWarpPointer (XI 2.0 minor 41) — Xorg `ProcXIWarpPointer`
+/// (Xi/xiwarppointer.c): core WarpPointer for one device, with FP16.16
+/// coordinates. Only a master pointer or a floating slave may be warped;
+/// yserver's only candidate is the master pointer (2), whose sprite is the
+/// core one, so this runs the core warp path with the XI source-rectangle
+/// rule.
+fn handle_xi_warp_pointer(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    // Length is gated to exactly 9 units above, so the body is 32 bytes.
+    let u32_at = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+    let fp1616_pixels = |o: usize| u32_at(o).cast_signed() / 65536;
+    let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+    let deviceid = u16_at(28);
+    if deviceid != crate::xinput::DEVICEID_MASTER_POINTER {
+        return xi1_error(
+            state,
+            client_id,
+            sequence,
+            XI1_ERROR_BAD_DEVICE,
+            u32::from(deviceid),
+            41,
+        );
+    }
+    let req = WarpRequest {
+        src: ResourceId(u32_at(0)),
+        dst: ResourceId(u32_at(4)),
+        src_x: fp1616_pixels(8),
+        src_y: fp1616_pixels(12),
+        src_w: u16_at(16),
+        src_h: u16_at(18),
+        dst_x: fp1616_pixels(20),
+        dst_y: fp1616_pixels(24),
+    };
+    if let Some(bad) = warp_pointer_bad_window(state, &req) {
+        return xi1_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+    }
+    if warp_pointer_src_allows(state, &req, WarpSrcRule::XInput2) {
+        apply_pointer_warp(state, backend, origin, &req);
+    }
+    debug!(
+        "client {} #{} XIWarpPointer dst=0x{:x} ({}, {})",
+        client_id.0, sequence.0, req.dst.0, req.dst_x, req.dst_y
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// XISetFocus (XI 2.0 minor 49) — Xorg `ProcXISetFocus`
+/// (Xi/xisetdevfocus.c): `SetInputFocus(dev, focus, RevertToParent,
+/// time, followOK=TRUE)` on a device with a focus class, i.e. a keyboard.
+/// Pointers and unknown ids are BadDevice (Xorg sets no errorValue).
+///
+/// The master keyboard's focus is the core focus, so device 3 runs core
+/// SetInputFocus. The slave keyboard (5) keeps its own focus
+/// (`xi1_device_focus`, shared with XI1 SetDeviceFocus) and may follow
+/// the keyboard. FollowKeyboard on the master keyboard itself would make
+/// it follow itself: Xorg stores `FollowKeyboardWin` and then crashes
+/// dereferencing it (Xvfb 21.1.24 segfaults at address 0x7), so yserver
+/// answers BadValue instead.
+fn handle_xi_set_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use crate::core_loop::xi1_focus;
+    const MINOR: u8 = 49;
+    // Length is gated to at least 4 units above.
+    let focus = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let req_time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let deviceid = u16::from_le_bytes([body[8], body[9]]);
+    if !xi1_device_has_keys(deviceid) {
+        return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, MINOR);
+    }
+    let revert_to = xi1_focus::REVERT_TO_PARENT;
+    if deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+        if focus == xi1_focus::FOCUS_FOLLOW_KEYBOARD {
+            return xi1_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                focus,
+                MINOR,
+            );
+        }
+        if let Some((code, value)) = core_focus_window_error(state, ResourceId(focus)) {
+            return xi1_error(state, client_id, sequence, code, value, MINOR);
+        }
+        apply_core_input_focus(
+            state,
+            client_id,
+            sequence,
+            ResourceId(focus),
+            revert_to,
+            req_time,
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    if focus != xi1_focus::FOCUS_FOLLOW_KEYBOARD
+        && let Some((code, value)) = core_focus_window_error(state, ResourceId(focus))
+    {
+        return xi1_error(state, client_id, sequence, code, value, MINOR);
+    }
+    // Timestamp gate (dix/events.c:4920-4922), as XI1 SetDeviceFocus.
+    let now = state.timestamp_now();
+    let time = if req_time == 0 { now } else { req_time };
+    let prev = xi1_focus::device_focus(state, deviceid);
+    if xi1_focus::time_after(time, now) || xi1_focus::time_after(prev.time, time) {
+        debug!(
+            "client {} #{} XISetFocus device={deviceid} stale time {time} \
+             (now={now} last={}) — ignored",
+            client_id.0, sequence.0, prev.time
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    xi1_focus::set_device_focus(state, deviceid, focus, revert_to, time);
+    debug!(
+        "client {} #{} XISetFocus device={deviceid} focus=0x{focus:x}",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// XIChangeHierarchy (XI 2.0 minor 43) — Xorg `ProcXIChangeHierarchy`
+/// (Xi/xichangehierarchy.c) over yserver's fixed device set: masters 2/3
+/// (the virtual core pair) and one fixed slave each (4/5).
+///
+/// The change list is walked exactly as Xorg walks it — same length
+/// checks, unknown change types skipped, processing stops at the first
+/// failing change — and every change gets the answer Xorg gives for the
+/// same devices:
+/// - RemoveMaster: return_mode must be Float/AttachToMaster (BadValue);
+///   the virtual core pair can never be removed (BadDevice), and a slave
+///   is not a master (BadDevice, errorValue = id).
+/// - AttachSlave / DetachSlave: masters are BadDevice (errorValue = id);
+///   yserver's slaves are fixed, which Xorg answers for its own fixed
+///   slaves (the XTest devices, ids 4/5 on Xvfb) with BadDevice,
+///   errorValue = id.
+/// - AddMaster: Xorg creates a new pair; yserver can't add devices, so it
+///   gives Xorg's answer when no device can be allocated (BadAlloc).
+///
+/// Unknown device ids are BadDevice with errorValue 0 (dixLookupDevice
+/// sets none). No change ever succeeds, so no HierarchyChanged event is
+/// sent. The change records are opaque to the request swapper and are
+/// read in the client's byte order (Xorg swaps only type/length/name_len
+/// and reads the device ids unswapped — for a big-endian client on a
+/// little-endian server that only changes the errorValue of the same
+/// BadDevice error).
+fn handle_xi_change_hierarchy(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    const MINOR: u8 = 43;
+    const ADD_MASTER: u16 = 1;
+    const REMOVE_MASTER: u16 = 2;
+    const ATTACH_SLAVE: u16 = 3;
+    const DETACH_SLAVE: u16 = 4;
+    const ATTACH_TO_MASTER: u8 = 1;
+    const FLOATING: u8 = 2;
+    let rd16 = |o: usize| {
+        let b = [body[o], body[o + 1]];
+        match byte_order {
+            ClientByteOrder::LittleEndian => u16::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u16::from_be_bytes(b),
+        }
+    };
+    let fail = |state: &mut ServerState, code: u8, value: u32| {
+        xi1_error(state, client_id, sequence, code, value, MINOR)
+    };
+    // Length is gated to at least 2 units above: num_changes + pad.
+    let num_changes = body[0];
+    let mut pos = 4usize;
+    for _ in 0..num_changes {
+        let len = body.len() - pos;
+        if len < 4 {
+            return fail(state, x11::error::BAD_LENGTH, 0);
+        }
+        let change_type = rd16(pos);
+        let change_bytes = usize::from(rd16(pos + 2)) * 4;
+        if len < change_bytes {
+            return fail(state, x11::error::BAD_LENGTH, 0);
+        }
+        // CHANGE_SIZE_MATCH: fixed-size records must state their own size.
+        let size_matches = |size: usize| len >= size && change_bytes == size;
+        match change_type {
+            ADD_MASTER => {
+                if len < 8 || usize::from(rd16(pos + 4)) > len - 8 {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                return fail(state, x11::error::BAD_ALLOC, 0);
+            }
+            REMOVE_MASTER => {
+                if !size_matches(12) {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                let return_mode = body[pos + 6];
+                if return_mode != ATTACH_TO_MASTER && return_mode != FLOATING {
+                    return fail(state, x11::error::BAD_VALUE, 0);
+                }
+                let deviceid = rd16(pos + 4);
+                // A slave is "not a master" (errorValue = id); the virtual
+                // core pair can't be removed and unknown ids don't exist
+                // (Xorg sets no errorValue for either).
+                let value = if xi1_device_valid(deviceid) && !xi1_device_is_master(deviceid) {
+                    u32::from(deviceid)
+                } else {
+                    0
+                };
+                return fail(state, XI1_ERROR_BAD_DEVICE, value);
+            }
+            ATTACH_SLAVE | DETACH_SLAVE => {
+                if !size_matches(8) {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                let deviceid = rd16(pos + 4);
+                // Masters and the fixed slaves report their id; unknown
+                // ids report 0.
+                let value = if xi1_device_valid(deviceid) {
+                    u32::from(deviceid)
+                } else {
+                    0
+                };
+                return fail(state, XI1_ERROR_BAD_DEVICE, value);
+            }
+            _ => {}
+        }
+        pos += change_bytes;
+    }
+    debug!(
+        "client {} #{} XIChangeHierarchy: {num_changes} change(s), nothing to do",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
 }
 
 fn handle_xi2_request(
@@ -15941,29 +16206,45 @@ fn handle_xi2_request(
             if body.len() >= 8 {
                 let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                 let num_masks = u16::from_le_bytes([body[4], body[5]]) as usize;
+                // Xorg ProcXISelectEvents checks every mask before
+                // setting any, so a rejected request changes nothing.
+                let mut masks: Vec<(u16, u64)> = Vec::with_capacity(num_masks);
                 let mut pos = 8;
+                for _ in 0..num_masks {
+                    if pos + 4 > body.len() {
+                        break;
+                    }
+                    let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
+                    let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
+                    pos += 4;
+                    let byte_len = mask_len.saturating_mul(4);
+                    if pos + byte_len > body.len() {
+                        break;
+                    }
+                    let mask_bytes = &body[pos..pos + byte_len];
+                    // XICheckInvalidMaskBits: a bit past XI2LASTEVENT is
+                    // BadValue with the bit number as errorValue.
+                    if let Some(bit) = xi2_first_invalid_mask_bit(mask_bytes) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            bit,
+                            46,
+                            header.opcode,
+                        );
+                    }
+                    // The mask is a bit array (bit n in byte n/8), so the
+                    // bytes are little-endian whatever the client order.
+                    let mut word = [0u8; 8];
+                    let keep = byte_len.min(8);
+                    word[..keep].copy_from_slice(&mask_bytes[..keep]);
+                    masks.push((deviceid, u64::from_le_bytes(word)));
+                    pos += byte_len;
+                }
                 if let Some(client) = state.clients.get_mut(&client_id.0) {
-                    for _ in 0..num_masks {
-                        if pos + 4 > body.len() {
-                            break;
-                        }
-                        let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
-                        let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
-                        pos += 4;
-                        let byte_len = mask_len.saturating_mul(4);
-                        if pos + byte_len > body.len() {
-                            break;
-                        }
-                        let mask = if mask_len > 0 {
-                            u32::from_le_bytes([
-                                body[pos],
-                                body[pos + 1],
-                                body[pos + 2],
-                                body[pos + 3],
-                            ])
-                        } else {
-                            0
-                        };
+                    for (deviceid, mask) in masks {
                         debug!(
                             "client {} XISelectEvents window=0x{:x} deviceid={} mask=0x{:x}",
                             client_id.0, window.0, deviceid, mask
@@ -15974,12 +16255,11 @@ fn handle_xi2_request(
                             client.xi2_masks.insert((window, deviceid), mask);
                             if window == ROOT_WINDOW
                                 && matches!(deviceid, 0..=2)
-                                && (mask & XI2_DEVICE_CHANGED_MASK) != 0
+                                && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
                             {
                                 send_device_changed_bootstrap = true;
                             }
                         }
-                        pos += byte_len;
                     }
                 }
             }
@@ -16595,24 +16875,39 @@ fn handle_xi2_request(
                 return Ok(RequestOutcome::Handled);
             }
             let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            // Xorg ProcXIGetSelectedEvents: one xXIEventMask per device
+            // in device-id order, each trimmed to the words that hold set
+            // bits. deviceid/mask_len follow the client byte order; the
+            // mask itself is a bit array (bit n in byte n/8), written as
+            // little-endian bytes for every client.
+            let mut selected: Vec<(u16, u64)> = state
+                .clients
+                .get(&client_id.0)
+                .map(|client| {
+                    client
+                        .xi2_masks
+                        .iter()
+                        .filter(|&(&(win, _), &mask)| win == window && mask != 0)
+                        .map(|(&(_, dev), &mask)| (dev, mask))
+                        .collect()
+                })
+                .unwrap_or_default();
+            selected.sort_unstable_by_key(|&(dev, _)| dev);
             let mut masks = Vec::new();
-            if let Some(client) = state.clients.get(&client_id.0) {
-                for (&(win, dev), &mask) in &client.xi2_masks {
-                    if win == window {
-                        x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, dev);
-                        x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, 1);
-                        x11::write_u32(ClientByteOrder::LittleEndian, &mut masks, mask);
-                    }
-                }
+            for &(dev, mask) in &selected {
+                let mask_len: u16 = if mask >> 32 == 0 { 1 } else { 2 };
+                x11::write_u16(byte_order, &mut masks, dev);
+                x11::write_u16(byte_order, &mut masks, mask_len);
+                masks.extend_from_slice(&mask.to_le_bytes()[..4 * usize::from(mask_len)]);
             }
-            let num_masks = (masks.len() / 8) as u16;
+            let num_masks = u16::try_from(selected.len()).unwrap_or(u16::MAX);
             let mut reply = x11::fixed_reply(
                 byte_order,
                 sequence,
                 0,
                 x11::checked_units(masks.len())? as u32,
             );
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, num_masks);
+            x11::write_u16(byte_order, &mut reply, num_masks);
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&masks);
             buf.extend_from_slice(&reply);
@@ -16866,7 +17161,7 @@ fn handle_xi2_request(
                         via_xi2: true,
                         implicit: false,
                         passive: false,
-                        xi2_mask: u32::MAX,
+                        xi2_mask: u64::MAX,
                     });
                 }
                 // Core↔XI bridge — Xorg `ActivateKeyboardGrab` /
@@ -20599,32 +20894,32 @@ fn handle_xi2_request(
         }
         50 => {
             // XIGetFocus { deviceid:CARD16 } -> xXIGetFocusReply
-            // { focus:WINDOW @8, 20 bytes pad }. Returns the raw stored
-            // per-device focus (None=0 / PointerRoot=1 / window), the same
-            // source XI1 GetDeviceFocus (minor 20) reads; Xorg
-            // (Xi/xifocus.c) doesn't resolve the sentinel here either.
+            // { focus:WINDOW @8, 20 bytes pad }. Xorg ProcXIGetFocus
+            // (Xi/xisetdevfocus.c) reports the device's raw focus (None=0 /
+            // PointerRoot=1 / FollowKeyboard=3 / window) without resolving
+            // the sentinels. Only keyboards have a focus class; pointers
+            // and unknown ids are BadDevice with no errorValue. The master
+            // keyboard's focus is the core focus; the slave keyboard's is
+            // its own (shared with XI1 GetDeviceFocus).
             let dev = if body.len() >= 2 {
                 u16::from_le_bytes([body[0], body[1]])
             } else {
                 0
             };
-            if !xi1_device_valid(dev) {
-                return xi1_error(
-                    state,
-                    client_id,
-                    sequence,
-                    XI1_ERROR_BAD_DEVICE,
-                    u32::from(dev),
-                    minor,
-                );
+            if !xi1_device_has_keys(dev) {
+                return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, minor);
             }
-            let f = crate::core_loop::xi1_focus::device_focus(state, dev);
+            let focus = if dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+                state.core_focus.raw
+            } else {
+                crate::core_loop::xi1_focus::device_focus(state, dev).focus
+            };
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u32(byte_order, &mut reply, f.focus); // bytes 8-11
+            x11::write_u32(byte_order, &mut reply, focus); // bytes 8-11
             reply.extend_from_slice(&[0u8; 20]); // bytes 12-31 pad
             debug!(
-                "client {} #{} XIGetFocus device={dev} -> focus=0x{:x}",
-                client_id.0, sequence.0, f.focus
+                "client {} #{} XIGetFocus device={dev} -> focus=0x{focus:x}",
+                client_id.0, sequence.0
             );
             buf.extend_from_slice(&reply);
         }
@@ -20670,7 +20965,17 @@ fn handle_xi2_request(
                 }
             }
         }
-        _ if minor == 0 || minor > XINPUT_LAST_REQUEST => {
+        41 => {
+            return handle_xi_warp_pointer(state, backend, origin, client_id, sequence, body);
+        }
+        43 => {
+            return handle_xi_change_hierarchy(state, client_id, sequence, byte_order, body);
+        }
+        49 => return handle_xi_set_focus(state, client_id, sequence, body),
+        // Every minor in 1..=XINPUT_LAST_REQUEST has an arm above; like
+        // Xorg's ProcIDispatch, anything else is BadRequest.
+        _ => {
+            debug_assert!(minor == 0 || minor > XINPUT_LAST_REQUEST);
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -20680,13 +20985,6 @@ fn handle_xi2_request(
                 u16::from(minor),
                 header.opcode,
             );
-        }
-        _ => {
-            debug!(
-                "client {} #{} known unsupported XI request minor={}",
-                client_id.0, sequence.0, minor
-            );
-            return Ok(RequestOutcome::Handled);
         }
     }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -23091,7 +23389,7 @@ fn emit_property_change(
         .filter_map(|(id, client)| {
             let selected = client.xi2_masks.iter().any(|(&(_, dev), &mask)| {
                 let device_matches = dev == deviceid || dev == XI_ALL_DEVICES;
-                device_matches && (mask & XI2_PROPERTY_EVENT_MASK) != 0
+                device_matches && (mask & u64::from(XI2_PROPERTY_EVENT_MASK)) != 0
             });
             selected.then_some(ClientId(*id))
         })
@@ -26659,96 +26957,109 @@ fn handle_set_input_focus(
                 42,
             );
         }
-        if window.0 > 1 {
-            let Some(w) = state.resources.window(window) else {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_WINDOW,
-                    window.0,
-                    42,
-                );
-            };
-            if w.map_state != crate::resources::MapState::Viewable {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    window.0,
-                    42,
-                );
-            }
+        if let Some((code, value)) = core_focus_window_error(state, window) {
+            return emit_x11_error(state, client_id, sequence, code, value, 42);
         }
-        // Xorg SetInputFocus: requests with a time LATER than the
-        // current time or EARLIER than the last focus time are
-        // silently ignored.
         let time = body
             .get(4..8)
             .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        let now = state
-            .timestamp_now()
-            .max(state.xi1_last_input_time)
-            .max(state.core_focus.time);
-        if time != 0
-            && (crate::core_loop::xi1_focus::time_after(time, now)
-                || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
-        {
-            debug!(
-                "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
-                client_id.0, sequence.0, state.core_focus.time
-            );
-            return Ok(RequestOutcome::Handled);
-        }
-        debug!(
-            "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
-            client_id.0, window.0
-        );
-        log::trace!(
-            target: "yserver::input::focus",
-            "SetInputFocus client={} window={} revert_to={revert_to}",
-            state.debug_client_label(client_id),
-            state.debug_window_label(window),
-        );
-        let from_raw = state.core_focus.raw;
-        let to_raw = window.0;
-        if from_raw != to_raw {
-            // Xorg SetInputFocus (dix/events.c:4923): the focus transition
-            // is reported NotifyWhileGrabbed (3) while a keyboard grab is
-            // active, else NotifyNormal (0). bspwm focuses a newly-mapped
-            // window WHILE sxhkd's synchronous passive key grab is still
-            // active; emitting NotifyNormal there told GLFW/kitty it had
-            // genuinely taken focus mid-grab, and its focus state machine
-            // then ignored every typed key (the keys still routed
-            // correctly to its window — only the FocusIn mode was wrong).
-            // Mirrors the same gate in `revert_core_focus_from`.
-            let mode = if state.active_keyboard_grab.is_some() {
-                3 // NotifyWhileGrabbed
-            } else {
-                0 // NotifyNormal
-            };
-            emit_core_focus_transition(state, from_raw, to_raw, mode);
-        }
-        state.core_focus = crate::server::CoreFocus {
-            raw: to_raw,
-            revert_to,
-            time: if time == 0 { now } else { time },
-        };
-        // Legacy mirror — the key fanout's `current_focus` and other
-        // readers still consult the per-client field; None/PointerRoot
-        // map to ROOT_WINDOW there (the fanout resolves PointerRoot
-        // through `state.core_focus` directly).
-        let mirror = match to_raw {
-            0 | 1 => ROOT_WINDOW,
-            w => ResourceId(w),
-        };
-        for c in state.clients.values_mut() {
-            c.focused_window = mirror;
-        }
+        apply_core_input_focus(state, client_id, sequence, window, revert_to, time);
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// The window check of Xorg `SetInputFocus`: a focus other than
+/// None(0)/PointerRoot(1) must be an existing window (BadWindow) that is
+/// viewable (BadMatch). Returns `(error code, errorValue)`.
+fn core_focus_window_error(state: &ServerState, window: ResourceId) -> Option<(u8, u32)> {
+    if window.0 <= 1 {
+        return None;
+    }
+    match state.resources.window(window) {
+        None => Some((x11::error::BAD_WINDOW, window.0)),
+        Some(w) if w.map_state != crate::resources::MapState::Viewable => {
+            Some((x11::error::BAD_MATCH, window.0))
+        }
+        Some(_) => None,
+    }
+}
+
+/// The rest of Xorg `SetInputFocus` for the master keyboard, whose focus
+/// is the core focus (core SetInputFocus and XISetFocus on device 3 both
+/// land here): the timestamp gate, the FocusOut/FocusIn chain, and the
+/// new focus/revert_to/time. `window` has passed
+/// [`core_focus_window_error`].
+fn apply_core_input_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    window: ResourceId,
+    revert_to: u8,
+    time: u32,
+) {
+    // Xorg SetInputFocus: requests with a time LATER than the
+    // current time or EARLIER than the last focus time are
+    // silently ignored.
+    let now = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.core_focus.time);
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
+    {
+        debug!(
+            "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
+            client_id.0, sequence.0, state.core_focus.time
+        );
+        return;
+    }
+    debug!(
+        "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
+        client_id.0, window.0
+    );
+    log::trace!(
+        target: "yserver::input::focus",
+        "SetInputFocus client={} window={} revert_to={revert_to}",
+        state.debug_client_label(client_id),
+        state.debug_window_label(window),
+    );
+    let from_raw = state.core_focus.raw;
+    let to_raw = window.0;
+    if from_raw != to_raw {
+        // Xorg SetInputFocus (dix/events.c:4923): the focus transition
+        // is reported NotifyWhileGrabbed (3) while a keyboard grab is
+        // active, else NotifyNormal (0). bspwm focuses a newly-mapped
+        // window WHILE sxhkd's synchronous passive key grab is still
+        // active; emitting NotifyNormal there told GLFW/kitty it had
+        // genuinely taken focus mid-grab, and its focus state machine
+        // then ignored every typed key (the keys still routed
+        // correctly to its window — only the FocusIn mode was wrong).
+        // Mirrors the same gate in `revert_core_focus_from`.
+        let mode = if state.active_keyboard_grab.is_some() {
+            3 // NotifyWhileGrabbed
+        } else {
+            0 // NotifyNormal
+        };
+        emit_core_focus_transition(state, from_raw, to_raw, mode);
+    }
+    state.core_focus = crate::server::CoreFocus {
+        raw: to_raw,
+        revert_to,
+        time: if time == 0 { now } else { time },
+    };
+    // Legacy mirror — the key fanout's `current_focus` and other
+    // readers still consult the per-client field; None/PointerRoot
+    // map to ROOT_WINDOW there (the fanout resolves PointerRoot
+    // through `state.core_focus` directly).
+    let mirror = match to_raw {
+        0 | 1 => ROOT_WINDOW,
+        w => ResourceId(w),
+    };
+    for c in state.clients.values_mut() {
+        c.focused_window = mirror;
+    }
 }
 
 /// Focus revert when the focus window (or an ancestor) becomes
@@ -29832,7 +30143,7 @@ fn handle_send_event(
     // guard targets the wnck/mate-panel case, which delivers by mask.
     let core_type = req.event[0] & 0x7f;
     if req.event_mask != 0 && matches!(core_type, 4..=8) {
-        let xi2_bit = 1u32 << core_type;
+        let xi2_bit = 1u64 << core_type;
         let before = targets.len();
         targets.retain(|target| {
             let Some(target_client) = state.clients.get(&target.0) else {
@@ -30036,98 +30347,179 @@ fn handle_warp_pointer(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
-        let src_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-        let dst_x = i16::from_le_bytes([body[16], body[17]]);
-        let dst_y = i16::from_le_bytes([body[18], body[19]]);
-        // Xorg ProcWarpPointer: BadWindow for a nonexistent src or
-        // dst window.
-        if src_window.0 != 0 && state.resources.window(src_window).is_none() {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_WINDOW,
-                src_window.0,
-                41,
+        let rd16 = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]);
+        let rdu16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+        let req = WarpRequest {
+            src: ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]])),
+            dst: ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]])),
+            src_x: i32::from(rd16(8)),
+            src_y: i32::from(rd16(10)),
+            src_w: rdu16(12),
+            src_h: rdu16(14),
+            dst_x: i32::from(rd16(16)),
+            dst_y: i32::from(rd16(18)),
+        };
+        if let Some(bad) = warp_pointer_bad_window(state, &req) {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+        }
+        if !warp_pointer_src_allows(state, &req, WarpSrcRule::Core) {
+            debug!(
+                "client {} #{} WarpPointer no-op (pointer outside src rect)",
+                client_id.0, sequence.0
             );
+            return Ok(RequestOutcome::Handled);
         }
-        if dst_window.0 != 0 && state.resources.window(dst_window).is_none() {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_WINDOW,
-                dst_window.0,
-                41,
-            );
-        }
-        // src_window != None: the warp only happens when the pointer
-        // is currently inside the source rectangle of src_window
-        // (width/height 0 extend to the window edge).
-        if src_window.0 != 0 {
-            let src_x = i16::from_le_bytes([body[8], body[9]]);
-            let src_y = i16::from_le_bytes([body[10], body[11]]);
-            let src_w = u16::from_le_bytes([body[12], body[13]]);
-            let src_h = u16::from_le_bytes([body[14], body[15]]);
-            let (px, py) = state.pointer_root;
-            let (ox, oy) = state.resources.window_absolute_position(src_window);
-            let rel_x = i32::from(px) - ox;
-            let rel_y = i32::from(py) - oy;
-            let (win_w, win_h) = state
-                .resources
-                .window(src_window)
-                .map_or((0, 0), |w| (i32::from(w.width), i32::from(w.height)));
-            let x0 = i32::from(src_x);
-            let y0 = i32::from(src_y);
-            let x1 = if src_w == 0 {
-                win_w
-            } else {
-                x0 + i32::from(src_w)
-            };
-            let y1 = if src_h == 0 {
-                win_h
-            } else {
-                y0 + i32::from(src_h)
-            };
-            if rel_x < x0 || rel_x >= x1 || rel_y < y0 || rel_y >= y1 {
-                debug!(
-                    "client {} #{} WarpPointer no-op (pointer outside src rect)",
-                    client_id.0, sequence.0
-                );
-                return Ok(RequestOutcome::Handled);
-            }
-        }
-        if dst_window.0 == 0 {
-            // dst=None: move relative to the current pointer position.
-            if let Ok(p) = backend.query_pointer(origin) {
-                let abs_x = i32::from(p.win_x) + i32::from(dst_x);
-                let abs_y = i32::from(p.win_y) + i32::from(dst_y);
-                let prev = state.barrier_bypass;
-                state.barrier_bypass = true;
-                backend.warp_pointer_root(state, abs_x, abs_y);
-                state.barrier_bypass = prev;
-            }
-        } else {
-            let host_target = state
-                .resources
-                .host_drawable_target(dst_window)
-                .map(|t| (t.host_xid(), dst_x, dst_y));
-            if let Some((host_xid, x, y)) = host_target {
-                let _ = backend.warp_pointer(origin, host_xid, x, y);
-            }
-            // Resolve the destination to root-absolute coordinates for
-            // self-contained backends (KMS) — see
-            // `Backend::warp_pointer_root`. No-op for proxy backends.
-            let (wx, wy) = state.resources.window_absolute_position(dst_window);
-            let prev = state.barrier_bypass;
-            state.barrier_bypass = true;
-            backend.warp_pointer_root(state, wx + i32::from(dst_x), wy + i32::from(dst_y));
-            state.barrier_bypass = prev;
-        }
+        apply_pointer_warp(state, backend, origin, &req);
     }
     debug!("client {} #{} WarpPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// Which of Xorg's two source-rectangle tests a warp uses. Xorg keeps
+/// two copies that differ in one term (see [`warp_pointer_src_allows`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarpSrcRule {
+    /// `ProcWarpPointer` (dix/events.c).
+    Core,
+    /// `ProcXIWarpPointer` (Xi/xiwarppointer.c).
+    XInput2,
+}
+
+/// A decoded core `WarpPointer` or `XIWarpPointer`. The XI FP16.16
+/// coordinates are already converted to whole pixels the way Xorg does
+/// it (`int src_x = stuff->src_x / (double)(1 << 16)`, which truncates
+/// toward zero).
+struct WarpRequest {
+    src: ResourceId,
+    dst: ResourceId,
+    src_x: i32,
+    src_y: i32,
+    src_w: u16,
+    src_h: u16,
+    dst_x: i32,
+    dst_y: i32,
+}
+
+/// The first nonexistent window of a warp, in Xorg's lookup order: the
+/// destination is looked up before the source in both ProcWarpPointer
+/// and ProcXIWarpPointer.
+fn warp_pointer_bad_window(state: &ServerState, req: &WarpRequest) -> Option<u32> {
+    [req.dst, req.src]
+        .into_iter()
+        .find(|w| w.0 != 0 && state.resources.window(*w).is_none())
+        .map(|w| w.0)
+}
+
+/// Whether the pointer is inside the warp's source rectangle, so the
+/// warp goes ahead (always true without a source window).
+///
+/// Ported term for term, including the XI copy's slip: its right-edge
+/// test compares against 0 instead of the pointer x
+/// (`winX + src_x + src_width < 0`, Xi/xiwarppointer.c), so an XI warp
+/// ignores the right edge of the rectangle — only the window's own
+/// extent (via the visibility test) bounds it. Both copies treat the
+/// right/bottom edges as inclusive, and a zero width/height as "to the
+/// window's edge". The core copy skips the visibility test for the root
+/// window (`source->parent &&`); the XI copy always runs it.
+fn warp_pointer_src_allows(state: &ServerState, req: &WarpRequest, rule: WarpSrcRule) -> bool {
+    if req.src.0 == 0 {
+        return true;
+    }
+    let (x, y) = (
+        i32::from(state.pointer_root.0),
+        i32::from(state.pointer_root.1),
+    );
+    let (win_x, win_y) = state.resources.window_absolute_position(req.src);
+    let left = win_x + req.src_x;
+    let top = win_y + req.src_y;
+    let right_limit = match rule {
+        WarpSrcRule::Core => x,
+        WarpSrcRule::XInput2 => 0,
+    };
+    let outside = x < left
+        || y < top
+        || (req.src_w != 0 && left + i32::from(req.src_w) < right_limit)
+        || (req.src_h != 0 && top + i32::from(req.src_h) < y);
+    if outside {
+        return false;
+    }
+    let check_visibility = rule == WarpSrcRule::XInput2 || req.src != ROOT_WINDOW;
+    !check_visibility || point_in_window_is_visible(state, req.src, x, y)
+}
+
+/// Xorg `PointInWindowIsVisible` (dix/window.c): the window is viewable
+/// and the root point lies in its visible border-inclusive region and
+/// input shape. The pointer hit test resolves exactly that — the point is
+/// in `window`'s region iff the deepest window under it is `window` or
+/// one of its inferiors.
+fn point_in_window_is_visible(state: &ServerState, window: ResourceId, x: i32, y: i32) -> bool {
+    if window == ROOT_WINDOW {
+        return true;
+    }
+    let viewable = state
+        .resources
+        .window(window)
+        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+    if !viewable {
+        return false;
+    }
+    let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) else {
+        return false;
+    };
+    state
+        .root_pointer_target_at(x, y)
+        .is_some_and(|(hit, _, _)| {
+            hit == window || crate::core_loop::xi1_focus::is_ancestor(state, window, hit)
+        })
+}
+
+/// Move the sprite for a validated warp: relative to the destination
+/// window's origin, or to the current position when there is none,
+/// clamped to the screen like ProcWarpPointer/ProcXIWarpPointer, then
+/// through the backend's absolute-motion path (which generates the
+/// crossing and motion events a warp is specified to produce). Warps
+/// bypass pointer barriers.
+fn apply_pointer_warp(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    req: &WarpRequest,
+) {
+    let (base_x, base_y) = if req.dst.0 == 0 {
+        (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        )
+    } else {
+        state.resources.window_absolute_position(req.dst)
+    };
+    let (root_w, root_h) = state
+        .resources
+        .window(ROOT_WINDOW)
+        .map_or((1, 1), |r| (i32::from(r.width), i32::from(r.height)));
+    let x = base_x
+        .saturating_add(req.dst_x)
+        .clamp(0, (root_w - 1).max(0));
+    let y = base_y
+        .saturating_add(req.dst_y)
+        .clamp(0, (root_h - 1).max(0));
+    if req.dst.0 != 0 {
+        // Proxy backends warp the host pointer relative to the host
+        // window (a no-op on KMS, which only uses `warp_pointer_root`).
+        let to_i16 = |v: i32| i16::try_from(v).unwrap_or(if v < 0 { i16::MIN } else { i16::MAX });
+        if let Some(target) = state.resources.host_drawable_target(req.dst) {
+            let _ = backend.warp_pointer(
+                origin,
+                target.host_xid(),
+                to_i16(req.dst_x),
+                to_i16(req.dst_y),
+            );
+        }
+    }
+    let prev = state.barrier_bypass;
+    state.barrier_bypass = true;
+    backend.warp_pointer_root(state, x, y);
+    state.barrier_bypass = prev;
 }
 
 fn handle_get_modifier_mapping(
@@ -32759,7 +33151,7 @@ mod tests {
             via_xi2,
             implicit: false,
             passive,
-            xi2_mask: if via_xi2 { u32::MAX } else { 0 },
+            xi2_mask: if via_xi2 { u64::MAX } else { 0 },
         });
     }
 
@@ -33786,16 +34178,15 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // Master keyboard (device 3) focused on a real window.
+        // Master keyboard (device 3) focused on a real window. The master
+        // keyboard's focus IS the core focus (Xorg: `inputInfo.keyboard->
+        // focus`, which ProcSetInputFocus and ProcXIGetFocus share).
         let win = 0x4000_0005u32;
-        state.xi1_device_focus.insert(
-            3,
-            crate::server::Xi1DeviceFocus {
-                focus: win,
-                revert_to: 0,
-                time: 0,
-            },
-        );
+        state.core_focus = crate::server::CoreFocus {
+            raw: win,
+            revert_to: 0,
+            time: 0,
+        };
         // XIGetFocus { deviceid:CARD16=3 } + pad.
         let header = RequestHeader {
             opcode: 137,
@@ -33848,6 +34239,849 @@ mod tests {
         assert_eq!(bytes[0], 0, "error packet");
         assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "BadDevice");
         assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor echoed");
+    }
+
+    // ── XIWarpPointer / XISetFocus / XIChangeHierarchy / XISelectEvents ──
+    //
+    // Expected values below are Xvfb 21.1.24 captures (raw-socket probe,
+    // little-endian client unless noted), cross-checked against
+    // Xi/xiwarppointer.c, Xi/xisetdevfocus.c, Xi/xichangehierarchy.c and
+    // Xi/xiselectev.c.
+
+    /// Send one XInput request (major 137) from client 1 and return what
+    /// the client received.
+    fn send_xi_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let header = RequestHeader {
+            opcode: 137,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        };
+        handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            body,
+        )
+        .expect("xi request");
+        read_all_available(peer)
+    }
+
+    fn assert_xi_error(bytes: &[u8], code: u8, value: u32, minor: u16) {
+        assert_eq!(bytes.len(), 32, "one error packet: {bytes:02x?}");
+        assert_eq!(bytes[0], 0, "error packet: {bytes:02x?}");
+        assert_eq!(bytes[1], code, "error code: {bytes:02x?}");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            value,
+            "errorValue: {bytes:02x?}"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            minor,
+            "minor opcode: {bytes:02x?}"
+        );
+        assert_eq!(bytes[10], XI2_MAJOR_OPCODE, "major opcode");
+    }
+
+    /// A mapped 100×100 child of the root at (100, 100), owned by client 1.
+    fn seed_mapped_window_at_100(state: &mut ServerState, xid: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(xid));
+    }
+
+    fn fp1616(v: f64) -> i32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = (v * 65536.0).round() as i32;
+        raw
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn xi_warp_body(
+        src: u32,
+        dst: u32,
+        src_x: f64,
+        src_y: f64,
+        src_w: u16,
+        src_h: u16,
+        dst_x: f64,
+        dst_y: f64,
+        deviceid: u16,
+    ) -> Vec<u8> {
+        let mut b = Vec::with_capacity(32);
+        b.extend_from_slice(&src.to_le_bytes());
+        b.extend_from_slice(&dst.to_le_bytes());
+        b.extend_from_slice(&fp1616(src_x).to_le_bytes());
+        b.extend_from_slice(&fp1616(src_y).to_le_bytes());
+        b.extend_from_slice(&src_w.to_le_bytes());
+        b.extend_from_slice(&src_h.to_le_bytes());
+        b.extend_from_slice(&fp1616(dst_x).to_le_bytes());
+        b.extend_from_slice(&fp1616(dst_y).to_le_bytes());
+        b.extend_from_slice(&deviceid.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_core_warp(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        src: u32,
+        dst: u32,
+        src_x: i16,
+        src_y: i16,
+        src_w: u16,
+        src_h: u16,
+        dst_x: i16,
+        dst_y: i16,
+    ) {
+        let mut b = Vec::with_capacity(20);
+        b.extend_from_slice(&src.to_le_bytes());
+        b.extend_from_slice(&dst.to_le_bytes());
+        b.extend_from_slice(&src_x.to_le_bytes());
+        b.extend_from_slice(&src_y.to_le_bytes());
+        b.extend_from_slice(&src_w.to_le_bytes());
+        b.extend_from_slice(&src_h.to_le_bytes());
+        b.extend_from_slice(&dst_x.to_le_bytes());
+        b.extend_from_slice(&dst_y.to_le_bytes());
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 41,
+                data: 0,
+                length_units: 6,
+            },
+            &b,
+            None,
+        )
+        .expect("WarpPointer");
+    }
+
+    #[test]
+    fn xi_warp_pointer_moves_to_truncated_fp1616_destination() {
+        // Xvfb: XIWarpPointer(dst=root, 10.75, 20.25) → pointer (10, 20);
+        // then relative (-0.5, -1.5) → (10, 19); relative (+0.99, +2.5)
+        // → (10, 21). ProcXIWarpPointer stores the FP16.16 values in
+        // ints, so the fraction truncates toward zero.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 10.75, 20.25, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert!(bytes.is_empty(), "XIWarpPointer has no reply: {bytes:02x?}");
+        assert_eq!(backend.warped_to, Some((10, 20)));
+
+        state.pointer_root = (10, 20);
+        let body = xi_warp_body(0, 0, 0.0, 0.0, 0, 0, -0.5, -1.5, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((10, 19)));
+
+        state.pointer_root = (10, 19);
+        let body = xi_warp_body(0, 0, 0.0, 0.0, 0, 0, 0.99, 2.5, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((10, 21)));
+    }
+
+    #[test]
+    fn xi_warp_pointer_to_window_and_clamped_to_the_screen() {
+        // Xvfb (1024×768): dst=W(100,100) (5, 6) → (105, 106);
+        // (-5.5, -6.5) → (95, 94); dst=root (5000, 5000) → (w-1, h-1);
+        // (-3, -3) → (0, 0). The test root is 800×600.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const W: u32 = 0x0040_0001;
+        seed_mapped_window_at_100(&mut state, W);
+        for (dx, dy, want) in [(5.0, 6.0, (105, 106)), (-5.5, -6.5, (95, 94))] {
+            let body = xi_warp_body(0, W, 0.0, 0.0, 0, 0, dx, dy, 2);
+            let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_eq!(backend.warped_to, Some(want), "dst=W ({dx}, {dy})");
+        }
+        for (dx, dy, want) in [
+            (5000.0, 5000.0, (799, 599)),
+            (800.0, 600.0, (799, 599)),
+            (-3.0, -3.0, (0, 0)),
+        ] {
+            let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, dx, dy, 2);
+            let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_eq!(backend.warped_to, Some(want), "dst=root ({dx}, {dy})");
+        }
+    }
+
+    #[test]
+    fn xi_warp_pointer_rejects_everything_but_the_master_pointer() {
+        // ProcXIWarpPointer: BadDevice unless the device is a master
+        // pointer or a floating slave (yserver has no floating slaves).
+        // errorValue = deviceid. Xvfb: devices 0,1,3,4,5,99 → BadDevice.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for dev in [0u16, 1, 3, 4, 5, 99] {
+            let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 5.0, 5.0, dev);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, u32::from(dev), 41);
+        }
+        // The device is checked before the windows.
+        let body = xi_warp_body(0, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 3);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 3, 41);
+        assert_eq!(backend.warped_to, None, "no rejected request may warp");
+    }
+
+    #[test]
+    fn xi_warp_pointer_bad_windows_report_dst_before_src() {
+        // Xvfb: dst bad → BadWindow(dst); src bad → BadWindow(src); both
+        // bad → BadWindow(dst).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi_warp_body(0, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 41);
+        let body = xi_warp_body(0x00be_ef00, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00be_ef00, 41);
+        let body = xi_warp_body(0x00be_ef00, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 41);
+        assert_eq!(backend.warped_to, None);
+    }
+
+    #[test]
+    fn xi_warp_pointer_source_rectangle_follows_xorgs_xi_arithmetic() {
+        // Xorg keeps two copies of the source-rectangle test. The XI one
+        // compares the right edge against 0 instead of the pointer x
+        // (`winX + src_x + src_width < 0`), so with W at (100,100) 100×100
+        // and src rect (0,0,10,10):
+        //   pointer (160,105): XIWarpPointer WARPS, core WarpPointer doesn't;
+        //   pointer (105,160): neither warps (the bottom edge is checked);
+        //   pointer (105,110): XI warps (bottom edge inclusive).
+        // Both also require the pointer to be visible in the source window:
+        //   pointer (50,50), src rect (-100,-100,0,0): no warp.
+        // The src coordinates truncate: pointer (104,104) with src_x 4.9
+        // warps, with 5.0 doesn't; pointer (99,99) with -0.9 doesn't.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_mapped_window_at_100(&mut state, W);
+        let cases = [
+            ((160_i16, 105_i16), (0.0, 0.0, 10_u16, 10_u16), true),
+            ((105, 160), (0.0, 0.0, 10, 10), false),
+            ((105, 110), (0.0, 0.0, 10, 10), true),
+            ((50, 50), (-100.0, -100.0, 0, 0), false),
+            ((104, 104), (4.9, 4.9, 0, 0), true),
+            ((104, 104), (5.0, 5.0, 0, 0), false),
+            ((99, 99), (-0.9, -0.9, 0, 0), false),
+        ];
+        for (pointer, (sx, sy, sw, sh), warps) in cases {
+            let mut backend = RecordingBackend::new();
+            state.pointer_root = pointer;
+            let body = xi_warp_body(W, ROOT_WINDOW.0, sx, sy, sw, sh, 300.0, 300.0, 2);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert!(bytes.is_empty(), "no error: {bytes:02x?}");
+            assert_eq!(
+                backend.warped_to,
+                warps.then_some((300, 300)),
+                "pointer {pointer:?} src ({sx},{sy},{sw},{sh})"
+            );
+        }
+        // src = root: always inside.
+        let mut backend = RecordingBackend::new();
+        state.pointer_root = (50, 50);
+        let body = xi_warp_body(ROOT_WINDOW.0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 70.0, 70.0, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((70, 70)));
+    }
+
+    #[test]
+    fn core_warp_pointer_source_rectangle_matches_xorg() {
+        // ProcWarpPointer (Xvfb): W at (100,100) 100×100, src rect
+        // (0,0,10,10): pointer (160,105) → no warp; (110,105) → warp (the
+        // right edge is inclusive: `winX + srcX + srcWidth < x`);
+        // (50,50) with src rect (-100,-100,0,0) → no warp (the pointer is
+        // not visible in W). Bad windows report dst before src.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_mapped_window_at_100(&mut state, W);
+        for (pointer, (sx, sy, sw, sh), warps) in [
+            ((160, 105), (0, 0, 10, 10), false),
+            ((110, 105), (0, 0, 10, 10), true),
+            ((105, 110), (0, 0, 10, 10), true),
+            ((50, 50), (-100, -100, 0, 0), false),
+        ] {
+            let mut backend = RecordingBackend::new();
+            state.pointer_root = pointer;
+            send_core_warp(
+                &mut state,
+                &mut backend,
+                W,
+                ROOT_WINDOW.0,
+                sx,
+                sy,
+                sw,
+                sh,
+                300,
+                300,
+            );
+            assert_eq!(
+                backend.warped_to,
+                warps.then_some((300, 300)),
+                "pointer {pointer:?} src ({sx},{sy},{sw},{sh})"
+            );
+        }
+        let mut backend = RecordingBackend::new();
+        send_core_warp(
+            &mut state,
+            &mut backend,
+            0x00be_ef00,
+            0x00de_ad00,
+            0,
+            0,
+            0,
+            0,
+            5,
+            5,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_WINDOW);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0x00de_ad00,
+            "dst is looked up first"
+        );
+    }
+
+    fn xi_set_focus_body(focus: u32, time: u32, deviceid: u16) -> Vec<u8> {
+        let mut b = Vec::with_capacity(12);
+        b.extend_from_slice(&focus.to_le_bytes());
+        b.extend_from_slice(&time.to_le_bytes());
+        b.extend_from_slice(&deviceid.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    /// Split a byte stream into X packets (GenericEvents carry a tail).
+    fn split_packets(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 32 <= bytes.len() {
+            let mut len = 32;
+            if bytes[pos] & 0x7f == 35 || bytes[pos] == 1 {
+                len += 4 * u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            }
+            out.push(&bytes[pos..pos + len]);
+            pos += len;
+        }
+        out
+    }
+
+    #[test]
+    fn xi_set_focus_on_the_master_keyboard_is_core_set_input_focus() {
+        // Xvfb: XISetFocus(dev 3, W) → GetInputFocus = W with revert_to
+        // RevertToParent (ProcXISetFocus passes RevertToParent), XIGetFocus
+        // (3) = W, and the core + XI2 FocusIn/FocusOut chain is delivered.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        {
+            let client = state.clients.get_mut(&1).unwrap();
+            client.event_masks.insert(ResourceId(W), FOCUS_CHANGE_MASK);
+            client
+                .xi2_masks
+                .insert((ResourceId(W), 0), (1 << 9) | (1 << 10));
+        }
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0, 3),
+        );
+        assert_eq!(state.core_focus.raw, W);
+        assert_eq!(state.core_focus.revert_to, 2, "RevertToParent");
+        let packets = split_packets(&bytes);
+        assert!(
+            packets
+                .iter()
+                .any(|p| p[0] == 9 && u32::from_le_bytes(p[4..8].try_into().unwrap()) == W),
+            "core FocusIn on W: {packets:02x?}"
+        );
+        assert!(
+            packets.iter().any(|p| p[0] == 35
+                && u16::from_le_bytes(p[8..10].try_into().unwrap()) == 9
+                && u32::from_le_bytes(p[24..28].try_into().unwrap()) == W),
+            "XI2 FocusIn on W: {packets:02x?}"
+        );
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[3, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &W.to_le_bytes(), "XIGetFocus(3) = W");
+
+        // Xvfb: None and PointerRoot are accepted and reported back.
+        for focus in [0u32, 1] {
+            let _ = send_xi_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                49,
+                &xi_set_focus_body(focus, 0, 3),
+            );
+            assert_eq!(state.core_focus.raw, focus);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[3, 0, 0, 0]);
+            let bytes = split_packets(&bytes).last().unwrap().to_vec();
+            assert_eq!(&bytes[8..12], &focus.to_le_bytes());
+        }
+
+        // A time later than the server's clock is silently ignored.
+        let _ = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0x7fff_ffff, 3),
+        );
+        assert_eq!(state.core_focus.raw, 1, "future-timestamp request ignored");
+    }
+
+    #[test]
+    fn xi_set_focus_errors_match_xorg() {
+        // Xvfb: devices without a focus class (the pointers) and unknown
+        // ids → BadDevice, errorValue 0 (ProcXISetFocus sets none); a
+        // missing window → BadWindow; an unviewable one → BadMatch with
+        // the window as errorValue.
+        const UNMAPPED: u32 = 0x0040_0002;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(UNMAPPED),
+                parent: ROOT_WINDOW,
+                width: 10,
+                height: 10,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        for dev in [0u16, 1, 2, 4, 99] {
+            let bytes = send_xi_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                49,
+                &xi_set_focus_body(ROOT_WINDOW.0, 0, dev),
+            );
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 0, 49);
+        }
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(0x00de_ad00, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 49);
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(UNMAPPED, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_MATCH, UNMAPPED, 49);
+        // FollowKeyboard on the master keyboard itself would make it
+        // follow itself (Xvfb segfaults on it); yserver rejects it.
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(3, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 3, 49);
+        assert_eq!(state.core_focus.raw, 1, "focus untouched by errors");
+    }
+
+    #[test]
+    fn xi_set_focus_on_the_slave_keyboard_sets_its_own_focus() {
+        // Xvfb: XISetFocus(dev 5, W) leaves the core focus alone and
+        // XIGetFocus(5) = W; FollowKeyboard (3) is accepted on a slave
+        // and reported back as 3.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0, 5),
+        );
+        assert!(bytes.is_empty(), "{bytes:02x?}");
+        assert_eq!(state.core_focus.raw, 1, "core focus unchanged");
+        let f = crate::core_loop::xi1_focus::device_focus(&state, 5);
+        assert_eq!((f.focus, f.revert_to), (W, 2));
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[5, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &W.to_le_bytes());
+        let _ = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(3, 0, 5),
+        );
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[5, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &3u32.to_le_bytes(), "FollowKeyboard");
+    }
+
+    #[test]
+    fn xi_get_focus_rejects_pointer_devices() {
+        // Xvfb: XIGetFocus on devices without a focus class (2, 4) →
+        // BadDevice, errorValue 0.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for dev in [2u8, 4] {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[dev, 0, 0, 0]);
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 0, 50);
+        }
+    }
+
+    fn xi_hierarchy_body(num_changes: u8, changes: &[&[u8]]) -> Vec<u8> {
+        let mut b = vec![num_changes, 0, 0, 0];
+        for c in changes {
+            b.extend_from_slice(c);
+        }
+        b
+    }
+
+    fn le_u16s(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn remove_master_change(dev: u16, mode: u8) -> Vec<u8> {
+        let mut c = le_u16s(&[2, 3, dev]);
+        c.extend_from_slice(&[mode, 0]);
+        c.extend_from_slice(&le_u16s(&[2, 3]));
+        c
+    }
+
+    #[test]
+    fn xi_change_hierarchy_answers_like_xorg_for_the_fixed_devices() {
+        // Every row is an Xvfb 21.1.24 capture. Xvfb's devices 4/5 are the
+        // XTest slaves, which Xorg refuses to attach/detach ("these are
+        // fixed"); yserver's 4/5 are fixed too, so the answers match
+        // device-for-device. `None` = Success (no reply, no event).
+        const BAD_DEVICE: u8 = XI1_ERROR_BAD_DEVICE;
+        let attach = |dev: u16, master: u16| le_u16s(&[3, 2, dev, master]);
+        let detach = |dev: u16| le_u16s(&[4, 2, dev, 0]);
+        // (label, request body, expected error (code, errorValue)).
+        type Case = (&'static str, Vec<u8>, Option<(u8, u32)>);
+        let cases: Vec<Case> = vec![
+            ("empty", xi_hierarchy_body(0, &[]), None),
+            (
+                "remove 2 float",
+                xi_hierarchy_body(1, &[&remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 3 attach",
+                xi_hierarchy_body(1, &[&remove_master_change(3, 1)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 2 mode 5",
+                xi_hierarchy_body(1, &[&remove_master_change(2, 5)]),
+                Some((x11::error::BAD_VALUE, 0)),
+            ),
+            (
+                "remove 4",
+                xi_hierarchy_body(1, &[&remove_master_change(4, 2)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "remove 99",
+                xi_hierarchy_body(1, &[&remove_master_change(99, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 0",
+                xi_hierarchy_body(1, &[&remove_master_change(0, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "attach 4->2",
+                xi_hierarchy_body(1, &[&attach(4, 2)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "attach 4->3",
+                xi_hierarchy_body(1, &[&attach(4, 3)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "attach 5->3",
+                xi_hierarchy_body(1, &[&attach(5, 3)]),
+                Some((BAD_DEVICE, 5)),
+            ),
+            (
+                "attach 2->3",
+                xi_hierarchy_body(1, &[&attach(2, 3)]),
+                Some((BAD_DEVICE, 2)),
+            ),
+            (
+                "attach 99->2",
+                xi_hierarchy_body(1, &[&attach(99, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "detach 4",
+                xi_hierarchy_body(1, &[&detach(4)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "detach 5",
+                xi_hierarchy_body(1, &[&detach(5)]),
+                Some((BAD_DEVICE, 5)),
+            ),
+            (
+                "detach 2",
+                xi_hierarchy_body(1, &[&detach(2)]),
+                Some((BAD_DEVICE, 2)),
+            ),
+            (
+                "detach 99",
+                xi_hierarchy_body(1, &[&detach(99)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "unknown type skipped",
+                xi_hierarchy_body(1, &[&le_u16s(&[9, 1])]),
+                None,
+            ),
+            (
+                "unknown then remove 2",
+                xi_hierarchy_body(2, &[&le_u16s(&[9, 1]), &remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove with length 2",
+                xi_hierarchy_body(1, &[&le_u16s(&[2, 2, 2, 2, 0, 3])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "attach with length 3",
+                xi_hierarchy_body(1, &[&le_u16s(&[3, 3, 4, 2, 0, 0])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "num_changes 2, one change",
+                xi_hierarchy_body(2, &[&remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "change length past the request",
+                xi_hierarchy_body(1, &[&le_u16s(&[3, 9, 4, 2])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "add master, name longer than the request",
+                xi_hierarchy_body(1, &[&[1, 0, 2, 0, 4, 0, 1, 1]]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+        ];
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for (label, body, want) in cases {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 43, &body);
+            match want {
+                None => assert!(bytes.is_empty(), "{label}: {bytes:02x?}"),
+                Some((code, value)) => {
+                    assert!(!bytes.is_empty(), "{label}: expected an error");
+                    assert_eq!(bytes[1], code, "{label}: {bytes:02x?}");
+                    assert_xi_error(&bytes, code, value, 43);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xi_change_hierarchy_add_master_is_refused_with_bad_alloc() {
+        // Xorg creates the pair; yserver's device set is fixed, so it
+        // answers the way Xorg does when it cannot allocate a device
+        // (AllocDevicePair → BadAlloc) and sends no HierarchyChanged.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), 1 << 11);
+        let mut add = le_u16s(&[1, 3, 3]);
+        add.extend_from_slice(&[1, 1]);
+        add.extend_from_slice(b"foo\0");
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            43,
+            &xi_hierarchy_body(1, &[&add]),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_ALLOC, 0, 43);
+    }
+
+    #[test]
+    fn xi_change_hierarchy_reads_changes_in_client_byte_order() {
+        // The change list is opaque to the request swapper; a big-endian
+        // client's AttachSlave(4 → 2) must still name device 4.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let change: Vec<u8> = [3u16, 2, 4, 2]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            43,
+            &xi_hierarchy_body(1, &[&change]),
+        );
+        assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "{bytes:02x?}");
+        assert_eq!(&bytes[4..8], &4u32.to_be_bytes(), "errorValue = device 4");
+    }
+
+    #[test]
+    fn xi_unknown_minor_is_bad_request() {
+        // Xvfb: XI minors 0, 62, 200, 255 → BadRequest (ProcIDispatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for minor in [0u8, 62, 200, 255] {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, minor, &[0; 8]);
+            assert_xi_error(&bytes, x11::error::BAD_REQUEST, 0, u16::from(minor));
+        }
+    }
+
+    fn xi_select_body(window: u32, masks: &[(u16, &[u32])]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&window.to_le_bytes());
+        b.extend_from_slice(&u16::try_from(masks.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        for (dev, words) in masks {
+            b.extend_from_slice(&dev.to_le_bytes());
+            b.extend_from_slice(&u16::try_from(words.len()).unwrap().to_le_bytes());
+            for w in *words {
+                // Event masks are bit arrays: byte i holds bits 8i..8i+7.
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn xi_select_events_keeps_bit_32_and_rejects_bits_past_the_last_event() {
+        // Xvfb: select dev 2 = {2, 30, 31, 32} (mask_len 2) + dev 3 = {3};
+        // XIGetSelectedEvents returns exactly
+        //   02000200 040000c0 01000000 03000100 08000000
+        // (masks in device order, trailing zero words trimmed). Selecting
+        // bit 33 → BadValue(33), bit 69 → BadValue(69), and the rejected
+        // request changes nothing.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        let lo = (1u32 << 2) | (1 << 30) | (1 << 31);
+        let body = xi_select_body(W, &[(2, &[lo, 1]), (3, &[1 << 3])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert!(bytes.is_empty(), "{bytes:02x?}");
+        let expected_tail: [u8; 20] = [
+            0x02, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x01, 0x00, 0x08, 0x00, 0x00, 0x00,
+        ];
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(reply.len(), 52, "{reply:02x?}");
+        assert_eq!(&reply[4..8], &5u32.to_le_bytes(), "reply length");
+        assert_eq!(&reply[8..10], &2u16.to_le_bytes(), "num_masks");
+        assert_eq!(&reply[32..], &expected_tail);
+
+        let body = xi_select_body(W, &[(2, &[0, 1 << 1])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 33, 46);
+        let body = xi_select_body(W, &[(2, &[1 << 2, 0, 1 << 5])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 69, 46);
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(
+            &reply[32..],
+            &expected_tail,
+            "rejected selects applied nothing"
+        );
+    }
+
+    #[test]
+    fn xi_get_selected_events_header_fields_use_client_byte_order() {
+        // Xvfb, big-endian client, same selection as above:
+        //   00020002 040000c0 01000000 00030001 08000000
+        // deviceid/mask_len/num_masks swap; the mask bytes don't.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let lo = (1u32 << 2) | (1 << 30) | (1 << 31);
+        // Request bodies reach the handler already swapped to LE.
+        let body = xi_select_body(W, &[(2, &[lo, 1]), (3, &[1 << 3])]);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(&reply[4..8], &5u32.to_be_bytes(), "reply length");
+        assert_eq!(&reply[8..10], &2u16.to_be_bytes(), "num_masks");
+        assert_eq!(
+            &reply[32..],
+            &[
+                0x00, 0x02, 0x00, 0x02, 0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03,
+                0x00, 0x01, 0x08, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
@@ -38892,7 +40126,7 @@ mod tests {
         // at the root window — the way GDK/Chromium subscribe.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
             (ROOT_WINDOW, DEVICEID_SLAVE_POINTER),
-            XI2_DEVICE_CHANGED_MASK,
+            u64::from(XI2_DEVICE_CHANGED_MASK),
         );
 
         // Touchpad add → DeviceChanged for device 4.
@@ -38971,12 +40205,10 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let non_root = ResourceId(0x4000_0001);
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((non_root, DEVICEID_SLAVE_POINTER), XI2_DEVICE_CHANGED_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (non_root, DEVICEID_SLAVE_POINTER),
+            u64::from(XI2_DEVICE_CHANGED_MASK),
+        );
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
         assert!(dropped.is_empty());
         assert!(
@@ -40409,7 +41641,7 @@ mod tests {
             .get_mut(&client_id)
             .expect("client installed")
             .xi2_masks
-            .insert((ROOT_WINDOW, deviceid), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, deviceid), u64::from(XI2_PROPERTY_EVENT_MASK));
     }
 
     #[test]
@@ -40672,12 +41904,10 @@ mod tests {
         // Selecting `XI_DeviceChanged` only — the
         // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
         // must be skipped.
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ROOT_WINDOW, 4), crate::xinput::XI2_DEVICE_CHANGED_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ROOT_WINDOW, 4),
+            u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK),
+        );
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40725,7 +41955,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .xi2_masks
-            .insert((ROOT_WINDOW, 3), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, 3), u64::from(XI2_PROPERTY_EVENT_MASK));
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40775,7 +42005,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .xi2_masks
-            .insert((ROOT_WINDOW, 0), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, 0), u64::from(XI2_PROPERTY_EVENT_MASK));
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40864,12 +42094,10 @@ mod tests {
         seed_touchpad_for_t3(&mut state);
         // Subscribe via a non-root window — anything keyed by the
         // device id wins.
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ResourceId(0xdead_beef), 4), XI2_PROPERTY_EVENT_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ResourceId(0xdead_beef), 4),
+            u64::from(XI2_PROPERTY_EVENT_MASK),
+        );
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -55104,7 +56332,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
         // Sanity: sibling is NOT a descendant of grab window.
         assert!(
@@ -56281,7 +57509,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
         // ReplayDevice only acts on a FROZEN device with a stored event to
         // replay (Xorg AllowSome) — engage the sync freeze + activating press.
@@ -56392,13 +57620,13 @@ mod tests {
             .get_mut(&GRAB_CLIENT_ID)
             .expect("grab client")
             .xi2_masks
-            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+            .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
         state
             .clients
             .get_mut(&TARGET_CLIENT_ID)
             .expect("target client")
             .xi2_masks
-            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+            .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
         state.button_grabs.push(PassiveButtonGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(TARGET_WIN),
@@ -56844,7 +58072,10 @@ mod tests {
             .get_mut(&OTHER_CLIENT_ID)
             .expect("other client")
             .xi2_masks
-            .insert((ResourceId(OTHER_WIN), 1), XI2_BUTTON_RELEASE_BIT);
+            .insert(
+                (ResourceId(OTHER_WIN), 1),
+                u64::from(XI2_BUTTON_RELEASE_BIT),
+            );
 
         // muffin holds an active master-pointer grab (XIGrabDevice).
         // owner_events=false → every event funnels to the grab owner.
@@ -56858,7 +58089,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         Backend::register_top_level(&mut backend, None, ResourceId(OTHER_WIN), OTHER_HOST_XID)
@@ -60860,7 +62091,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         process_request(
