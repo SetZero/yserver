@@ -1,5 +1,6 @@
 // SYNC ground-truth probe: Await / AwaitFence suspension, CounterNotify, errors,
-// SERVERTIME waits. Client A drives counters and fences, client B awaits and then
+// SERVERTIME waits, BadAlarm and AlarmNotify selection by clients other than the
+// alarm's owner. Client A drives counters and fences, client B awaits and then
 // sends GetInputFocus; "blocked" means B's reply had not arrived after A's round
 // trip. Run against Xvfb and yserver and compare (XIDs and times differ).
 //   gcc -o /tmp/sync-await-probe tools/sync-await-probe.c -lxcb -lxcb-sync
@@ -12,6 +13,7 @@
 #include <xcb/xcb.h>
 #include <xcb/sync.h>
 #include <xcb/xcbext.h>
+#include <sys/uio.h>
 
 static uint8_t s_ev, s_err;
 static uint32_t servertime;
@@ -56,6 +58,12 @@ static void peek(xcb_connection_t *b, const char *tag, unsigned int *pending, in
             long long cv = ((long long)n->counter_value.hi << 32) | n->counter_value.lo;
             printf("  [%s] B: CounterNotify kind=%d counter=0x%x wait=%lld value=%lld count=%u destroyed=%u\n",
                    tag, n->kind, n->counter, wv, cv, n->count, n->destroyed);
+        } else if (t == s_ev + 1) {
+            xcb_sync_alarm_notify_event_t *n = (void *)ev;
+            long long cv = ((long long)n->counter_value.hi << 32) | n->counter_value.lo;
+            long long av = ((long long)n->alarm_value.hi << 32) | n->alarm_value.lo;
+            printf("  [%s] B: AlarmNotify alarm=0x%x counter_value=%lld alarm_value=%lld state=%u\n",
+                   tag, n->alarm, cv, av, n->state);
         } else printf("  [%s] B: event type %d\n", tag, t);
         free(ev);
     }
@@ -106,6 +114,165 @@ static void do_destroy(xcb_connection_t *a, void *p) { xcb_sync_destroy_counter(
 static void do_trigger(xcb_connection_t *a, void *p) { xcb_sync_trigger_fence(a, *(xcb_sync_fence_t *)p); printf("  A: trigger fence\n"); }
 static void do_destroy_fence(xcb_connection_t *a, void *p) { xcb_sync_destroy_fence(a, *(xcb_sync_fence_t *)p); printf("  A: destroy fence\n"); }
 static void do_nothing(xcb_connection_t *a, void *p) { (void)a; (void)p; usleep(150000); printf("  A: waited 150ms\n"); }
+
+
+// Every AlarmNotify (and async error) connection `c` has received so far.
+static void drain_alarms(xcb_connection_t *c, const char *who) {
+    xcb_generic_event_t *ev;
+    sync_rt(c);
+    while ((ev = xcb_poll_for_event(c))) {
+        int t = ev->response_type & 0x7f;
+        if (t == 0) { show_err("  async error", (xcb_generic_error_t *)ev); continue; }
+        if (t == s_ev + 1) {
+            xcb_sync_alarm_notify_event_t *n = (void *)ev;
+            long long cv = ((long long)n->counter_value.hi << 32) | n->counter_value.lo;
+            long long av = ((long long)n->alarm_value.hi << 32) | n->alarm_value.lo;
+            printf("  %s: AlarmNotify alarm=0x%x counter_value=%lld alarm_value=%lld state=%u\n",
+                   who, n->alarm, cv, av, n->state);
+        } else printf("  %s: event type %d\n", who, t);
+        free(ev);
+    }
+}
+
+// A SYNC request with a hand-built body, so the length can disagree with the
+// value mask (xcb derives the value list from the mask).
+static xcb_void_cookie_t raw_sync(xcb_connection_t *c, uint8_t minor, const void *body, size_t len) {
+    struct iovec iov[4];
+    uint8_t hdr[4] = { 0, minor, 0, 0 };
+    iov[2].iov_base = hdr; iov[2].iov_len = 4;
+    iov[3].iov_base = (void *)body; iov[3].iov_len = len;
+    xcb_protocol_request_t req = { 2, &xcb_sync_id, minor, 1 };
+    xcb_void_cookie_t ck = { xcb_send_request(c, XCB_REQUEST_CHECKED, iov + 2, &req) };
+    return ck;
+}
+
+static void show_alarm(xcb_connection_t *c, const char *what, xcb_sync_alarm_t al) {
+    xcb_generic_error_t *e = NULL;
+    xcb_sync_query_alarm_reply_t *r = xcb_sync_query_alarm_reply(c, xcb_sync_query_alarm(c, al), &e);
+    if (!r) { show_err(what, e); return; }
+    long long wv = ((long long)r->trigger.wait_value.hi << 32) | r->trigger.wait_value.lo;
+    long long d = ((long long)r->delta.hi << 32) | r->delta.lo;
+    printf("%-44s counter=0x%x wait=%lld test=%u delta=%lld events=%u state=%u\n", what,
+           r->trigger.counter, wv, r->trigger.test_type, d, r->events, r->state);
+    free(r);
+}
+
+static void alarm_events(xcb_connection_t *c, xcb_sync_alarm_t al, int on) {
+    uint32_t v = on;
+    xcb_sync_change_alarm(c, al, XCB_SYNC_CA_EVENTS, &v);
+}
+
+static void alarms(xcb_connection_t *a, xcb_connection_t *b) {
+    printf("== alarm errors\n");
+    xcb_sync_counter_t c = xcb_generate_id(a);
+    xcb_sync_create_counter(a, c, i64(0));
+    {
+        xcb_generic_error_t *e = NULL;
+        free(xcb_sync_query_alarm_reply(b, xcb_sync_query_alarm(b, 0x0badbad0), &e));
+        show_err("QueryAlarm unknown", e);
+        e = NULL;
+        free(xcb_sync_query_alarm_reply(b, xcb_sync_query_alarm(b, 0), &e));
+        show_err("QueryAlarm None", e);
+    }
+    show_err("ChangeAlarm unknown mask 0", xcb_request_check(b, xcb_sync_change_alarm_checked(b, 0x0badbad0, 0, NULL)));
+    show_err("DestroyAlarm unknown", xcb_request_check(b, xcb_sync_destroy_alarm_checked(b, 0x0badbad0)));
+    {
+        uint32_t body[3] = { 0x0badbad0, XCB_SYNC_CA_EVENTS, 0 };
+        show_err("ChangeAlarm unknown, mask/len mismatch", xcb_request_check(b, raw_sync(b, XCB_SYNC_CHANGE_ALARM, body, 8)));
+        show_err("QueryAlarm unknown, long", xcb_request_check(b, raw_sync(b, XCB_SYNC_QUERY_ALARM, body, 8)));
+        show_err("DestroyAlarm unknown, long", xcb_request_check(b, raw_sync(b, XCB_SYNC_DESTROY_ALARM, body, 8)));
+        show_err("ChangeAlarm unknown, short", xcb_request_check(b, raw_sync(b, XCB_SYNC_CHANGE_ALARM, body, 4)));
+    }
+    xcb_sync_alarm_t al = xcb_generate_id(a);
+    {
+        uint32_t v[] = { c, XCB_SYNC_VALUETYPE_ABSOLUTE, 0, 10, XCB_SYNC_TESTTYPE_POSITIVE_COMPARISON, 0, 1, 1 };
+        xcb_sync_create_alarm(a, al, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE_TYPE | XCB_SYNC_CA_VALUE |
+                              XCB_SYNC_CA_TEST_TYPE | XCB_SYNC_CA_DELTA | XCB_SYNC_CA_EVENTS, v);
+        sync_rt(a);
+    }
+    {
+        uint32_t body[3] = { al, XCB_SYNC_CA_EVENTS, 0 };
+        show_err("ChangeAlarm known, mask/len mismatch", xcb_request_check(b, raw_sync(b, XCB_SYNC_CHANGE_ALARM, body, 8)));
+    }
+    xcb_sync_alarm_t gone = xcb_generate_id(a);
+    {
+        uint32_t v[] = { c };
+        xcb_sync_create_alarm(a, gone, XCB_SYNC_CA_COUNTER, v);
+        xcb_sync_destroy_alarm(a, gone);
+    }
+    {
+        xcb_generic_error_t *e = NULL;
+        free(xcb_sync_query_alarm_reply(a, xcb_sync_query_alarm(a, gone), &e));
+        show_err("QueryAlarm destroyed", e);
+    }
+    show_err("ChangeAlarm destroyed", xcb_request_check(a, xcb_sync_change_alarm_checked(a, gone, 0, NULL)));
+    show_err("DestroyAlarm destroyed", xcb_request_check(a, xcb_sync_destroy_alarm_checked(a, gone)));
+    drain_alarms(a, "A"); drain_alarms(b, "B");
+
+    printf("== AlarmNotify selection (alarm owned by A: c>=10 delta 1 events)\n");
+    xcb_connection_t *d = conn(NULL);
+    show_alarm(b, "B QueryAlarm (A's)", al);
+    show_err("B ChangeAlarm events=True", xcb_request_check(b, ({ uint32_t v = 1; xcb_sync_change_alarm_checked(b, al, XCB_SYNC_CA_EVENTS, &v); })));
+    show_err("D ChangeAlarm events=True", xcb_request_check(d, ({ uint32_t v = 1; xcb_sync_change_alarm_checked(d, al, XCB_SYNC_CA_EVENTS, &v); })));
+    show_err("B ChangeAlarm events=True again", xcb_request_check(b, ({ uint32_t v = 1; xcb_sync_change_alarm_checked(b, al, XCB_SYNC_CA_EVENTS, &v); })));
+    show_alarm(b, "B QueryAlarm after B/D select", al);
+    drain_alarms(a, "A"); drain_alarms(b, "B"); drain_alarms(d, "D");
+    printf("  A: set c 10\n"); xcb_sync_set_counter(a, c, i64(10)); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B"); drain_alarms(d, "D");
+    printf("  B: events=False; A: set c 11\n"); alarm_events(b, al, 0); sync_rt(b);
+    xcb_sync_set_counter(a, c, i64(11)); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B"); drain_alarms(d, "D");
+    printf("  A (owner): events=False; A: set c 12\n"); alarm_events(a, al, 0); sync_rt(a);
+    xcb_sync_set_counter(a, c, i64(12)); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B"); drain_alarms(d, "D");
+    show_alarm(b, "B QueryAlarm after owner events=False", al);
+    printf("  D disconnects; A: set c 13\n"); xcb_disconnect(d); usleep(100000); sync_rt(a);
+    xcb_sync_set_counter(a, c, i64(13)); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B");
+    {
+        uint32_t v[] = { 9, 1 };
+        show_err("B ChangeAlarm events=True + bad test type",
+                 xcb_request_check(b, xcb_sync_change_alarm_checked(b, al, XCB_SYNC_CA_TEST_TYPE | XCB_SYNC_CA_EVENTS, v)));
+    }
+    printf("  A: set c 14\n"); xcb_sync_set_counter(a, c, i64(14)); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B");
+    {
+        uint32_t v[] = { 0, 100 };
+        show_err("B (non-owner) ChangeAlarm value=100",
+                 xcb_request_check(b, xcb_sync_change_alarm_checked(b, al, XCB_SYNC_CA_VALUE, v)));
+    }
+    show_alarm(a, "A QueryAlarm after B changed value", al);
+    drain_alarms(a, "A"); drain_alarms(b, "B");
+    printf("  A: DestroyAlarm (B selected)\n"); xcb_sync_destroy_alarm(a, al); sync_rt(a);
+    drain_alarms(a, "A"); drain_alarms(b, "B");
+
+    printf("== non-owner DestroyAlarm; owner disconnect with B selected\n");
+    xcb_connection_t *e = conn(NULL);
+    xcb_sync_counter_t ce = xcb_generate_id(e);
+    xcb_sync_create_counter(e, ce, i64(0));
+    xcb_sync_alarm_t ae1 = xcb_generate_id(e), ae2 = xcb_generate_id(e);
+    { uint32_t v[] = { ce, 0, 50 }; xcb_sync_create_alarm(e, ae1, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE, v); }
+    { uint32_t v[] = { c, 0, 50 }; xcb_sync_create_alarm(e, ae2, XCB_SYNC_CA_COUNTER | XCB_SYNC_CA_VALUE, v); }
+    sync_rt(e);
+    alarm_events(b, ae1, 1); alarm_events(b, ae2, 1); sync_rt(b);
+    show_err("B DestroyAlarm (E's)", xcb_request_check(b, xcb_sync_destroy_alarm_checked(b, ae1)));
+    drain_alarms(e, "E"); drain_alarms(b, "B");
+    printf("  E disconnects (owns ae2 on A's counter, B selected)\n");
+    xcb_disconnect(e); usleep(100000); sync_rt(a);
+    drain_alarms(b, "B");
+
+    printf("== counter None\n");
+    xcb_sync_alarm_t an = xcb_generate_id(b);
+    { uint32_t v[] = { 0, 5 }; xcb_sync_create_alarm(b, an, XCB_SYNC_CA_VALUE, v); }
+    show_alarm(b, "CreateAlarm without counter", an);
+    drain_alarms(b, "B");
+    show_err("ChangeAlarm events=True (no counter)", xcb_request_check(b, ({ uint32_t v = 1; xcb_sync_change_alarm_checked(b, an, XCB_SYNC_CA_EVENTS, &v); })));
+    show_alarm(b, "after ChangeAlarm", an);
+    drain_alarms(b, "B");
+    xcb_sync_destroy_alarm(b, an);
+    drain_alarms(b, "B");
+    xcb_sync_destroy_counter(a, c); sync_rt(a);
+}
 
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -260,6 +427,8 @@ int main(void) {
     peek(b, "after await", &cookie, &have);
     xcb_disconnect(d); usleep(100000); sync_rt(a);
     peek(b, "after owner disconnect", &cookie, &have);
+
+    alarms(a, b);
 
     xcb_disconnect(b);
     xcb_disconnect(a);

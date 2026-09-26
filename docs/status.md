@@ -148,7 +148,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   skips positive transitions on a never-decreasing counter), which only
   ever hangs the client. Not done: xshmfence-backed fences triggered by the
   client itself are not observed by AwaitFence/QueryFence (Xorg queries
-  the shared memory); BadAlarm and the alarm event-client list.
+  the shared memory); the alarm event-client list. ChangeAlarm /
+  QueryAlarm / DestroyAlarm on a missing alarm answer BadAlarm in Xorg's
+  check order (size, lookup, then the value list against the mask).
 
 - **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
   now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,

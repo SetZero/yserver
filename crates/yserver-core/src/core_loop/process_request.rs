@@ -5285,6 +5285,29 @@ fn sync_known_fence(
     ))
 }
 
+/// Xorg's `RTAlarm` lookup: an alarm that does not exist (never created,
+/// None, or destroyed) is BadAlarm naming it.
+fn sync_known_alarm(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    alarm: u32,
+) -> Result<(), io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if state.sync_alarms.contains_key(&alarm) {
+        return Ok(());
+    }
+    Err(sync_error(
+        state,
+        client_id,
+        sequence,
+        header,
+        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_ALARM,
+        alarm,
+    ))
+}
+
 fn handle_sync_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -5536,6 +5559,32 @@ fn handle_sync_request(
             }
         }
         x11sync::CHANGE_ALARM => {
+            // Xorg `ProcSyncChangeAlarm`: minimum size, then the alarm
+            // lookup (BadAlarm), then the value list against the mask
+            // (BadLength naming the alarm, captured on Xvfb).
+            let Some((alarm, mask)) = x11sync::parse_alarm_with_mask(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
+                return outcome;
+            }
+            if body.len() != x11sync::alarm_request_len(mask) {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
+            }
             if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body)
                 && let Some(mut a) = state.sync_alarms.get(&alarm).cloned()
             {
@@ -5574,7 +5623,21 @@ fn handle_sync_request(
             }
         }
         x11sync::QUERY_ALARM => {
+            // Xorg `ProcSyncQueryAlarm`: exact size, then the lookup.
+            if body.len() != 4 {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            }
             let alarm_id = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm_id) {
+                return outcome;
+            }
             let alarm = state
                 .sync_alarms
                 .get(&alarm_id)
@@ -5596,9 +5659,22 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::DESTROY_ALARM => {
-            if let Some(alarm) = x11sync::parse_resource(body) {
-                state.sync_alarms.remove(&alarm);
+            // Xorg `ProcSyncDestroyAlarm`: exact size, then the lookup.
+            if body.len() != 4 {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
             }
+            let alarm = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
+                return outcome;
+            }
+            state.sync_alarms.remove(&alarm);
         }
         x11sync::CREATE_FENCE => {
             if let Some(req) = x11sync::parse_create_fence(body) {
@@ -60909,6 +60985,114 @@ mod tests {
         crate::core_loop::sync_await::fence_triggered(&mut f.state, F1);
         assert!(!f.suspended());
         assert!(f.state.sync_fences[&F1].triggered);
+    }
+
+    /// A ChangeAlarm body: alarm, value mask, value list.
+    fn sync_alarm_body(alarm: u32, mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = alarm.to_le_bytes().to_vec();
+        body.extend_from_slice(&mask.to_le_bytes());
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    /// Xvfb: ChangeAlarm / QueryAlarm / DestroyAlarm on an alarm that
+    /// does not exist (unknown, None, or destroyed) answer BadAlarm (SYNC
+    /// error base + 1) naming it. Xorg's order: QueryAlarm and DestroyAlarm
+    /// check the exact request size first (BadLength), ChangeAlarm checks
+    /// the minimum size, then looks the alarm up, and only then matches the
+    /// value list against the mask (BadLength naming the alarm).
+    #[test]
+    fn sync_alarm_requests_on_a_missing_alarm_answer_bad_alarm() {
+        use yserver_protocol::x11::sync as s;
+        const ALARM: u32 = 0x0010_0030;
+        const GONE: u32 = 0x0010_0031;
+        const UNKNOWN: u32 = 0x0bad_bad0;
+        let bad_alarm = crate::nested::SYNC_FIRST_ERROR + s::BAD_ALARM;
+        let bad_length = x11::error::BAD_LENGTH;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(ALARM, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(GONE, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        f.a(s::DESTROY_ALARM, &GONE.to_le_bytes());
+        let _ = f.b_packets();
+        let long = sync_alarm_body(UNKNOWN, s::CA_EVENTS, &[]);
+        let cases: Vec<(u8, Vec<u8>, u8, u32)> = vec![
+            (
+                s::QUERY_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (s::QUERY_ALARM, 0u32.to_le_bytes().to_vec(), bad_alarm, 0),
+            (s::QUERY_ALARM, GONE.to_le_bytes().to_vec(), bad_alarm, GONE),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(UNKNOWN, 0, &[]),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(GONE, 0, &[]),
+                bad_alarm,
+                GONE,
+            ),
+            (s::CHANGE_ALARM, long.clone(), bad_alarm, UNKNOWN),
+            (
+                s::DESTROY_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (
+                s::DESTROY_ALARM,
+                GONE.to_le_bytes().to_vec(),
+                bad_alarm,
+                GONE,
+            ),
+            (s::QUERY_ALARM, long.clone(), bad_length, 0),
+            (s::DESTROY_ALARM, long, bad_length, 0),
+            (
+                s::CHANGE_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_length,
+                0,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(ALARM, s::CA_EVENTS, &[]),
+                bad_length,
+                ALARM,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(ALARM, s::CA_VALUE, &[0]),
+                bad_length,
+                ALARM,
+            ),
+        ];
+        for (minor, body, code, value) in cases {
+            f.b(minor, &body);
+            let packets = f.b_packets();
+            assert!(
+                !packets.is_empty(),
+                "minor {minor} body {body:x?}: no error"
+            );
+            assert_eq!(
+                error_fields(&packets[0]),
+                (code, value, u16::from(minor), 142),
+                "minor {minor} body {body:x?}"
+            );
+        }
+        assert!(f.state.sync_alarms.contains_key(&ALARM));
     }
 
     /// SERVERTIME awaits wake when the clock reaches the value (Xvfb: an

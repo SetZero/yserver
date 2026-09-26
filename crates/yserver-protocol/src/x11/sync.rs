@@ -207,6 +207,17 @@ pub fn parse_alarm_with_mask(body: &[u8]) -> Option<(u32, u32)> {
     Some((read_u32_le(body), read_u32_le(&body[4..])))
 }
 
+/// Body length (after the 4-byte request header) of a `CreateAlarm` /
+/// `ChangeAlarm` whose value-mask is `mask`: id and mask, then one word
+/// per mask bit plus a second word for each INT64 (`VALUE`, `DELTA`) —
+/// Xorg's `Ones(vmask) + Ones(vmask & (XSyncCAValue | XSyncCADelta))`.
+/// Every mask bit counts, known or not, as in Xorg.
+#[must_use]
+pub fn alarm_request_len(mask: u32) -> usize {
+    let words = mask.count_ones() + (mask & (CA_VALUE | CA_DELTA)).count_ones();
+    8 + 4 * words as usize
+}
+
 /// Attributes carried by a `CreateAlarm`/`ChangeAlarm` value-list.
 /// Each field is `Some` only when its value-mask bit was set.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -626,6 +637,23 @@ mod tests {
         assert_eq!(attrs.value_type, None);
         assert_eq!(attrs.value, None);
         assert_eq!(attrs.events, Some(false));
+    }
+
+    /// Xorg's CreateAlarm / ChangeAlarm length rule: a word per mask bit,
+    /// two for VALUE and DELTA; muffin's full CreateAlarm is 8 + 32 bytes.
+    #[test]
+    fn alarm_request_len_counts_int64_values_twice() {
+        assert_eq!(alarm_request_len(0), 8);
+        assert_eq!(alarm_request_len(CA_EVENTS), 12);
+        assert_eq!(alarm_request_len(CA_VALUE), 16);
+        assert_eq!(muffin_create_alarm_body().len(), 40);
+        assert_eq!(
+            alarm_request_len(
+                CA_COUNTER | CA_VALUE_TYPE | CA_VALUE | CA_TEST_TYPE | CA_DELTA | CA_EVENTS
+            ),
+            40
+        );
+        assert_eq!(alarm_request_len(1 << 7), 12, "unknown bits count too");
     }
 
     #[test]
