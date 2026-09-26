@@ -762,11 +762,17 @@ unsafe impl Send for StagingBuffer {}
 unsafe impl Sync for StagingBuffer {}
 
 impl StagingBuffer {
-    fn new(vk: Arc<VkContext>, size: u64) -> Result<Self, vk::Result> {
+    /// Transfer staging, counted under churn `class`.
+    fn new(
+        vk: Arc<VkContext>,
+        size: u64,
+        class: crate::kms::vk::mem_accounting::ChurnClass,
+    ) -> Result<Self, vk::Result> {
         Self::new_with_usage(
             vk,
             size,
             vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            class,
         )
     }
 
@@ -776,12 +782,16 @@ impl StagingBuffer {
     ///
     /// Upload/general path: prefers plain `HOST_VISIBLE | HOST_COHERENT`
     /// (write-combined is fine — the CPU only *writes* here).
+    ///
+    /// `class` names the site for the `vram churn` counters (#177): these
+    /// buffers live one frame, so only allocation rates show them.
     fn new_with_usage(
         vk: Arc<VkContext>,
         size: u64,
         usage: vk::BufferUsageFlags,
+        class: crate::kms::vk::mem_accounting::ChurnClass,
     ) -> Result<Self, vk::Result> {
-        Self::new_internal(vk, size, usage, false)
+        Self::new_internal(vk, size, usage, false, class)
     }
 
     /// Readback-optimized staging: prefers a `HOST_CACHED` memory type so
@@ -798,6 +808,7 @@ impl StagingBuffer {
             size,
             vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
             true,
+            crate::kms::vk::mem_accounting::ChurnClass::Readback,
         )
     }
 
@@ -806,6 +817,7 @@ impl StagingBuffer {
         size: u64,
         usage: vk::BufferUsageFlags,
         readback: bool,
+        class: crate::kms::vk::mem_accounting::ChurnClass,
     ) -> Result<Self, vk::Result> {
         let buf_info = vk::BufferCreateInfo::default()
             .size(size)
@@ -826,10 +838,11 @@ impl StagingBuffer {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mt);
-        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory_as(
             &vk.device,
             &alloc_info,
             crate::kms::vk::mem_accounting::MemCategory::Staging,
+            class,
             &mem_props,
         ) {
             Ok(m) => m,
@@ -976,10 +989,20 @@ impl StagingPool {
         if let Some(buf) = self.buckets.get_mut(&size).and_then(Vec::pop) {
             self.pooled_bytes = self.pooled_bytes.saturating_sub(buf.size);
             self.hits += 1;
+            crate::kms::vk::mem_accounting::note_staging_pool(
+                crate::kms::vk::mem_accounting::PoolEvent::Hit,
+            );
             return Ok(buf);
         }
         self.misses += 1;
-        let mut buf = StagingBuffer::new(Arc::clone(vk), size)?;
+        crate::kms::vk::mem_accounting::note_staging_pool(
+            crate::kms::vk::mem_accounting::PoolEvent::Miss,
+        );
+        let mut buf = StagingBuffer::new(
+            Arc::clone(vk),
+            size,
+            crate::kms::vk::mem_accounting::ChurnClass::StagingPool,
+        )?;
         buf.from_pool = true;
         Ok(buf)
     }
@@ -992,10 +1015,16 @@ impl StagingPool {
             || self.pooled_bytes.saturating_add(buf.size) > STAGING_POOL_TOTAL_BYTES_CAP
         {
             self.rejected += 1;
+            crate::kms::vk::mem_accounting::note_staging_pool(
+                crate::kms::vk::mem_accounting::PoolEvent::Dropped,
+            );
             return; // buf drops → StagingBuffer::Drop destroys it
         }
         self.pooled_bytes = self.pooled_bytes.saturating_add(buf.size);
         self.returned += 1;
+        crate::kms::vk::mem_accounting::note_staging_pool(
+            crate::kms::vk::mem_accounting::PoolEvent::Kept,
+        );
         bucket.push(buf);
     }
 
@@ -6085,6 +6114,7 @@ impl RenderEngine {
                 let staging = Arc::new(StagingBuffer::new(
                     Arc::clone(&inner.vk),
                     upload_bytes.max(1),
+                    crate::kms::vk::mem_accounting::ChurnClass::GlyphUpload,
                 )?);
                 let src_slice = &g.pixels[..copy_len];
                 // SAFETY: staging is HOST_COHERENT, mapped for at least
@@ -6238,6 +6268,7 @@ impl RenderEngine {
                 Arc::clone(&inner.vk),
                 needed,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
+                crate::kms::vk::mem_accounting::ChurnClass::ImageText,
             )?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -6770,6 +6801,7 @@ impl RenderEngine {
                 let staging = Arc::new(StagingBuffer::new(
                     Arc::clone(&inner.vk),
                     upload_bytes.max(1),
+                    crate::kms::vk::mem_accounting::ChurnClass::GlyphUpload,
                 )?);
                 let src_slice: &[u8] = &atlas_bytes;
                 // SAFETY: staging is HOST_COHERENT, mapped for at
@@ -7185,6 +7217,7 @@ impl RenderEngine {
                 Arc::clone(&inner.vk),
                 needed,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
+                crate::kms::vk::mem_accounting::ChurnClass::GlyphRun,
             )?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -8264,6 +8297,7 @@ impl RenderEngine {
                 Arc::clone(&inner.vk),
                 needed,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
+                crate::kms::vk::mem_accounting::ChurnClass::Traps,
             )?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -17418,6 +17452,90 @@ mod tests {
     /// first glyph and the right-hand quad never appears, so the two
     /// destinations differ. The two "must be painted" assertions keep
     /// the comparison from passing on two blank images.
+    /// #177: a glyph run's instance buffer is allocated and freed within
+    /// one telemetry period, so the live ledger (`vram by use`) never sees
+    /// it. The churn counters must: `glyph_run` gains an allocation and a
+    /// free sized for the run, and the formatted line shows a non-zero
+    /// rate. Other tests run in parallel against the same process-wide
+    /// ledger, so this asserts lower bounds only.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_glyph_run_instance_buffer_shows_in_churn_rates() {
+        use crate::kms::vk::mem_accounting::{ChurnClass, churn_snapshot, format_churn_line};
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
+        let full = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: 32,
+                height: 32,
+            },
+        };
+        let pixels = [0xFFu8; 4];
+        let glyphs = run_split_glyph_inputs(&pixels);
+        let draw = |engine: &mut RenderEngine,
+                    store: &mut DrawableStore,
+                    platform: &mut PlatformBackend| {
+            engine
+                .composite_glyphs(
+                    store,
+                    platform,
+                    Dst::server_internal(target),
+                    3,
+                    0,
+                    [1.0, 1.0, 1.0, 1.0],
+                    &glyphs,
+                    None,
+                )
+                .expect("composite_glyphs");
+            // Closes the frame; `drain_all` then retires it, dropping the
+            // pinned instance buffer.
+            engine
+                .get_image(store, platform, Src::server_internal(target), full, 32)
+                .expect("get_image");
+            engine.drain_all(platform);
+        };
+        // Warm-up interns the glyphs so the measured run allocates only
+        // what every later run of the same text allocates.
+        draw(&mut engine, &mut store, &mut platform);
+
+        let before = churn_snapshot();
+        draw(&mut engine, &mut store, &mut platform);
+        let after = churn_snapshot();
+
+        let (b, a) = (
+            before.class(ChurnClass::GlyphRun),
+            after.class(ChurnClass::GlyphRun),
+        );
+        let instance = std::mem::size_of::<crate::kms::vk::text_pipeline::GlyphInstanceData>();
+        assert!(a.allocs > b.allocs, "glyph run allocation not counted");
+        assert!(a.frees > b.frees, "glyph run free not counted");
+        assert!(
+            a.alloc_bytes - b.alloc_bytes >= 2 * instance as u64,
+            "glyph run bytes: {} < 2 instances",
+            a.alloc_bytes - b.alloc_bytes
+        );
+        assert!(
+            after.class(ChurnClass::Readback).frees > before.class(ChurnClass::Readback).frees,
+            "get_image readback staging not counted"
+        );
+        let line = format_churn_line(&before, &after, 1.0, None);
+        let seg = line
+            .split(" glyph_run[")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .unwrap_or_else(|| panic!("no glyph_run segment: {line}"));
+        assert!(
+            !seg.starts_with("alloc=0/s") && !seg.contains(" free=0/s"),
+            "rate line misses the churn: {line}"
+        );
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
@@ -17721,6 +17839,7 @@ mod tests {
                 Arc::clone(&vk_ctx),
                 u64::try_from(bytes.len()).expect("len"),
                 vk::BufferUsageFlags::VERTEX_BUFFER,
+                crate::kms::vk::mem_accounting::ChurnClass::GlyphRun,
             )
             .expect("instance buffer");
             unsafe {

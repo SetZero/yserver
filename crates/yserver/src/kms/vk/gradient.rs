@@ -465,10 +465,11 @@ fn allocate_image(
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt)
         .push_next(&mut dedicated);
-    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory_as(
         &vk.device,
         &alloc_info,
         crate::kms::vk::mem_accounting::MemCategory::Other,
+        crate::kms::vk::mem_accounting::ChurnClass::Gradient,
         &mem_props,
     ) {
         Ok(m) => m,
@@ -548,10 +549,11 @@ fn upload_initial(
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt);
-    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory_as(
         &vk.device,
         &alloc,
         crate::kms::vk::mem_accounting::MemCategory::Staging,
+        crate::kms::vk::mem_accounting::ChurnClass::Gradient,
         &mem_props,
     ) {
         Ok(m) => m,

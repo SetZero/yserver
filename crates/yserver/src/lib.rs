@@ -324,7 +324,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         // out empty otherwise reads as a clean run.
         log::warn!(
             "resource telemetry active: 1 Hz on target `{RESOURCE_TELEMETRY_TARGET}` \
-             (vram / vram by use / gpu load / pixmap pool live). For a long run filter with \
+             (vram / vram by use / vram churn / gpu load / pixmap pool live). For a long run filter with \
              RUST_LOG=warn,{RESOURCE_TELEMETRY_TARGET}=info \
              — full `info` writes ~2 MB/s."
         );
@@ -341,6 +341,13 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // the 1 s sleep below is nominal, not exact.
             let mut prev_gpu: Option<(crate::drm::fdinfo::GpuLoadSample, std::time::Instant)> =
                 None;
+            // Previous churn counters, pixmap-pool counters and when they
+            // were read: `vram churn` reports rates over the real interval.
+            let mut prev_churn = (
+                crate::kms::vk::mem_accounting::churn_snapshot(),
+                crate::kms::vk::pixmap_pool::telemetry_snapshot().map(|s| s.pool_counters()),
+                std::time::Instant::now(),
+            );
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let s = crate::kms::vk::call_stats::VK_CALLS.snapshot_and_reset();
@@ -616,6 +623,28 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                         vram.map(|v| v.device_local_usage),
                     ),
                 );
+                // Allocate/free RATES per call-site class (#177). The
+                // live ledger above is sampled once a second, so an
+                // allocation that lives one frame never shows in it —
+                // yet a few hundred of those per second is what makes
+                // libdrm's VA free list hot on amdgpu. `live_allocs`
+                // is every VkDeviceMemory we hold, whatever its heap.
+                let churn_now = std::time::Instant::now();
+                let churn = crate::kms::vk::mem_accounting::churn_snapshot();
+                let pix =
+                    crate::kms::vk::pixmap_pool::telemetry_snapshot().map(|s| s.pool_counters());
+                let (prev_c, prev_pix, prev_at) = &prev_churn;
+                log::info!(
+                    target: RESOURCE_TELEMETRY_TARGET,
+                    "{}",
+                    crate::kms::vk::mem_accounting::format_churn_line(
+                        prev_c,
+                        &churn,
+                        churn_now.duration_since(*prev_at).as_secs_f64(),
+                        pix.map(|p| p.since(&prev_pix.unwrap_or_default())),
+                    ),
+                );
+                prev_churn = (churn, pix, churn_now);
             }
         });
     }

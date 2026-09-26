@@ -134,6 +134,21 @@ pub struct PixmapPoolStats {
     pub total_returns_rejected_oversize_by_bucket: [u64; 4],
 }
 
+impl PixmapPoolStats {
+    /// The counters `vram churn` reports: a hit or an accepted return is
+    /// a `vkAllocateMemory` / `vkFreeMemory` the pool saved; a rejected
+    /// return (bucket full, or larger than `MAX_POOLED_DIM`) is a free.
+    #[must_use]
+    pub fn pool_counters(&self) -> crate::kms::vk::mem_accounting::PoolCounters {
+        crate::kms::vk::mem_accounting::PoolCounters {
+            hits: self.total_takes_hit,
+            misses: self.total_takes_miss,
+            kept: self.total_returns_accepted,
+            dropped: self.total_returns_rejected_bucket_full + self.total_returns_rejected_oversize,
+        }
+    }
+}
+
 /// Upper bound of each oversize-reject bin, indexed in lockstep
 /// with `PixmapPoolStats::total_returns_rejected_oversize_by_bucket`.
 /// The last entry (`u32::MAX`) is the "everything else" catch-all.
@@ -452,6 +467,27 @@ mod tests {
     // unit-testable without a real Vulkan device. Pure-decision
     // logic (eligible, bucket-cap check, key hashing) is testable
     // standalone via these helpers.
+
+    #[test]
+    fn pool_counters_count_both_reject_paths_as_drops() {
+        let stats = PixmapPoolStats {
+            total_takes_hit: 7,
+            total_takes_miss: 3,
+            total_returns_accepted: 5,
+            total_returns_rejected_bucket_full: 2,
+            total_returns_rejected_oversize: 4,
+            total_returns_rejected_oversize_by_bucket: [0, 1, 1, 2],
+        };
+        assert_eq!(
+            stats.pool_counters(),
+            crate::kms::vk::mem_accounting::PoolCounters {
+                hits: 7,
+                misses: 3,
+                kept: 5,
+                dropped: 6,
+            }
+        );
+    }
 
     #[test]
     fn eligible_under_max_dim() {

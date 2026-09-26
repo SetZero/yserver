@@ -4662,10 +4662,15 @@ impl PlatformBackend {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mt);
-        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        // Pool-sized storage only reaches here on a pool miss; the split
+        // tells `vram churn` which side of `MAX_POOLED_DIM` allocates.
+        let pool_sized = extent.width <= crate::kms::vk::pixmap_pool::MAX_POOLED_DIM
+            && extent.height <= crate::kms::vk::pixmap_pool::MAX_POOLED_DIM;
+        let memory = match crate::kms::vk::mem_accounting::allocate_storage_memory(
             &vk.device,
             &alloc_info,
             category,
+            pool_sized,
             &mem_props,
         ) {
             Ok(m) => m,
