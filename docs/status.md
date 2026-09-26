@@ -124,6 +124,32 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   21.1.24 captures. Known gaps kept: XI1 Set/GetDeviceFocus(3) still use
   their own record rather than the core focus, and slave-keyboard focus
   changes emit XI1 DeviceFocus events but no XI2 FocusIn/Out.
+- **2026-09-26 SYNC Await / AwaitFence suspend the client (extension audit
+  §2):** an Await or AwaitFence now suspends the client the way Xorg's
+  `IgnoreClient` does: the fair request queue treats a client with an entry
+  in `ServerState::sync_awaits` as not runnable (the same predicate that
+  parks a client behind an asynchronous CRTC configuration), so its later
+  requests stay queued in order while every other client runs, and the poll
+  does not spin on it. `core_loop/sync_await.rs` ports
+  `SyncAwaitEpilogue` / `SyncAwaitTriggerFired`: a trigger that already
+  holds fires at once; firing sends the CounterNotify events (threshold
+  rule, contiguous with descending `count`, `destroyed` for a destroyed
+  counter or fence) and resumes the client. Triggers: Set/ChangeCounter,
+  DestroyCounter and a counter owner's disconnect (which also deactivate
+  alarms on the counter with an AlarmNotify), TriggerFence, Present idle
+  fences, DestroyFence / fence owner disconnect, and the SERVERTIME and
+  IDLETIME system counters (post-poll evaluation plus a poll deadline;
+  SERVERTIME alarms now fire too). Await/AwaitFence/counter/fence requests
+  raise Xorg's errors (BadCounter, BadFence, BadAccess on system counters,
+  BadValue, BadMatch for resetting an untriggered fence); Initialize always
+  answers 3.1. Ground truth: Xvfb 21.1.24 with a two-connection xcb probe.
+  Deliberate deviation: a PositiveTransition on SERVERTIME fires when the
+  clock crosses it; Xorg never wakes for it (`SyncComputeBracketValues`
+  skips positive transitions on a never-decreasing counter), which only
+  ever hangs the client. Not done: xshmfence-backed fences triggered by the
+  client itself are not observed by AwaitFence/QueryFence (Xorg queries
+  the shared memory); BadAlarm and the alarm event-client list.
+
 - **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
   now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,
   sticky per-client major) and gates requests on the negotiated major

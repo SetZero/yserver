@@ -1773,9 +1773,7 @@ pub(crate) fn purge_present_for_destroyed_windows(
                         "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} failed: {error}"
                     );
                 }
-                if let Some(fence) = state.sync_fences.get_mut(idle_fence_xid) {
-                    fence.triggered = true;
-                }
+                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
             }
             crate::backend::PresentWake::PixmapSynced {
                 release,
@@ -5210,6 +5208,83 @@ fn reply_set_crtc_config(
     Ok(write_to_client(client, client_id, &reply))
 }
 
+/// A SYNC protocol error: `code` is either a core error or
+/// `SYNC_FIRST_ERROR + x11sync::BAD_*`.
+fn sync_error(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    code: u8,
+    value: u32,
+) -> io::Result<RequestOutcome> {
+    emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        code,
+        value,
+        u16::from(header.data),
+        header.opcode,
+    )
+}
+
+/// Xorg's lookup of a client-writable counter for SetCounter /
+/// ChangeCounter / DestroyCounter: an unknown XID is BadCounter, a system
+/// counter BadAccess (both naming the counter; captured on Xvfb).
+fn sync_writable_counter(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    counter: u32,
+) -> Result<i64, io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if crate::core_loop::sync_await::is_system_counter(counter) {
+        return Err(sync_error(
+            state,
+            client_id,
+            sequence,
+            header,
+            x11::error::BAD_ACCESS,
+            counter,
+        ));
+    }
+    match state.sync_counters.get(&counter) {
+        Some(c) => Ok(c.value),
+        None => Err(sync_error(
+            state,
+            client_id,
+            sequence,
+            header,
+            crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+            counter,
+        )),
+    }
+}
+
+/// Xorg `RTFence` lookup: an unknown fence is BadFence naming it.
+fn sync_known_fence(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    fence: u32,
+) -> Result<(), io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if state.sync_fences.contains_key(&fence) {
+        return Ok(());
+    }
+    Err(sync_error(
+        state,
+        client_id,
+        sequence,
+        header,
+        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_FENCE,
+        fence,
+    ))
+}
+
 fn handle_sync_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -5226,19 +5301,17 @@ fn handle_sync_request(
     let minor = header.data;
     match minor {
         x11sync::INITIALIZE => {
-            let (client_major, client_minor) =
-                x11sync::parse_initialize(body).unwrap_or((x11sync::MAJOR_VERSION, 0));
-            let major = x11sync::MAJOR_VERSION.min(client_major);
-            let minor_ver = if major < x11sync::MAJOR_VERSION {
-                client_minor
-            } else {
-                x11sync::MINOR_VERSION
-            };
-            let reply = x11sync::encode_initialize_reply(byte_order, sequence, major, minor_ver);
+            // Xorg `ProcSyncInitialize` always answers its own version
+            // (Xvfb: client 3.1 / 3.0 / 2.0 / 4.0 all get 3.1).
+            let reply = x11sync::encode_initialize_reply(
+                byte_order,
+                sequence,
+                x11sync::MAJOR_VERSION,
+                x11sync::MINOR_VERSION,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::LIST_SYSTEM_COUNTERS => {
@@ -5262,46 +5335,55 @@ fn handle_sync_request(
         }
         x11sync::SET_COUNTER => {
             if let Some((counter, value)) = x11sync::parse_counter_value(body) {
-                let transition = state.sync_counters.get_mut(&counter).map(|c| {
-                    let old = c.value;
+                let old = match sync_writable_counter(state, client_id, sequence, header, counter) {
+                    Ok(old) => old,
+                    Err(outcome) => return outcome,
+                };
+                if let Some(c) = state.sync_counters.get_mut(&counter) {
                     c.value = value;
-                    (old, value)
-                });
-                if let Some((old, new)) = transition {
-                    evaluate_alarms_for_counter(state, counter, old, new);
                 }
+                crate::core_loop::sync_await::counter_changed(state, counter, old, value);
             }
         }
         x11sync::CHANGE_COUNTER => {
             if let Some((counter, delta)) = x11sync::parse_counter_value(body) {
-                let transition = state.sync_counters.get_mut(&counter).map(|c| {
-                    let old = c.value;
-                    c.value = old.saturating_add(delta);
-                    (old, c.value)
-                });
-                if let Some((old, new)) = transition {
-                    evaluate_alarms_for_counter(state, counter, old, new);
+                let old = match sync_writable_counter(state, client_id, sequence, header, counter) {
+                    Ok(old) => old,
+                    Err(outcome) => return outcome,
+                };
+                // Xorg: an INT64 overflow is BadValue naming the high half
+                // of the delta (Xvfb: value 0x7fffffff for i64::MAX).
+                let Some(new) = old.checked_add(delta) else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let value_hi = (delta >> 32) as u32;
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        value_hi,
+                    );
+                };
+                if let Some(c) = state.sync_counters.get_mut(&counter) {
+                    c.value = new;
                 }
+                crate::core_loop::sync_await::counter_changed(state, counter, old, new);
             }
         }
         x11sync::QUERY_COUNTER => {
             let counter = x11sync::parse_resource(body).unwrap_or(0);
-            let value = match counter {
-                x11sync::SERVERTIME_COUNTER => i64::from(state.timestamp_now()),
-                x11sync::IDLETIME_COUNTER
-                | x11sync::IDLETIME_DEVICE_VCP
-                | x11sync::IDLETIME_DEVICE_VCK => {
-                    // X11 timestamps are 32-bit ms; saturate at u32::MAX
-                    // (~49 days idle) per X11 spec. After saturation the
-                    // value fits in i64 without sign-loss or truncation.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let elapsed_ms = std::time::Instant::now()
-                        .duration_since(state.idletime_baseline(counter))
-                        .as_millis()
-                        .min(u128::from(u32::MAX)) as i64;
-                    elapsed_ms
-                }
-                _ => state.sync_counters.get(&counter).map_or(0, |c| c.value),
+            // IDLETIME saturates at u32::MAX ms (~49 days) inside
+            // `idletime_current_idle`. An unknown counter is BadCounter.
+            let Some(value) = crate::core_loop::sync_await::counter_value(state, counter) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                    counter,
+                );
             };
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -5312,11 +5394,105 @@ fn handle_sync_request(
         }
         x11sync::DESTROY_COUNTER => {
             if let Some(counter) = x11sync::parse_resource(body) {
+                let last = match sync_writable_counter(state, client_id, sequence, header, counter)
+                {
+                    Ok(last) => last,
+                    Err(outcome) => return outcome,
+                };
                 state.sync_counters.remove(&counter);
+                crate::core_loop::sync_await::counter_destroyed(state, counter, last);
             }
         }
         x11sync::AWAIT => {
-            // Non-blocking stub.
+            // Xorg `ProcSyncAwait`: validate every wait condition, then
+            // suspend the client until one of the triggers fires. Its later
+            // requests stay queued behind this one (see `sync_await`).
+            let Some(conditions) = x11sync::parse_await(byte_order, body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if conditions.is_empty() {
+                return sync_error(state, client_id, sequence, header, x11::error::BAD_VALUE, 0);
+            }
+            let mut waits = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                // `SyncInitTrigger` order: counter, value type, value, test
+                // type. Captured on Xvfb: None / unknown → BadCounter,
+                // bad value type / test type → BadValue naming it, relative
+                // overflow → BadValue naming the high half of the wait.
+                let current = if c.counter == 0 {
+                    None
+                } else {
+                    crate::core_loop::sync_await::counter_value(state, c.counter)
+                };
+                let Some(current) = current else {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                        c.counter,
+                    );
+                };
+                let test_value = match c.value_type {
+                    x11sync::VALUE_TYPE_ABSOLUTE => c.wait_value,
+                    x11sync::VALUE_TYPE_RELATIVE => {
+                        let Some(v) = current.checked_add(c.wait_value) else {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let value_hi = (c.wait_value >> 32) as u32;
+                            return sync_error(
+                                state,
+                                client_id,
+                                sequence,
+                                header,
+                                x11::error::BAD_VALUE,
+                                value_hi,
+                            );
+                        };
+                        v
+                    }
+                    other => {
+                        return sync_error(
+                            state,
+                            client_id,
+                            sequence,
+                            header,
+                            x11::error::BAD_VALUE,
+                            other,
+                        );
+                    }
+                };
+                if c.test_type > x11sync::TEST_NEGATIVE_COMPARISON {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        c.test_type,
+                    );
+                }
+                waits.push(crate::server::SyncAwaitCondition::Counter {
+                    counter: c.counter,
+                    test_type: c.test_type,
+                    test_value,
+                    event_threshold: c.event_threshold,
+                });
+            }
+            debug!(
+                "client {} #{} SYNC::Await {} condition(s)",
+                client_id.0,
+                sequence.0,
+                waits.len()
+            );
+            crate::core_loop::sync_await::begin_await(state, client_id, waits);
         }
         x11sync::CREATE_ALARM => {
             if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body) {
@@ -5350,16 +5526,12 @@ fn handle_sync_request(
                 // already holds fires immediately. For IDLETIME-family
                 // counters the value is derived from last_activity rather
                 // than `sync_counters`.
-                let now_value = if matches!(
-                    counter,
-                    x11sync::IDLETIME_COUNTER
-                        | x11sync::IDLETIME_DEVICE_VCP
-                        | x11sync::IDLETIME_DEVICE_VCK
-                ) {
-                    idletime_current_idle(state, counter)
-                } else {
-                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
-                };
+                // System counters (SERVERTIME, IDLETIME) read the clock.
+                let now_value =
+                    crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
+                if counter == x11sync::SERVERTIME_COUNTER {
+                    state.sync_servertime_last = Some(now_value);
+                }
                 evaluate_alarms_for_counter(state, counter, now_value, now_value);
             }
         }
@@ -5392,16 +5564,12 @@ fn handle_sync_request(
                 // already holds fires immediately. For IDLETIME-family
                 // counters the value is derived from last_activity rather
                 // than `sync_counters`.
-                let now_value = if matches!(
-                    counter,
-                    x11sync::IDLETIME_COUNTER
-                        | x11sync::IDLETIME_DEVICE_VCP
-                        | x11sync::IDLETIME_DEVICE_VCK
-                ) {
-                    idletime_current_idle(state, counter)
-                } else {
-                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
-                };
+                // System counters (SERVERTIME, IDLETIME) read the clock.
+                let now_value =
+                    crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
+                if counter == x11sync::SERVERTIME_COUNTER {
+                    state.sync_servertime_last = Some(now_value);
+                }
                 evaluate_alarms_for_counter(state, counter, now_value, now_value);
             }
         }
@@ -5449,6 +5617,10 @@ fn handle_sync_request(
         }
         x11sync::DESTROY_FENCE => {
             if let Some(fence) = x11sync::parse_resource(body) {
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
+                }
+                crate::core_loop::sync_await::fence_destroyed(state, fence);
                 state.sync_fences.remove(&fence);
                 debug!(
                     "client {} #{} SYNC::DestroyFence fence=0x{:x}",
@@ -5458,15 +5630,15 @@ fn handle_sync_request(
         }
         x11sync::TRIGGER_FENCE => {
             if let Some(fence) = x11sync::parse_resource(body) {
-                if let Some(f) = state.sync_fences.get_mut(&fence) {
-                    f.triggered = true;
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
                 }
                 // For DRI3-imported xshmfence-backed fences, the
-                // memory-only `f.triggered=true` above is invisible to
-                // Mesa's local `xshmfence_await`. Forward the trigger
-                // to the backend so it writes the shared 4-byte
-                // counter + futex-wakes any local waiter — Mesa's
-                // `loader_dri3_copy_drawable` blocks on exactly that.
+                // server-side triggered bit is invisible to Mesa's local
+                // `xshmfence_await`. Forward the trigger to the backend so
+                // it writes the shared 4-byte counter + futex-wakes any
+                // local waiter — Mesa's `loader_dri3_copy_drawable` blocks
+                // on exactly that.
                 if let Err(e) = backend.dri3_trigger_fence(fence) {
                     log::warn!("SYNC::TriggerFence 0x{fence:x}: backend trigger failed: {e}");
                 }
@@ -5474,37 +5646,37 @@ fn handle_sync_request(
                     "client {} #{} SYNC::TriggerFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
                 );
-                // Wake any pending Await whose list contains this
-                // fence. We don't actually unblock the client's
-                // request stream (see SyncPendingAwait doc-comment)
-                // but we do log the satisfaction so test harnesses
-                // can assert sequencing.
-                let mut satisfied: Vec<crate::server::SyncPendingAwait> = Vec::new();
-                state.sync_pending_awaits.retain(|a| {
-                    if a.fences.contains(&fence) {
-                        satisfied.push(a.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                for a in &satisfied {
-                    debug!(
-                        "SYNC::AwaitSatisfied client={} seq={} on fence=0x{:x}",
-                        a.client.0, a.sequence.0, fence
-                    );
-                }
+                // Xorg `miSyncTriggerFence`: wakes every AwaitFence on it.
+                crate::core_loop::sync_await::fence_triggered(state, fence);
             }
         }
         x11sync::RESET_FENCE => {
-            if let Some(fence) = x11sync::parse_resource(body)
-                && let Some(f) = state.sync_fences.get_mut(&fence)
-            {
-                f.triggered = false;
+            if let Some(fence) = x11sync::parse_resource(body) {
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
+                }
+                // Xorg `ProcSyncResetFence`: only a triggered fence can be
+                // reset (Xvfb: BadMatch naming the fence).
+                if state.sync_fences.get(&fence).is_some_and(|f| !f.triggered) {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_MATCH,
+                        fence,
+                    );
+                }
+                if let Some(f) = state.sync_fences.get_mut(&fence) {
+                    f.triggered = false;
+                }
             }
         }
         x11sync::QUERY_FENCE => {
             let fence = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                return outcome;
+            }
             let triggered = state.sync_fences.get(&fence).is_some_and(|f| f.triggered);
             let reply = x11sync::encode_query_fence_reply(byte_order, sequence, triggered);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -5513,47 +5685,45 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::AWAIT_FENCE => {
-            // Spec: server must defer further processing of this
-            // client's requests until *any* fence in the list is
-            // triggered. We don't actually suspend the request
-            // stream (real blocking needs core-loop integration —
-            // see SyncPendingAwait doc-comment), but we *do*
-            //
-            // 1. Short-circuit when at least one fence is already
-            //    triggered: the await is trivially satisfied, log
-            //    it and move on. No state change.
-            // 2. Otherwise record the await on `sync_pending_awaits`
-            //    so a later TriggerFence on any of these fences
-            //    fires an `AwaitSatisfied` log line — useful for
-            //    tests that need to assert sequencing.
-            if let Some(fences) = x11sync::parse_await_fence(body) {
-                let any_triggered = fences
-                    .iter()
-                    .any(|f| state.sync_fences.get(f).is_some_and(|s| s.triggered));
-                if any_triggered {
-                    debug!(
-                        "client {} #{} SYNC::AwaitFence n={} -> already triggered",
-                        client_id.0,
-                        sequence.0,
-                        fences.len()
-                    );
-                } else {
-                    state
-                        .sync_pending_awaits
-                        .push(crate::server::SyncPendingAwait {
-                            client: client_id,
-                            sequence,
-                            fences: fences.clone(),
-                        });
-                    debug!(
-                        "client {} #{} SYNC::AwaitFence n={} -> pending (request stream NOT \
-                         suspended — known gap)",
-                        client_id.0,
-                        sequence.0,
-                        fences.len()
+            // Xorg `ProcSyncAwaitFence`: suspend the client until any of
+            // the fences triggers (or is destroyed). Captured on Xvfb:
+            // empty list → BadValue, None / unknown fence → BadFence.
+            let Some(fences) = x11sync::parse_await_fence(byte_order, body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if fences.is_empty() {
+                return sync_error(state, client_id, sequence, header, x11::error::BAD_VALUE, 0);
+            }
+            for &fence in &fences {
+                if !state.sync_fences.contains_key(&fence) {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_FENCE,
+                        fence,
                     );
                 }
             }
+            debug!(
+                "client {} #{} SYNC::AwaitFence n={}",
+                client_id.0,
+                sequence.0,
+                fences.len()
+            );
+            let waits = fences
+                .into_iter()
+                .map(|fence| crate::server::SyncAwaitCondition::Fence { fence })
+                .collect();
+            crate::core_loop::sync_await::begin_await(state, client_id, waits);
         }
         x11sync::SET_PRIORITY => {
             // Stub.
@@ -5610,19 +5780,8 @@ fn apply_alarm_attributes(
         let value = attrs.value.unwrap_or(0);
         let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
         alarm.wait_value = if relative {
-            let current = if matches!(
-                alarm.counter,
-                x11sync::IDLETIME_COUNTER
-                    | x11sync::IDLETIME_DEVICE_VCP
-                    | x11sync::IDLETIME_DEVICE_VCK
-            ) {
-                idletime_current_idle(state, alarm.counter)
-            } else {
-                state
-                    .sync_counters
-                    .get(&alarm.counter)
-                    .map_or(0, |c| c.value)
-            };
+            let current =
+                crate::core_loop::sync_await::counter_value(state, alarm.counter).unwrap_or(0);
             current.saturating_add(value)
         } else {
             value
@@ -9720,7 +9879,12 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
         return;
     }
     // Global IDLETIME: always reset on any input.
-    evaluate_alarms_for_counter(state, x11sync::IDLETIME_COUNTER, prior_global_idle_ms, 0);
+    crate::core_loop::sync_await::counter_changed(
+        state,
+        x11sync::IDLETIME_COUNTER,
+        prior_global_idle_ms,
+        0,
+    );
     state
         .idletime_last_evaluated
         .insert(x11sync::IDLETIME_COUNTER, 0);
@@ -9731,7 +9895,7 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
         3 => x11sync::IDLETIME_DEVICE_VCK,
         _ => return,
     };
-    evaluate_alarms_for_counter(state, device_counter, prior_device_idle_ms, 0);
+    crate::core_loop::sync_await::counter_changed(state, device_counter, prior_device_idle_ms, 0);
     state.idletime_last_evaluated.insert(device_counter, 0);
 }
 
@@ -10468,9 +10632,7 @@ fn supersede_covered_pending_presents(
                         "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
                     );
                 }
-                if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
-                    f.triggered = true;
-                }
+                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
             }
             crate::backend::PresentWake::PixmapSynced {
                 release,
@@ -11298,9 +11460,7 @@ fn execute_present_pixmap_copy_or_reroute(
                              failed: {e}"
                         );
                     }
-                    if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
-                        f.triggered = true;
-                    }
+                    crate::core_loop::sync_await::fence_triggered(state, idle_fence_xid);
                 }
                 crate::backend::PresentWake::PixmapSynced {
                     release,
@@ -12883,9 +13043,8 @@ pub(crate) fn discard_stale_present_event(
     backend.signal_present_wake(event.present_id);
     if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        fence.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
 }
 
@@ -12939,9 +13098,8 @@ pub(crate) fn complete_present_with_clock(
     if emit_idle
         && let PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(f) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        f.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
     fire_present_completion_events_at(state, event, clock, mode, emit_idle, true);
 }
@@ -12959,9 +13117,8 @@ pub(crate) fn retire_present_idle(
     backend.signal_present_wake(event.present_id);
     if let PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        fence.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
     let clock = refresh_present_crtc_completion_clock(
         state,
@@ -60151,6 +60308,746 @@ mod tests {
                 )
             );
         }
+    }
+
+    // ── SYNC Await / AwaitFence ─────────────────────────────────────
+    // Ground truth for every expectation below: Xorg 21.1.24 Xvfb driven
+    // by a two-connection xcb probe (client A changes counters and fences,
+    // client B awaits and then sends GetInputFocus; "suspended" means B's
+    // reply had not arrived after A's round trip).
+
+    fn sync_req(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 142,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("sync request");
+    }
+
+    fn sync_i64(v: i64) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        #[allow(clippy::cast_possible_truncation)]
+        out[..4].copy_from_slice(&((v >> 32) as i32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        out[4..].copy_from_slice(&(v as u32).to_le_bytes());
+        out
+    }
+
+    fn sync_counter_body(counter: u32, value: i64) -> Vec<u8> {
+        let mut body = counter.to_le_bytes().to_vec();
+        body.extend_from_slice(&sync_i64(value));
+        body
+    }
+
+    /// One `WAITCONDITION`: counter, value type, wait value, test type,
+    /// event threshold.
+    fn sync_wait(
+        counter: u32,
+        value_type: u32,
+        wait: i64,
+        test_type: u32,
+        threshold: i64,
+    ) -> Vec<u8> {
+        let mut body = counter.to_le_bytes().to_vec();
+        body.extend_from_slice(&value_type.to_le_bytes());
+        body.extend_from_slice(&sync_i64(wait));
+        body.extend_from_slice(&test_type.to_le_bytes());
+        body.extend_from_slice(&sync_i64(threshold));
+        body
+    }
+
+    /// CounterNotify → (counter, wait value, counter value, count, destroyed).
+    fn counter_notify_fields(p: &[u8; 32]) -> (u32, i64, i64, u16, bool) {
+        assert_eq!(p[0], crate::nested::SYNC_FIRST_EVENT, "CounterNotify type");
+        assert_eq!(p[1], 0, "kind CounterNotify");
+        let i64_at = |at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(p, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(p, at + 4))
+        };
+        (
+            le_u32(p, 4),
+            i64_at(8),
+            i64_at(16),
+            u16::from_le_bytes([p[28], p[29]]),
+            p[30] != 0,
+        )
+    }
+
+    struct SyncFixture {
+        state: ServerState,
+        backend: RecordingBackend,
+        _peer_a: UnixStream,
+        peer_b: UnixStream,
+    }
+
+    const SYNC_A: u32 = 1;
+    const SYNC_B: u32 = 2;
+    const SYNC_C1: u32 = 0x0010_0001;
+    const SYNC_C2: u32 = 0x0010_0002;
+
+    fn sync_fixture() -> SyncFixture {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, SYNC_A);
+        let peer_b = install_client(&mut state, SYNC_B);
+        SyncFixture {
+            state,
+            backend: RecordingBackend::new(),
+            _peer_a: peer_a,
+            peer_b,
+        }
+    }
+
+    impl SyncFixture {
+        fn a(&mut self, minor: u8, body: &[u8]) {
+            sync_req(&mut self.state, &mut self.backend, SYNC_A, minor, body);
+        }
+        fn b(&mut self, minor: u8, body: &[u8]) {
+            sync_req(&mut self.state, &mut self.backend, SYNC_B, minor, body);
+        }
+        fn suspended(&self) -> bool {
+            crate::core_loop::sync_await::client_is_suspended(&self.state, ClientId(SYNC_B))
+        }
+        fn b_packets(&mut self) -> Vec<[u8; 32]> {
+            wire_packets(&mut self.peer_b)
+        }
+    }
+
+    /// Xvfb: B awaits c1 >= 5 (PositiveComparison); A sets 3 → B stays
+    /// suspended; A sets 7 → B resumes with CounterNotify(c1, wait 5,
+    /// value 7, count 0, not destroyed).
+    #[test]
+    fn sync_await_suspends_until_the_counter_condition_holds() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        assert!(f.b_packets().is_empty());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 3));
+        assert!(f.suspended(), "3 < 5");
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 7));
+        assert!(!f.suspended());
+        let events = f.b_packets();
+        assert_eq!(events.len(), 1);
+        assert_eq!(counter_notify_fields(&events[0]), (SYNC_C1, 5, 7, 0, false));
+
+        // Already satisfied at request time: no suspension, the event
+        // still goes out (Xvfb: reply arrives with CounterNotify wait 5
+        // value 7).
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 5, 7, 0, false)
+        );
+    }
+
+    /// Transitions need a crossing and events respect the threshold, per
+    /// Xvfb: PositiveTransition 10 thr 2 from 7 → set 9 (no), set 12 →
+    /// event value 12; from 12, PositiveTransition 10 → set 1 does not
+    /// fire (no upward crossing); from 1, PositiveTransition 10 → 5 (no),
+    /// 11 → event; PositiveTransition 0 thr 5 from -5 → set 1 resumes the
+    /// client without an event (diff 1 < 5).
+    #[test]
+    fn sync_await_transitions_and_event_threshold() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 7));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                2,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 9));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 12));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 10, 12, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                100,
+            ),
+        );
+        assert!(f.suspended(), "12 >= 10 but no transition yet");
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(f.suspended());
+        f.state.sync_awaits.remove(&SYNC_B);
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                0,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 5));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 11));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 10, 11, 0, false)
+        );
+
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                0,
+                s::TEST_POSITIVE_TRANSITION,
+                5,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(!f.suspended());
+        assert!(f.b_packets().is_empty(), "diff below threshold: no event");
+    }
+
+    /// Xvfb: c1=11, c2=100; B awaits [c1 >= 1000 thr -2000, c2 <= 45 thr
+    /// 0]; A sets c2 50 (suspended) then 40 → both conditions report, in
+    /// order, count 1 then 0. Relative waits add to the counter (c1=11,
+    /// +3 → wait 14); NegativeTransition -3 fires on the way down.
+    #[test]
+    fn sync_await_multi_condition_relative_and_negative() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 11));
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 100));
+        let mut body = sync_wait(
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            -2000,
+        );
+        body.extend(sync_wait(
+            SYNC_C2,
+            s::VALUE_TYPE_ABSOLUTE,
+            45,
+            s::TEST_NEGATIVE_COMPARISON,
+            0,
+        ));
+        f.b(s::AWAIT, &body);
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C2, 50));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C2, 40));
+        assert!(!f.suspended());
+        let events = f.b_packets();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            counter_notify_fields(&events[0]),
+            (SYNC_C1, 1000, 11, 1, false)
+        );
+        assert_eq!(
+            counter_notify_fields(&events[1]),
+            (SYNC_C2, 45, 40, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_RELATIVE,
+                3,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        f.a(s::CHANGE_COUNTER, &sync_counter_body(SYNC_C1, 2));
+        assert!(f.suspended());
+        f.a(s::CHANGE_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 14, 14, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                -3,
+                s::TEST_NEGATIVE_TRANSITION,
+                0,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, -3, -5, 0, false)
+        );
+    }
+
+    /// Xvfb: destroying an awaited counter resumes the client with a
+    /// destroyed event carrying its last value, plus threshold events for
+    /// the other conditions; an alarm on it goes Inactive with an
+    /// AlarmNotify. A counter owner disconnecting does the same (value 0).
+    #[test]
+    fn sync_await_fires_destroyed_when_the_counter_goes_away() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 40));
+        let mut body = sync_wait(
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            0,
+        );
+        body.extend(sync_wait(
+            SYNC_C2,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            -2000,
+        ));
+        f.b(s::AWAIT, &body);
+        f.state.sync_alarms.insert(
+            0x0020_0009,
+            crate::server::SyncAlarm {
+                owner: ClientId(SYNC_B),
+                counter: SYNC_C1,
+                wait_value: 1000,
+                delta: 1,
+                test_type: u8::try_from(s::TEST_POSITIVE_COMPARISON).unwrap(),
+                events: true,
+                state: s::ALARM_STATE_ACTIVE,
+            },
+        );
+        f.a(s::DESTROY_COUNTER, &SYNC_C1.to_le_bytes());
+        assert!(!f.suspended());
+        let packets = f.b_packets();
+        let notifies: Vec<_> = packets
+            .iter()
+            .filter(|p| p[0] == crate::nested::SYNC_FIRST_EVENT)
+            .map(counter_notify_fields)
+            .collect();
+        assert_eq!(
+            notifies,
+            vec![(SYNC_C1, 1000, -5, 1, true), (SYNC_C2, 1000, 40, 0, false)]
+        );
+        let alarm = packets
+            .iter()
+            .find(|p| p[0] == crate::nested::SYNC_FIRST_EVENT + 1)
+            .expect("AlarmNotify for the alarm on the destroyed counter");
+        assert_eq!(alarm[28], s::ALARM_STATE_INACTIVE);
+        assert_eq!(
+            f.state.sync_alarms[&0x0020_0009].state,
+            s::ALARM_STATE_INACTIVE
+        );
+        assert_eq!(f.state.sync_alarms[&0x0020_0009].counter, 0);
+
+        // Owner disconnect: Xvfb sends destroyed, wait 10, value 0.
+        const C3: u32 = 0x0030_0001;
+        let _peer_c = install_client(&mut f.state, 3);
+        sync_req(
+            &mut f.state,
+            &mut f.backend,
+            3,
+            s::CREATE_COUNTER,
+            &sync_counter_body(C3, 0),
+        );
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                C3,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(3),
+        );
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (C3, 10, 0, 0, true)
+        );
+    }
+
+    /// Xvfb: Initialize with client 3.1 / 3.0 / 2.0 / 4.0 always replies 3.1.
+    #[test]
+    fn sync_initialize_always_answers_the_server_version() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        for (major, minor) in [(3u8, 1u8), (3, 0), (2, 0), (4, 0)] {
+            f.b(s::INITIALIZE, &[major, minor, 0, 0]);
+            let reply = f.b_packets();
+            assert_eq!(reply[0][0], 1);
+            assert_eq!((reply[0][8], reply[0][9]), (3, 1), "client {major}.{minor}");
+        }
+    }
+
+    /// Xvfb error table for Await and the counter requests.
+    #[test]
+    fn sync_await_and_counter_errors_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 100));
+        let cases: [(Vec<u8>, u8, u32); 6] = [
+            (Vec::new(), x11::error::BAD_VALUE, 0),
+            (sync_wait(0, 0, 1, 2, 0), bad_counter, 0),
+            (sync_wait(0x0bad_bad0, 0, 1, 2, 0), bad_counter, 0x0bad_bad0),
+            (sync_wait(SYNC_C2, 7, 1, 2, 0), x11::error::BAD_VALUE, 7),
+            (sync_wait(SYNC_C2, 0, 1, 9, 0), x11::error::BAD_VALUE, 9),
+            (
+                sync_wait(SYNC_C2, 1, i64::MAX, 2, 0),
+                x11::error::BAD_VALUE,
+                0x7fff_ffff,
+            ),
+        ];
+        for (body, code, value) in cases {
+            f.b(s::AWAIT, &body);
+            assert!(!f.suspended(), "an erroring Await never suspends");
+            assert_eq!(
+                error_fields(&f.b_packets()[0]),
+                (code, value, u16::from(s::AWAIT), 142)
+            );
+        }
+        let mut peer_a = std::mem::replace(&mut f._peer_a, UnixStream::pair().unwrap().0);
+        let st = s::SERVERTIME_COUNTER;
+        let a_cases: [(u8, Vec<u8>, u8, u32); 5] = [
+            (
+                s::SET_COUNTER,
+                sync_counter_body(st, 1),
+                x11::error::BAD_ACCESS,
+                st,
+            ),
+            (
+                s::SET_COUNTER,
+                sync_counter_body(0x0bad_bad0, 1),
+                bad_counter,
+                0x0bad_bad0,
+            ),
+            (
+                s::CHANGE_COUNTER,
+                sync_counter_body(SYNC_C2, i64::MAX),
+                x11::error::BAD_VALUE,
+                0x7fff_ffff,
+            ),
+            (
+                s::DESTROY_COUNTER,
+                st.to_le_bytes().to_vec(),
+                x11::error::BAD_ACCESS,
+                st,
+            ),
+            (
+                s::DESTROY_COUNTER,
+                0x0bad_bad0u32.to_le_bytes().to_vec(),
+                bad_counter,
+                0x0bad_bad0,
+            ),
+        ];
+        for (minor, body, code, value) in a_cases {
+            f.a(minor, &body);
+            assert_eq!(
+                error_fields(&wire_packets(&mut peer_a)[0]),
+                (code, value, u16::from(minor), 142)
+            );
+        }
+        assert_eq!(
+            f.state.sync_counters[&SYNC_C2].value, 100,
+            "overflow left it alone"
+        );
+    }
+
+    /// Xvfb: AwaitFence on an untriggered fence suspends until TriggerFence
+    /// (no events); on a triggered fence it returns at once; destroying the
+    /// fence resumes with CounterNotify(counter = fence, 0, 0, destroyed).
+    /// Errors: empty → BadValue, None / unknown → BadFence; ResetFence of an
+    /// untriggered fence → BadMatch naming it.
+    #[test]
+    fn sync_await_fence_suspends_until_triggered() {
+        use yserver_protocol::x11::sync as s;
+        const F1: u32 = 0x0010_0010;
+        const F2: u32 = 0x0010_0011;
+        let mut f = sync_fixture();
+        let fence_body = |fence: u32, triggered: bool| {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&fence.to_le_bytes());
+            body.extend_from_slice(&[u8::from(triggered), 0, 0, 0]);
+            body
+        };
+        f.a(s::CREATE_FENCE, &fence_body(F1, false));
+        f.a(s::CREATE_FENCE, &fence_body(F2, true));
+
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        f.a(s::TRIGGER_FENCE, &F1.to_le_bytes());
+        assert!(!f.suspended());
+        assert!(
+            f.b_packets().is_empty(),
+            "fences send no events when triggered"
+        );
+
+        f.b(s::AWAIT_FENCE, &F2.to_le_bytes());
+        assert!(!f.suspended(), "already triggered");
+
+        f.a(s::RESET_FENCE, &F1.to_le_bytes());
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        f.a(s::DESTROY_FENCE, &F1.to_le_bytes());
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (F1, 0, 0, 0, true)
+        );
+
+        let bad_fence = crate::nested::SYNC_FIRST_ERROR + s::BAD_FENCE;
+        for (body, code, value) in [
+            (Vec::new(), x11::error::BAD_VALUE, 0),
+            (0u32.to_le_bytes().to_vec(), bad_fence, 0),
+            (
+                0x0bad_bad0u32.to_le_bytes().to_vec(),
+                bad_fence,
+                0x0bad_bad0,
+            ),
+        ] {
+            f.b(s::AWAIT_FENCE, &body);
+            assert!(!f.suspended());
+            assert_eq!(
+                error_fields(&f.b_packets()[0]),
+                (code, value, u16::from(s::AWAIT_FENCE), 142)
+            );
+        }
+        f.b(s::RESET_FENCE, &F2.to_le_bytes());
+        f.b(s::RESET_FENCE, &F2.to_le_bytes());
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_MATCH, F2, u16::from(s::RESET_FENCE), 142)
+        );
+    }
+
+    /// A Present idle fence triggered by the server (Xorg
+    /// `present_fence_set_triggered` → `miSyncTriggerFence`) wakes an
+    /// AwaitFence on it.
+    #[test]
+    fn sync_await_fence_wakes_on_server_side_trigger() {
+        use yserver_protocol::x11::sync as s;
+        const F1: u32 = 0x0010_0020;
+        let mut f = sync_fixture();
+        f.state.sync_fences.insert(
+            F1,
+            crate::server::SyncFence {
+                owner: ClientId(SYNC_A),
+                triggered: false,
+            },
+        );
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        crate::core_loop::sync_await::fence_triggered(&mut f.state, F1);
+        assert!(!f.suspended());
+        assert!(f.state.sync_fences[&F1].triggered);
+    }
+
+    /// SERVERTIME awaits wake when the clock reaches the value (Xvfb: an
+    /// absolute now+300 PositiveComparison blocked ~300 ms and reported
+    /// wait == value), and the loop gets a deadline for it.
+    #[test]
+    fn sync_await_on_servertime_fires_when_the_clock_gets_there() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        let now = i64::from(f.state.timestamp_now());
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::SERVERTIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                now + 300,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        let deadline = crate::core_loop::sync_await::system_counter_deadline(&f.state)
+            .expect("a SERVERTIME deadline");
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > std::time::Duration::from_millis(200)
+                && wait <= std::time::Duration::from_millis(300),
+            "deadline ~300 ms out, got {wait:?}"
+        );
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        assert!(f.suspended(), "not there yet");
+        // Let 400 ms of server time pass. Until the loop evaluates it, the
+        // passed value must read as due now — never as "no deadline", or
+        // an idle loop would block past it.
+        f.state.start_instant -= std::time::Duration::from_millis(400);
+        let due = crate::core_loop::sync_await::system_counter_deadline(&f.state)
+            .expect("still pending until evaluated");
+        assert!(due <= std::time::Instant::now());
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        assert!(!f.suspended());
+        let (counter, wait_value, value, count, destroyed) =
+            counter_notify_fields(&f.b_packets()[0]);
+        assert_eq!(
+            (counter, wait_value, count, destroyed),
+            (s::SERVERTIME_COUNTER, now + 300, 0, false)
+        );
+        assert!(value >= now + 300);
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_none());
+    }
+
+    /// SERVERTIME alarms fire too (Xvfb: an absolute now+200
+    /// PositiveComparison alarm with delta 0 sent AlarmNotify after ~200 ms
+    /// with state Inactive and counter >= alarm value).
+    #[test]
+    fn sync_alarm_on_servertime_fires_when_the_clock_gets_there() {
+        use yserver_protocol::x11::sync as s;
+        const ALARM: u32 = 0x0010_0030;
+        let mut f = sync_fixture();
+        let now = i64::from(f.state.timestamp_now());
+        let mut body = ALARM.to_le_bytes().to_vec();
+        let mask = s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE | s::CA_DELTA;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&s::SERVERTIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&s::VALUE_TYPE_ABSOLUTE.to_le_bytes());
+        body.extend_from_slice(&sync_i64(now + 200));
+        body.extend_from_slice(&s::TEST_POSITIVE_COMPARISON.to_le_bytes());
+        body.extend_from_slice(&sync_i64(0));
+        f.b(s::CREATE_ALARM, &body);
+        assert!(f.b_packets().is_empty(), "not due yet");
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_some());
+        f.state.start_instant -= std::time::Duration::from_millis(300);
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        let packets = f.b_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            packets[0][0],
+            crate::nested::SYNC_FIRST_EVENT + 1,
+            "AlarmNotify"
+        );
+        assert_eq!(packets[0][28], s::ALARM_STATE_INACTIVE);
+        assert_eq!(f.state.sync_alarms[&ALARM].state, s::ALARM_STATE_INACTIVE);
+    }
+
+    /// IDLETIME awaits: a positive test wakes when idle time reaches it; a
+    /// negative transition wakes on input (idle drops to 0).
+    #[test]
+    fn sync_await_on_idletime_fires_on_idle_and_on_input() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.state.dpms.last_activity = std::time::Instant::now();
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::IDLETIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                5_000,
+                s::TEST_POSITIVE_TRANSITION,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_some());
+        f.state.dpms.last_activity -= std::time::Duration::from_secs(6);
+        crate::core_loop::run::evaluate_idletime_alarms_post_poll(&mut f.state, &mut f.backend);
+        assert!(!f.suspended());
+        let (counter, wait_value, _, _, _) = counter_notify_fields(&f.b_packets()[0]);
+        assert_eq!((counter, wait_value), (s::IDLETIME_COUNTER, 5_000));
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::IDLETIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                1_000,
+                s::TEST_NEGATIVE_TRANSITION,
+                0,
+            ),
+        );
+        assert!(f.suspended(), "idle is ~6 s, no downward crossing yet");
+        evaluate_idletime_negative_alarms_on_input_wake(&mut f.state, 2, 6_000, 6_000);
+        assert!(!f.suspended());
+    }
+
+    /// The awaiting client's own disconnect drops its await.
+    #[test]
+    fn sync_await_dies_with_its_client() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(SYNC_B),
+        );
+        assert!(f.state.sync_awaits.is_empty());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 9));
+        assert!(f.state.sync_counters.contains_key(&SYNC_C1));
     }
 
     fn xfixes_create_barrier(

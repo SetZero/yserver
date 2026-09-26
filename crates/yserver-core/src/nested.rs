@@ -66,7 +66,7 @@ const SHAPE_FIRST_ERROR: u8 = 0; // SHAPE defines no errors (match Xorg: first_e
 
 const SYNC_MAJOR_OPCODE: u8 = 142;
 pub(crate) const SYNC_FIRST_EVENT: u8 = 83; // matches Xorg: Counter=83, Alarm=84
-const SYNC_FIRST_ERROR: u8 = 164;
+pub(crate) const SYNC_FIRST_ERROR: u8 = 164;
 
 const DAMAGE_MAJOR_OPCODE: u8 = 143;
 pub(crate) const DAMAGE_FIRST_EVENT: u8 = 91; // matches Xorg: DamageNotify=91

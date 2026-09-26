@@ -1362,17 +1362,15 @@ pub struct ServerState {
     /// `ServerState` gives it the right lifetime under `-noreset` — as
     /// long as the server, which is as long as the orphaned overlay.
     pub cow_teardown_failed: bool,
-    /// Outstanding `XSync::AwaitFence` requests waiting on at least
-    /// one fence in the list to transition to triggered. Per the
-    /// spec the server must defer further processing of the
-    /// blocked client's requests until *any* of the listed fences
-    /// triggers; **we don't suspend the client's request stream**
-    /// (that requires deeper core-loop integration), so this map
-    /// only records the await for telemetry + a corresponding
-    /// `TriggerFence`-time `AwaitSatisfied` debug log. Real
-    /// blocking is left as a known gap — see followup §5 in
-    /// `docs/superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md`.
-    pub sync_pending_awaits: Vec<SyncPendingAwait>,
+    /// SYNC `Await` / `AwaitFence` in progress, keyed by client id. A client
+    /// with an entry is suspended (Xorg `IgnoreClient`): the core loop's
+    /// fair request queue keeps its later requests queued until the entry
+    /// is removed — the await fired, or the client left.
+    pub sync_awaits: HashMap<u32, SyncAwait>,
+    /// SERVERTIME value last evaluated against alarms and awaits; the
+    /// post-poll pass feeds `(last, now)` through the trigger tests the way
+    /// Xorg's `ServertimeWakeupHandler` calls `SyncChangeCounter`.
+    pub sync_servertime_last: Option<i64>,
     /// Cumulative XI2 scroll-axis values for the master pointer.
     /// `[0]` is valuator number 2 (vertical scroll), `[1]` is
     /// valuator number 3 (horizontal scroll). Increments by 1 per
@@ -1416,14 +1414,36 @@ pub struct KeyRepeatState {
     pub next_fire: std::time::Instant,
 }
 
-/// One outstanding `XSync::AwaitFence` request that hasn't been
-/// satisfied yet. Stored on `ServerState` until any fence in
-/// `fences` triggers.
-#[derive(Clone, Debug)]
-pub struct SyncPendingAwait {
-    pub client: ClientId,
-    pub sequence: SequenceNumber,
-    pub fences: Vec<u32>,
+/// One wait condition of a pending SYNC await (Xorg `SyncAwait`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncAwaitCondition {
+    /// `Await` on a counter: `test_value` is already resolved (a relative
+    /// wait was added to the counter's value when the request arrived).
+    Counter {
+        counter: u32,
+        test_type: u32,
+        test_value: i64,
+        event_threshold: i64,
+    },
+    /// `AwaitFence` on a fence.
+    Fence { fence: u32 },
+}
+
+impl SyncAwaitCondition {
+    /// The counter or fence this condition waits on.
+    #[must_use]
+    pub fn object(&self) -> u32 {
+        match *self {
+            Self::Counter { counter, .. } => counter,
+            Self::Fence { fence } => fence,
+        }
+    }
+}
+
+/// A suspended client's `Await` / `AwaitFence` (Xorg `SyncAwaitUnion`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SyncAwait {
+    pub conditions: Vec<SyncAwaitCondition>,
 }
 
 /// GLX context resource. We never run server-side GL — direct-
@@ -1625,7 +1645,8 @@ impl ServerState {
             xi2_client_versions: HashMap::new(),
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
-            sync_pending_awaits: Vec::new(),
+            sync_awaits: HashMap::new(),
+            sync_servertime_last: None,
             repeat_state: None,
             dpms: DpmsState::new(false),
             screensaver: ScreenSaverState::new(),

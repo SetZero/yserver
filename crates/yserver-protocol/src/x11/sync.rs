@@ -1,6 +1,6 @@
 use super::{
     ClientByteOrder, SequenceNumber,
-    wire::{write_u16, write_u32},
+    wire::{read_u32, write_u16, write_u32},
 };
 
 pub const INITIALIZE: u8 = 0;
@@ -57,7 +57,86 @@ pub const CA_DELTA: u32 = 1 << 4;
 pub const CA_EVENTS: u32 = 1 << 5;
 // Event sub-codes relative to the SYNC first-event base
 // (CounterNotify=0, AlarmNotify=1).
+pub const COUNTER_NOTIFY_KIND: u8 = 0;
 pub const ALARM_NOTIFY_KIND: u8 = 1;
+
+// Error codes relative to the SYNC first-error base (`syncconst.h`).
+pub const BAD_COUNTER: u8 = 0;
+pub const BAD_ALARM: u8 = 1;
+pub const BAD_FENCE: u8 = 2;
+
+/// Wire size of one `WAITCONDITION` in `Await`: trigger (counter,
+/// value-type, INT64 wait-value, test-type) plus the INT64 event threshold.
+pub const WAIT_CONDITION_LEN: usize = 28;
+
+/// One `Await` wait condition as sent (`xSyncWaitCondition`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitCondition {
+    pub counter: u32,
+    pub value_type: u32,
+    pub wait_value: i64,
+    pub test_type: u32,
+    pub event_threshold: i64,
+}
+
+fn read_i64_ordered(byte_order: ClientByteOrder, bytes: &[u8]) -> i64 {
+    // INT64 on the wire is hi (INT32) then lo (CARD32).
+    #[allow(clippy::cast_possible_wrap)]
+    let hi = read_u32(byte_order, bytes) as i32;
+    (i64::from(hi) << 32) | i64::from(read_u32(byte_order, &bytes[4..]))
+}
+
+/// Parse an `Await` body: a list of wait conditions. `None` when the length
+/// is not a whole number of conditions (Xorg: BadLength). An empty list
+/// parses; the handler rejects it with BadValue as Xorg does.
+#[must_use]
+pub fn parse_await(byte_order: ClientByteOrder, body: &[u8]) -> Option<Vec<WaitCondition>> {
+    if !body.len().is_multiple_of(WAIT_CONDITION_LEN) {
+        return None;
+    }
+    Some(
+        body.chunks_exact(WAIT_CONDITION_LEN)
+            .map(|c| WaitCondition {
+                counter: read_u32(byte_order, c),
+                value_type: read_u32(byte_order, &c[4..]),
+                wait_value: read_i64_ordered(byte_order, &c[8..]),
+                test_type: read_u32(byte_order, &c[16..]),
+                event_threshold: read_i64_ordered(byte_order, &c[20..]),
+            })
+            .collect(),
+    )
+}
+
+/// Encode a `CounterNotify` event (32 bytes, `xSyncCounterNotifyEvent`):
+/// sent only to a client whose `Await` / `AwaitFence` just unblocked.
+/// `count` is the number of events still to follow for that request.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn encode_counter_notify_event(
+    byte_order: ClientByteOrder,
+    first_event: u8,
+    sequence: SequenceNumber,
+    counter: u32,
+    wait_value: i64,
+    counter_value: i64,
+    time: u32,
+    count: u16,
+    destroyed: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.push(first_event.wrapping_add(COUNTER_NOTIFY_KIND));
+    out.push(COUNTER_NOTIFY_KIND);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, counter);
+    write_i64(byte_order, &mut out, wait_value);
+    write_i64(byte_order, &mut out, counter_value);
+    write_u32(byte_order, &mut out, time);
+    write_u16(byte_order, &mut out, count);
+    out.push(u8::from(destroyed));
+    out.push(0);
+    debug_assert_eq!(out.len(), 32);
+    out
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateFenceRequest {
@@ -102,14 +181,6 @@ fn fixed_reply(byte_order: ClientByteOrder, sequence: SequenceNumber, length: u3
     write_u16(byte_order, &mut out, sequence.0);
     write_u32(byte_order, &mut out, length);
     out
-}
-
-#[must_use]
-pub fn parse_initialize(body: &[u8]) -> Option<(u8, u8)> {
-    if body.len() < 4 {
-        return None;
-    }
-    Some((body[0], body[1]))
 }
 
 #[must_use]
@@ -277,13 +348,18 @@ pub fn parse_create_fence(body: &[u8]) -> Option<CreateFenceRequest> {
     })
 }
 
+/// Parse an `AwaitFence` body: `FENCE[n]`, n implicit in the length.
+/// `None` when the length is not a multiple of 4 (Xorg: BadLength).
 #[must_use]
-pub fn parse_await_fence(body: &[u8]) -> Option<Vec<u32>> {
-    // Body: u32[n] fences. n is implicit from the body length /4.
+pub fn parse_await_fence(byte_order: ClientByteOrder, body: &[u8]) -> Option<Vec<u32>> {
     if !body.len().is_multiple_of(4) {
         return None;
     }
-    Some(body.chunks_exact(4).map(read_u32_le).collect())
+    Some(
+        body.chunks_exact(4)
+            .map(|c| read_u32(byte_order, c))
+            .collect(),
+    )
 }
 
 #[must_use]
@@ -632,13 +708,13 @@ mod tests {
         body[0..4].copy_from_slice(&0x100u32.to_le_bytes());
         body[4..8].copy_from_slice(&0x200u32.to_le_bytes());
         body[8..12].copy_from_slice(&0x300u32.to_le_bytes());
-        let list = parse_await_fence(&body).unwrap();
+        let list = parse_await_fence(ClientByteOrder::LittleEndian, &body).unwrap();
         assert_eq!(list, vec![0x100, 0x200, 0x300]);
     }
 
     #[test]
     fn await_fence_rejects_misaligned() {
-        assert!(parse_await_fence(&[0u8; 7]).is_none());
+        assert!(parse_await_fence(ClientByteOrder::LittleEndian, &[0u8; 7]).is_none());
     }
 
     #[test]
@@ -681,5 +757,57 @@ mod tests {
         assert_eq!(DESTROY_FENCE, 17, "X_SyncDestroyFence");
         assert_eq!(QUERY_FENCE, 18, "X_SyncQueryFence");
         assert_eq!(AWAIT_FENCE, 19, "X_SyncAwaitFence");
+    }
+
+    #[test]
+    fn parse_await_reads_conditions_in_client_byte_order() {
+        let mut body = Vec::new();
+        for v in [0x0020_0000u32, 1, 0xffff_ffff, 0xffff_fffd, 3, 0, 7] {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(
+            parse_await(ClientByteOrder::BigEndian, &body),
+            Some(vec![WaitCondition {
+                counter: 0x0020_0000,
+                value_type: VALUE_TYPE_RELATIVE,
+                wait_value: -3,
+                test_type: TEST_NEGATIVE_COMPARISON,
+                event_threshold: 7,
+            }])
+        );
+        assert_eq!(parse_await(ClientByteOrder::BigEndian, &body[..27]), None);
+        assert_eq!(
+            parse_await(ClientByteOrder::BigEndian, &[]),
+            Some(Vec::new())
+        );
+    }
+
+    /// `xSyncCounterNotifyEvent`: type, kind, seq, counter, wait hi/lo,
+    /// value hi/lo, time, count, destroyed, pad.
+    #[test]
+    fn counter_notify_event_layout() {
+        let e = encode_counter_notify_event(
+            ClientByteOrder::LittleEndian,
+            83,
+            SequenceNumber(9),
+            0x0020_0000,
+            -3,
+            0x1_0000_0002,
+            0x1234,
+            1,
+            true,
+        );
+        assert_eq!(e.len(), 32);
+        assert_eq!(e[0], 83, "CounterNotify is first_event + 0");
+        assert_eq!(e[1], COUNTER_NOTIFY_KIND);
+        assert_eq!(&e[2..4], &9u16.to_le_bytes());
+        assert_eq!(&e[4..8], &0x0020_0000u32.to_le_bytes());
+        assert_eq!(&e[8..12], &(-1i32).to_le_bytes(), "wait hi");
+        assert_eq!(&e[12..16], &0xffff_fffdu32.to_le_bytes(), "wait lo");
+        assert_eq!(&e[16..20], &1u32.to_le_bytes(), "value hi");
+        assert_eq!(&e[20..24], &2u32.to_le_bytes(), "value lo");
+        assert_eq!(&e[24..28], &0x1234u32.to_le_bytes());
+        assert_eq!(&e[28..30], &1u16.to_le_bytes());
+        assert_eq!(e[30], 1);
     }
 }
