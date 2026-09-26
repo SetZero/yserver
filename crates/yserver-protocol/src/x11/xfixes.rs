@@ -1,6 +1,6 @@
 use super::{
     ClientByteOrder, SequenceNumber,
-    wire::{write_i16, write_u16, write_u32},
+    wire::{read_u16, read_u32, write_i16, write_u16, write_u32},
 };
 
 pub const QUERY_VERSION: u8 = 0;
@@ -29,7 +29,9 @@ pub const SET_PICTURE_CLIP_REGION: u8 = 22;
 pub const SET_CURSOR_NAME: u8 = 23;
 pub const GET_CURSOR_NAME: u8 = 24;
 pub const GET_CURSOR_IMAGE_AND_NAME: u8 = 25;
+pub const CHANGE_CURSOR: u8 = 26;
 pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
+pub const EXPAND_REGION: u8 = 28;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
 pub const CREATE_POINTER_BARRIER: u8 = 31;
@@ -54,13 +56,156 @@ pub const SELECTION_MASK_CLIENT_CLOSE: u32 = 1 << SELECTION_NOTIFY_CLIENT_CLOSE;
 pub const SELECTION_ALL_EVENTS_MASK: u32 =
     SELECTION_MASK_SET_OWNER | SELECTION_MASK_WINDOW_DESTROY | SELECTION_MASK_CLIENT_CLOSE;
 
+// `XFixesCursorNotify` subtype and its `SelectCursorInput` mask bit
+// (Xorg `xfixes/cursor.c`, `CursorAllEvents`).
+pub const DISPLAY_CURSOR_NOTIFY: u8 = 0;
+pub const DISPLAY_CURSOR_NOTIFY_MASK: u32 = 1 << DISPLAY_CURSOR_NOTIFY;
+/// Every mask bit `SelectCursorInput` accepts; any other bit is BadValue.
+pub const CURSOR_ALL_EVENTS_MASK: u32 = DISPLAY_CURSOR_NOTIFY_MASK;
+
 // Mutter/muffin refuses to start as a WM unless XFIXES advertises >= 5.0
-// (`Window manager error: Mutter requires XFixes 5.0`). QueryVersion echoes
-// min(client, server) per axis, so older clients still negotiate down.
-// Stage-5+ opcodes (`CreatePointerBarrier` etc.) are reply-less and fall
-// through `handle_xfixes_request`'s `other` arm without breaking clients.
+// (`Window manager error: Mutter requires XFixes 5.0`). 6.0 only adds the
+// client disconnect mode (Xwayland `-terminate`), which yserver does not
+// implement, so 5.0 is the ceiling. `negotiate_version` applies Xorg's rule
+// against it.
 pub const MAJOR_VERSION: u32 = 5;
 pub const MINOR_VERSION: u32 = 0;
+
+/// Highest minor opcode each negotiated major version admits — Xorg
+/// `xfixes.c` `version_requests`. Index 0 is a client that has not sent
+/// `QueryVersion` yet: only `QueryVersion` itself is allowed.
+const VERSION_LAST_REQUEST: [u8; 6] = [
+    QUERY_VERSION,
+    GET_CURSOR_IMAGE,
+    CHANGE_CURSOR_BY_NAME,
+    EXPAND_REGION,
+    SHOW_CURSOR,
+    DELETE_POINTER_BARRIER,
+];
+
+/// Outcome of one `QueryVersion` under Xorg's rule
+/// (`xfixes.c::ProcXFixesQueryVersion`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NegotiatedVersion {
+    /// The major version the client is now held to (it gates requests).
+    pub client_major: u32,
+    /// The version put in the reply.
+    pub reply_major: u32,
+    pub reply_minor: u32,
+}
+
+/// Xorg's XFIXES version rule. A client asking for less than the server
+/// gets its own minor and the larger of its earlier and current major
+/// (the gate never shrinks); the reply's major is capped at what it asked
+/// for. A client asking for at least the server version gets the server's.
+#[must_use]
+pub fn negotiate_version(
+    previous_major: u32,
+    client_major: u32,
+    client_minor: u32,
+) -> NegotiatedVersion {
+    let (major, minor) = if (client_major, client_minor) < (MAJOR_VERSION, MINOR_VERSION) {
+        (previous_major.max(client_major), client_minor)
+    } else {
+        (MAJOR_VERSION, MINOR_VERSION)
+    };
+    NegotiatedVersion {
+        client_major: major,
+        reply_major: client_major.min(major),
+        reply_minor: minor,
+    }
+}
+
+/// Whether a client held to `client_major` may issue minor opcode `minor`
+/// (Xorg `ProcXFixesDispatch`). Everything else is BadRequest.
+#[must_use]
+pub fn request_allowed(client_major: u32, minor: u8) -> bool {
+    usize::try_from(client_major)
+        .ok()
+        .and_then(|major| VERSION_LAST_REQUEST.get(major))
+        .is_some_and(|last| minor <= *last)
+}
+
+/// Parse `QueryVersion`: client major and minor (CARD32 each).
+#[must_use]
+pub fn parse_query_version(byte_order: ClientByteOrder, body: &[u8]) -> Option<(u32, u32)> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some((read_u32(byte_order, body), read_u32(byte_order, &body[4..])))
+}
+
+/// Parse `HideCursor` / `ShowCursor`: the window naming the screen.
+#[must_use]
+pub fn parse_window(byte_order: ClientByteOrder, body: &[u8]) -> Option<u32> {
+    (body.len() >= 4).then(|| read_u32(byte_order, body))
+}
+
+/// Parse `ChangeCursor`: (source, destination).
+#[must_use]
+pub fn parse_change_cursor(byte_order: ClientByteOrder, body: &[u8]) -> Option<(u32, u32)> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some((read_u32(byte_order, body), read_u32(byte_order, &body[4..])))
+}
+
+/// `ExpandRegion` request fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpandRegionRequest {
+    pub source: u32,
+    pub destination: u32,
+    pub left: u16,
+    pub right: u16,
+    pub top: u16,
+    pub bottom: u16,
+}
+
+/// Parse `ExpandRegion`: source, destination, then CARD16 left, right, top,
+/// bottom.
+#[must_use]
+pub fn parse_expand_region(
+    byte_order: ClientByteOrder,
+    body: &[u8],
+) -> Option<ExpandRegionRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    Some(ExpandRegionRequest {
+        source: read_u32(byte_order, body),
+        destination: read_u32(byte_order, &body[4..]),
+        left: read_u16(byte_order, &body[8..]),
+        right: read_u16(byte_order, &body[10..]),
+        top: read_u16(byte_order, &body[12..]),
+        bottom: read_u16(byte_order, &body[14..]),
+    })
+}
+
+/// `XFixesCursorNotify` (event `first_event + 1`), 32 bytes: subtype,
+/// window, cursor serial, timestamp, cursor name atom (Xorg
+/// `xXFixesCursorNotifyEvent`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_cursor_notify_event(
+    out: &mut Vec<u8>,
+    order: ClientByteOrder,
+    first_event: u8,
+    seq: SequenceNumber,
+    window: u32,
+    cursor_serial: u32,
+    timestamp: u32,
+    name: u32,
+) {
+    let start = out.len();
+    out.push(first_event + 1);
+    out.push(DISPLAY_CURSOR_NOTIFY);
+    write_u16(order, out, seq.0);
+    write_u32(order, out, window);
+    write_u32(order, out, cursor_serial);
+    write_u32(order, out, timestamp);
+    write_u32(order, out, name);
+    out.extend_from_slice(&[0u8; 12]);
+    debug_assert_eq!(out.len() - start, 32);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegionRect {
@@ -1101,5 +1246,111 @@ mod tests {
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 2);
         assert_eq!(i16::from_le_bytes(reply[8..10].try_into().unwrap()), 1);
         assert_eq!(i16::from_le_bytes(reply[32..34].try_into().unwrap()), 1);
+    }
+
+    /// Xorg 21.1.24 Xvfb (XFIXES 6.0) answers, captured with a raw xcb probe:
+    /// 4.0 -> 4.0, 2.0 -> 2.0, 3.7 -> 3.7 (the client's minor is echoed
+    /// below the server version) and 7.0 -> 6.0 (capped). yserver's ceiling
+    /// is 5.0, so the capped cases land on 5.0 by the same rule.
+    #[test]
+    fn negotiate_version_follows_xorg_rule() {
+        let reply = |prev, maj, min| {
+            let v = negotiate_version(prev, maj, min);
+            (v.reply_major, v.reply_minor)
+        };
+        assert_eq!(reply(0, 4, 0), (4, 0));
+        assert_eq!(reply(0, 2, 0), (2, 0));
+        assert_eq!(reply(0, 3, 7), (3, 7));
+        assert_eq!(reply(0, 5, 0), (5, 0));
+        assert_eq!(reply(0, 5, 1), (5, 0));
+        assert_eq!(reply(0, 6, 0), (5, 0));
+        assert_eq!(reply(0, 7, 0), (5, 0));
+    }
+
+    /// Captured on Xvfb: QueryVersion 4.0 then 2.0 replies 2.0, but the
+    /// client keeps the 4.0 request set — HideCursor (29) succeeds while
+    /// DeletePointerBarrier (32, a 5.0 request) is BadRequest.
+    #[test]
+    fn negotiated_major_is_sticky_and_gates_requests() {
+        let first = negotiate_version(0, 4, 0);
+        assert_eq!(first.client_major, 4);
+        let second = negotiate_version(first.client_major, 2, 0);
+        assert_eq!((second.reply_major, second.reply_minor), (2, 0));
+        assert_eq!(second.client_major, 4);
+        assert!(request_allowed(second.client_major, HIDE_CURSOR));
+        assert!(!request_allowed(
+            second.client_major,
+            DELETE_POINTER_BARRIER
+        ));
+    }
+
+    /// Captured on Xvfb: before QueryVersion, HideCursor is BadRequest; after
+    /// QueryVersion 1.0, CreateRegion (5) is BadRequest.
+    #[test]
+    fn request_gate_matches_version_request_sets() {
+        assert!(request_allowed(0, QUERY_VERSION));
+        assert!(!request_allowed(0, HIDE_CURSOR));
+        assert!(!request_allowed(0, GET_CURSOR_IMAGE));
+        assert!(request_allowed(1, GET_CURSOR_IMAGE));
+        assert!(!request_allowed(1, CREATE_REGION));
+        assert!(request_allowed(2, CHANGE_CURSOR_BY_NAME));
+        assert!(!request_allowed(2, EXPAND_REGION));
+        assert!(request_allowed(3, EXPAND_REGION));
+        assert!(!request_allowed(3, HIDE_CURSOR));
+        assert!(request_allowed(4, SHOW_CURSOR));
+        assert!(!request_allowed(4, CREATE_POINTER_BARRIER));
+        assert!(request_allowed(5, DELETE_POINTER_BARRIER));
+        // 6.0's disconnect-mode requests stay out of reach.
+        assert!(!request_allowed(5, 33));
+        assert!(!request_allowed(6, 33));
+    }
+
+    #[test]
+    fn cursor_notify_event_layout() {
+        let mut out = Vec::new();
+        encode_cursor_notify_event(
+            &mut out,
+            ClientByteOrder::BigEndian,
+            87,
+            SequenceNumber(0x0102),
+            0x0000_039f,
+            3,
+            0x1122_3344,
+            231,
+        );
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], 88, "CursorNotify is first_event + 1");
+        assert_eq!(out[1], DISPLAY_CURSOR_NOTIFY);
+        assert_eq!(&out[2..4], &[0x01, 0x02]);
+        assert_eq!(&out[4..8], &0x0000_039f_u32.to_be_bytes());
+        assert_eq!(&out[8..12], &3u32.to_be_bytes());
+        assert_eq!(&out[12..16], &0x1122_3344_u32.to_be_bytes());
+        assert_eq!(&out[16..20], &231u32.to_be_bytes());
+        assert!(out[20..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn parse_expand_region_reads_all_fields_in_client_order() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x10u32.to_be_bytes());
+        body.extend_from_slice(&0x20u32.to_be_bytes());
+        for v in [1u16, 2, 3, 4] {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(
+            parse_expand_region(ClientByteOrder::BigEndian, &body),
+            Some(ExpandRegionRequest {
+                source: 0x10,
+                destination: 0x20,
+                left: 1,
+                right: 2,
+                top: 3,
+                bottom: 4,
+            })
+        );
+        assert_eq!(
+            parse_expand_region(ClientByteOrder::BigEndian, &body[..15]),
+            None
+        );
     }
 }

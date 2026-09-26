@@ -2,7 +2,7 @@
 //!
 //! All `HostX11Backend` methods that send wire bytes to the host (drawing,
 //! extension proxies, `apply_*` sync points, etc.) live here, plus the
-//! pure-byte wire builders they call (`build_xfixes_change_cursor_by_name`,
+//! pure-byte wire builders they call (`build_xfixes_change_cursor`,
 //! `build_shape_rectangles`, `patch_glyph_command_offsets`,
 //! `push_card8_padded`, the font-request builders).
 //!
@@ -220,16 +220,12 @@ impl HostX11Backend {
         self.stream.flush()
     }
 
-    /// Forward XFIXES `ChangeCursorByName` (minor 23) to the host. The host
-    /// resolves the cursor name against its own theme, so we pass through
-    /// `name_bytes` verbatim. No-op when the host doesn't advertise XFIXES.
-    pub fn xfixes_change_cursor_by_name(
-        &mut self,
-        host_cursor_xid: u32,
-        name_bytes: &[u8],
-    ) -> io::Result<()> {
-        let Some(bytes) =
-            build_xfixes_change_cursor_by_name(self.xfixes_opcode, host_cursor_xid, name_bytes)
+    /// Forward XFIXES `ChangeCursor` (minor 26) to the host: every use of
+    /// host cursor `destination` switches to `source`, which is how the
+    /// host sprite follows a nested `ChangeCursor` / `ChangeCursorByName`.
+    /// No-op when the host doesn't advertise XFIXES.
+    pub fn xfixes_change_cursor(&mut self, source: u32, destination: u32) -> io::Result<()> {
+        let Some(bytes) = build_xfixes_change_cursor(self.xfixes_opcode, source, destination)
         else {
             return Ok(());
         };
@@ -2396,26 +2392,20 @@ fn patch_glyph_command_offsets(items: &mut [u8], x_off: i16, y_off: i16, id_size
     }
 }
 
-/// Build the wire bytes for XFIXES `ChangeCursorByName` (minor 23). Returns
-/// `None` when the host XFIXES extension is unavailable.
-fn build_xfixes_change_cursor_by_name(
+/// Build the wire bytes for XFIXES `ChangeCursor` (minor 26): source then
+/// destination. Returns `None` when the host XFIXES extension is unavailable.
+fn build_xfixes_change_cursor(
     host_xfixes_opcode: Option<u8>,
-    host_cursor_xid: u32,
-    name_bytes: &[u8],
+    source: u32,
+    destination: u32,
 ) -> Option<Vec<u8>> {
     let opcode = host_xfixes_opcode?;
-    let nbytes = u16::try_from(name_bytes.len()).ok()?;
-    let padded_name = padded_len(name_bytes.len());
-    let length_units = u16::try_from(3 + padded_name / 4).ok()?;
-    let mut out = Vec::with_capacity(12 + padded_name);
+    let mut out = Vec::with_capacity(12);
     out.push(opcode);
-    out.push(yserver_protocol::x11::xfixes::CHANGE_CURSOR_BY_NAME);
-    write_u16(&mut out, length_units);
-    write_u32(&mut out, host_cursor_xid);
-    write_u16(&mut out, nbytes);
-    write_u16(&mut out, 0); // pad
-    out.extend_from_slice(name_bytes);
-    out.resize(12 + padded_name, 0);
+    out.push(yserver_protocol::x11::xfixes::CHANGE_CURSOR);
+    write_u16(&mut out, 3);
+    write_u32(&mut out, source);
+    write_u32(&mut out, destination);
     Some(out)
 }
 
@@ -2548,39 +2538,20 @@ mod tests {
     }
 
     #[test]
-    fn change_cursor_by_name_no_host_opcode_returns_none() {
-        // No host XFIXES opcode → caller should send nothing and not crash.
-        assert!(super::build_xfixes_change_cursor_by_name(None, 0x10, b"left_ptr").is_none());
+    fn change_cursor_no_host_opcode_returns_none() {
+        assert!(super::build_xfixes_change_cursor(None, 0x10, 0x20).is_none());
     }
 
     #[test]
-    fn change_cursor_by_name_wire_shape_unpadded_name() {
-        // 8-byte name "left_ptr" → no padding needed.
-        let bytes =
-            super::build_xfixes_change_cursor_by_name(Some(140), 0xdead_beef, b"left_ptr").unwrap();
-        // header(4) + cursor(4) + nbytes(2)+pad(2) + name(8) = 20 bytes = 5 units
-        assert_eq!(bytes.len(), 20);
+    fn change_cursor_wire_shape() {
+        // xfixesproto `xXFixesChangeCursorReq`: header + source + destination.
+        let bytes = super::build_xfixes_change_cursor(Some(140), 0xdead_beef, 0x0102_0304).unwrap();
+        assert_eq!(bytes.len(), 12);
         assert_eq!(bytes[0], 140, "major = XFIXES");
-        assert_eq!(bytes[1], 27, "minor = ChangeCursorByName per xfixes.xml");
-        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 5);
-        assert_eq!(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            0xdead_beef,
-        );
-        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 8);
-        assert_eq!(&bytes[12..20], b"left_ptr");
-    }
-
-    #[test]
-    fn change_cursor_by_name_wire_shape_pads_name_to_4() {
-        // 5-byte name → 3 padding bytes appended.
-        let bytes = super::build_xfixes_change_cursor_by_name(Some(140), 0x1, b"hand1").unwrap();
-        // 12 (header) + padded_len(5) = 12 + 8 = 20 bytes = 5 units
-        assert_eq!(bytes.len(), 20);
-        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 5);
-        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 5);
-        assert_eq!(&bytes[12..17], b"hand1");
-        assert_eq!(&bytes[17..20], &[0, 0, 0]);
+        assert_eq!(bytes[1], 26, "minor = ChangeCursor");
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 3);
+        assert_eq!(&bytes[4..8], &0xdead_beef_u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0x0102_0304_u32.to_le_bytes());
     }
 
     fn glyphcmd(count: u8, dx: i16, dy: i16) -> [u8; 8] {

@@ -1561,6 +1561,15 @@ pub struct KmsBackend {
     /// Set/cleared via `set_grab_cursor` from the core grab/ungrab
     /// paths; `None` when no grab (or a `None`-cursor grab) is active.
     pub(crate) grab_cursor_override: Option<u32>,
+    /// XFIXES `HideCursor` is in force (some client holds a hide count).
+    /// The effective cursor keeps being tracked, so `GetCursorImage` and
+    /// `CursorNotify` are unaffected; only the sprite is blanked (Xorg
+    /// `CursorDisplayCursor` displays `NullCursor` while hide counts exist).
+    pub(crate) cursor_hidden: bool,
+    /// Pending XFIXES `CursorNotify` report: set whenever the effective
+    /// cursor switches, drained by the core via
+    /// `take_displayed_cursor_change`.
+    pub(crate) displayed_cursor_pending: Option<yserver_core::backend::DisplayedCursor>,
 
     /// Animated-cursor frame lists, keyed by the anim cursor's host
     /// handle. Same key-space discipline as `cursor_records` /
@@ -1997,6 +2006,25 @@ impl KmsBackend {
 
     fn bind_direct_cursor_on_all_outputs(&mut self) {
         if self.scanout_m2.cursor_bound_all {
+            return;
+        }
+        if self.cursor_hidden {
+            // XFIXES HideCursor: the direct frame owns the planes now, so
+            // make sure no stale sprite stays bound on any of them.
+            let mut failed = false;
+            for output_idx in 0..self.platform.outputs.len() {
+                if let Err(error) = self.platform.cursor_plane_hide_on_crtc(output_idx) {
+                    failed = true;
+                    log::warn!(
+                        "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
+                    );
+                }
+            }
+            if failed {
+                self.request_direct_unflip("cursor_hide_failed");
+            } else {
+                self.scanout_m2.cursor_bound_all = true;
+            }
             return;
         }
         let (hot_x, hot_y) = self
@@ -5256,6 +5284,8 @@ impl KmsBackend {
             default_cursor_xid: None,
             effective_cursor_xid: None,
             grab_cursor_override: None,
+            cursor_hidden: false,
+            displayed_cursor_pending: None,
             anim_cursor_records: HashMap::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
@@ -5674,10 +5704,64 @@ impl KmsBackend {
         }
         self.effective_cursor_xid = new_xid;
         self.sync_cursor_animation(new_xid);
+        // XFIXES CursorNotify (Xorg `CursorDisplayCursor`: the requested
+        // cursor differs from the sprite's current one). Queued AFTER the
+        // animation re-arm so the serial is the one `GetCursorImage` now
+        // reports. A missing cursor reports serial 0, as Xorg does for a
+        // NULL cursor.
+        self.displayed_cursor_pending = Some(yserver_core::backend::DisplayedCursor {
+            host_xid: new_xid.unwrap_or(0),
+            serial: new_xid
+                .and_then(|xid| self.cursor_records.get(&xid))
+                .map_or(0, |record| {
+                    u32::try_from(record.version).unwrap_or(u32::MAX)
+                }),
+        });
         let Some(xid) = new_xid else {
             return;
         };
         self.display_cursor_by_handle(xid);
+    }
+
+    /// XFIXES `HideCursor` / `ShowCursor` edge. Hiding drops the scene's
+    /// cursor entry (the scene then assigns `Hidden` on every output, which
+    /// detaches a bound HW plane on the next retire) and, while a direct
+    /// root scanout owns the planes, detaches the legacy cursor plane
+    /// right away since no compose will run. Showing re-displays the
+    /// current effective cursor through the ordinary path.
+    fn apply_cursor_hidden(&mut self, hidden: bool) {
+        if self.cursor_hidden == hidden {
+            return;
+        }
+        self.cursor_hidden = hidden;
+        if hidden {
+            self.scene.clear_cursor();
+            if self.scanout_m2.active() {
+                for output_idx in 0..self.platform.outputs.len() {
+                    if let Err(error) = self.platform.cursor_plane_hide_on_crtc(output_idx) {
+                        log::warn!(
+                            "scanout_m2: cursor hide failed on output {output_idx}: {error}; unflipping"
+                        );
+                        self.request_direct_unflip("cursor_hide_failed");
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        let Some(xid) = self.effective_cursor_xid else {
+            return;
+        };
+        self.display_cursor_by_handle(xid);
+        // Under direct scanout nothing composes, and the scene's cursor
+        // mode may still read Hidden, so `display_cursor_by_handle` can
+        // skip the plane. Rebind it directly.
+        if self.scanout_m2.active()
+            && let Some(record) = self.cursor_records.get(&xid).cloned()
+            && !self.refresh_direct_cursor_on_all_outputs(&record)
+        {
+            self.request_direct_unflip("cursor_show_failed");
+        }
     }
 
     /// Arm (reset to frame 0) or clear the cursor animation for the
@@ -5797,6 +5881,12 @@ impl KmsBackend {
     /// animation tick. Keeps the sample-view readiness guard
     /// (Vk-less fixtures build records without sprite allocs).
     fn display_cursor_by_handle(&mut self, xid: u32) {
+        // XFIXES HideCursor: the effective cursor (and a running
+        // animation) keep advancing, nothing reaches the screen.
+        // `apply_cursor_hidden(false)` re-displays the current one.
+        if self.cursor_hidden {
+            return;
+        }
         let Some(record) = self.cursor_records.get(&xid).cloned() else {
             return;
         };
@@ -6208,6 +6298,8 @@ impl KmsBackend {
             default_cursor_xid: None,
             effective_cursor_xid: None,
             grab_cursor_override: None,
+            cursor_hidden: false,
+            displayed_cursor_pending: None,
             anim_cursor_records: HashMap::new(),
             active_cursor_anim: None,
             last_drained_fb_opens: 0,
@@ -13807,7 +13899,10 @@ impl KmsBackend {
             // synchronous from the same thread that owns scene
             // state.
             let cursor_mode = self.scene.cursor_mode();
-            if matches!(
+            if self.cursor_hidden {
+                // XFIXES HideCursor: there is no sprite to move. Showing
+                // it again displays it at the then-current position.
+            } else if matches!(
                 cursor_mode,
                 crate::kms::render::scene::CursorPlaneMode::Hw
                     | crate::kms::render::scene::CursorPlaneMode::Mixed
@@ -27361,6 +27456,7 @@ impl Backend for KmsBackend {
         #[allow(clippy::cast_possible_truncation)]
         let y = self.core.cursor_y as i16;
         Some(yserver_core::backend::ActiveCursorImage {
+            host_xid: xid,
             width: record.width,
             height: record.height,
             hot_x: record.hot_x,
@@ -27422,19 +27518,39 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn xfixes_change_cursor_by_name(
+    fn replace_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_cursor_xid: u32,
-        _name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()> {
-        // Stage 3f.4: v1-parity no-op. XFixes cursor-by-name is a
-        // theme-database hint ("watch" / "left_ptr" / etc.); yserver
-        // doesn't have a cursor-theme registry, so neither v1 nor v2
-        // do anything beyond returning Ok. Real apps see no behaviour
-        // difference (their fallback non-named cursor stays in
-        // effect).
+        // Xorg `ReplaceCursor`: windows, grabs and the resource database
+        // stop referencing the old cursor. Here that is every window's
+        // cursor slot, the sticky root default and the grab override.
+        if old_host_xid == new_host_xid {
+            return Ok(());
+        }
+        for geom in self.windows.values_mut() {
+            if geom.cursor == Some(old_host_xid) {
+                geom.cursor = Some(new_host_xid);
+            }
+        }
+        if self.core.active_cursor == Some(old_host_xid) {
+            self.core.active_cursor = Some(new_host_xid);
+        }
+        if self.grab_cursor_override == Some(old_host_xid) {
+            self.grab_cursor_override = Some(new_host_xid);
+        }
+        self.refresh_effective_cursor();
         Ok(())
+    }
+
+    fn set_cursor_hidden(&mut self, hidden: bool) {
+        self.apply_cursor_hidden(hidden);
+    }
+
+    fn take_displayed_cursor_change(&mut self) -> Option<yserver_core::backend::DisplayedCursor> {
+        self.displayed_cursor_pending.take()
     }
 
     fn set_shape_rectangles(
@@ -34833,7 +34949,7 @@ mod tests {
     /// Stage 3f.4 close: cursor-creation calls mint valid handles
     /// without logging gaps. `create_cursor`, `create_glyph_cursor`,
     /// `render_create_cursor`, `define_cursor`, and
-    /// `xfixes_change_cursor_by_name` all return `Ok` with no
+    /// `replace_cursor` all return `Ok` with no
     /// `log_render_gap` noise. Pixel rasterisation + scene blit is
     /// Stage 4 (cursor scene-layer work); 3f.4's job is to silence
     /// the pre-Stage-4 stub warnings that were misleading
@@ -34867,8 +34983,8 @@ mod tests {
 
         b.define_cursor(None, 0xABCD_EF01, c1.as_raw())
             .expect("define_cursor");
-        b.xfixes_change_cursor_by_name(None, c1.as_raw(), b"watch")
-            .expect("xfixes_change_cursor_by_name");
+        b.replace_cursor(None, c1.as_raw(), c2.as_raw())
+            .expect("replace_cursor");
 
         let gaps = b.logged_gaps.borrow();
         for g in [
@@ -34876,7 +34992,7 @@ mod tests {
             "create_glyph_cursor",
             "render_create_cursor",
             "define_cursor",
-            "xfixes_change_cursor_by_name",
+            "replace_cursor",
         ] {
             assert!(
                 !gaps.contains(g),
@@ -35038,6 +35154,136 @@ mod tests {
         // UngrabPointer (None) → reverts to the window's cursor.
         b.set_grab_cursor(None, None).expect("clear grab cursor");
         assert_eq!(b.effective_cursor_xid, Some(win_cur.as_raw()));
+    }
+
+    fn cursor_test_window(b: &mut KmsBackend, w: u32) {
+        let rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            w,
+            super::WindowGeometry {
+                border_width: 0,
+                border_pixel: None,
+                border_pixmap: None,
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                depth: 24,
+                mapped: true,
+                viewable: true,
+                parent: None,
+                stack_rank: rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+    }
+
+    /// XFIXES CursorNotify source: the backend reports each switch of the
+    /// effective cursor once, with the serial `GetCursorImage` reports, and
+    /// nothing when the cursor stays the same (Xvfb: re-defining the same
+    /// cursor sends no event). Hiding does not count as a change (Xvfb:
+    /// HideCursor sends no event, DefineCursor while hidden does).
+    #[test]
+    fn effective_cursor_changes_are_reported_once_and_survive_hiding() {
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0040).unwrap();
+        let a = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("cursor a");
+        let c = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("cursor c");
+        let w: u32 = 0xBEEF_0002;
+        cursor_test_window(&mut b, w);
+        b.core.prev_pointer_window = Some(w);
+        let _ = b.take_displayed_cursor_change();
+
+        b.define_cursor(None, w, a.as_raw()).expect("define a");
+        let change = b.take_displayed_cursor_change().expect("a reported");
+        assert_eq!(change.host_xid, a.as_raw());
+        let image = b.get_active_cursor_image().expect("image");
+        assert_eq!(
+            change.serial, image.serial,
+            "notify serial == GetCursorImage serial"
+        );
+        assert_eq!(image.host_xid, a.as_raw());
+
+        b.define_cursor(None, w, a.as_raw())
+            .expect("define a again");
+        assert_eq!(
+            b.take_displayed_cursor_change(),
+            None,
+            "same cursor: no report"
+        );
+
+        b.set_cursor_hidden(true);
+        assert!(b.cursor_hidden);
+        assert_eq!(
+            b.take_displayed_cursor_change(),
+            None,
+            "hiding is not a change"
+        );
+        b.define_cursor(None, w, c.as_raw())
+            .expect("define c while hidden");
+        assert_eq!(
+            b.take_displayed_cursor_change().map(|d| d.host_xid),
+            Some(c.as_raw()),
+            "a change while hidden is still reported",
+        );
+        assert_eq!(b.effective_cursor_xid, Some(c.as_raw()));
+        b.set_cursor_hidden(false);
+        assert!(!b.cursor_hidden);
+        assert_eq!(
+            b.take_displayed_cursor_change(),
+            None,
+            "showing is not a change"
+        );
+    }
+
+    /// XFIXES ChangeCursor (Xorg `ReplaceCursor`): every window slot, the
+    /// sticky root default and the grab override naming the old cursor move
+    /// to the new one, and the sprite follows.
+    #[test]
+    fn replace_cursor_rewrites_every_reference() {
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0050).unwrap();
+        let old = b
+            .create_cursor(None, pix, None, (0xFFFF, 0, 0), (0, 0, 0), 0, 0)
+            .expect("old");
+        let new = b
+            .create_cursor(None, pix, None, (0, 0, 0xFFFF), (0, 0, 0), 0, 0)
+            .expect("new");
+        let other = b
+            .create_cursor(None, pix, None, (0, 0xFFFF, 0), (0, 0, 0), 0, 0)
+            .expect("other");
+        let (w1, w2) = (0xBEEF_0003, 0xBEEF_0004);
+        cursor_test_window(&mut b, w1);
+        cursor_test_window(&mut b, w2);
+        b.core.prev_pointer_window = Some(w1);
+        b.define_cursor(None, w1, old.as_raw()).expect("w1 old");
+        b.define_cursor(None, w2, other.as_raw()).expect("w2 other");
+        let root = b.core.window_id;
+        b.define_cursor(None, root, old.as_raw()).expect("root old");
+        b.grab_cursor_override = Some(old.as_raw());
+        let _ = b.take_displayed_cursor_change();
+
+        b.replace_cursor(None, old.as_raw(), new.as_raw())
+            .expect("replace");
+        assert_eq!(b.windows[&w1].cursor, Some(new.as_raw()));
+        assert_eq!(b.windows[&w2].cursor, Some(other.as_raw()), "untouched");
+        assert_eq!(b.core.active_cursor, Some(new.as_raw()));
+        assert_eq!(b.grab_cursor_override, Some(new.as_raw()));
+        assert_eq!(b.effective_cursor_xid, Some(new.as_raw()));
+        assert_eq!(
+            b.take_displayed_cursor_change().map(|d| d.host_xid),
+            Some(new.as_raw())
+        );
     }
 
     /// Effective-cursor walk: a child without its own cursor inherits

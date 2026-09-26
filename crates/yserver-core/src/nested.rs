@@ -58,7 +58,7 @@ pub(crate) const XI2_FIRST_ERROR: u8 = 157;
 
 const XFIXES_MAJOR_OPCODE: u8 = 140;
 pub(crate) const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cursor=88
-const XFIXES_FIRST_ERROR: u8 = 163;
+pub(crate) const XFIXES_FIRST_ERROR: u8 = 163;
 
 const SHAPE_MAJOR_OPCODE: u8 = 141;
 pub(crate) const SHAPE_FIRST_EVENT: u8 = 64; // matches Xorg: ShapeNotify=64

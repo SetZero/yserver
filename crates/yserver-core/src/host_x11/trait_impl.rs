@@ -1116,14 +1116,14 @@ impl Backend for HostX11Backend {
         self.with_active_origin(origin, |this| HostX11Backend::xkb_proxy(this, minor, body))
     }
 
-    fn xfixes_change_cursor_by_name(
+    fn replace_cursor(
         &mut self,
         origin: Option<OriginContext>,
-        host_cursor_xid: u32,
-        name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()> {
         self.with_active_origin(origin, |this| {
-            HostX11Backend::xfixes_change_cursor_by_name(this, host_cursor_xid, name_bytes)
+            HostX11Backend::xfixes_change_cursor(this, new_host_xid, old_host_xid)
         })
     }
 

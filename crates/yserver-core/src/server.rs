@@ -1179,6 +1179,13 @@ pub struct ServerState {
     pub xfixes_selection_masks: HashMap<(u32, ResourceId, AtomId), u32>,
     /// XFIXES cursor event masks: (client, window) -> mask.
     pub xfixes_cursor_masks: HashMap<(u32, ResourceId), u32>,
+    /// XFIXES major version each client negotiated (Xorg
+    /// `XFixesClientRec.major_version`). It gates which requests the
+    /// client may send; a client with no entry has not sent `QueryVersion`.
+    pub xfixes_client_major: HashMap<u32, u32>,
+    /// XFIXES `HideCursor` counts per client (Xorg `CursorHideCountRec`,
+    /// one screen). The sprite is hidden while this map is non-empty.
+    pub xfixes_cursor_hide_counts: HashMap<u32, u32>,
     /// SHAPE state per window. Missing entries mean the default window rectangle.
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
     /// SHAPE select-input state: (client, window) -> enabled.
@@ -1586,6 +1593,8 @@ impl ServerState {
             pointer_barriers: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
             xfixes_cursor_masks: HashMap::new(),
+            xfixes_client_major: HashMap::new(),
+            xfixes_cursor_hide_counts: HashMap::new(),
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
             present_pending_exec: BTreeMap::new(),
@@ -2866,6 +2875,10 @@ impl ServerState {
                 .retain(|(window, _), _| !windows.contains(window));
             client.rebuild_xi1_global_event_classes();
         }
+        // Xorg `CursorFreeWindow`: a destroyed window takes every
+        // client's XFIXES cursor selection on it along.
+        self.xfixes_cursor_masks
+            .retain(|(_, window), _| !windows.contains(window));
     }
 
     pub fn find_passive_grab(

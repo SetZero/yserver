@@ -1069,6 +1069,10 @@ fn process_request_inline(
         }
         backend.mark_dirty();
     }
+    // A request that changed the displayed cursor (DefineCursor, a grab,
+    // XFIXES ChangeCursor, a map under the pointer) reports it before the
+    // client's next request runs, as Xorg does from DisplayCursor.
+    crate::core_loop::process_request::emit_xfixes_cursor_notify(state, backend);
     outcome
 }
 
@@ -1932,6 +1936,9 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
     backend.poll_deferred_input(state);
+
+    // Pointer motion and other input-driven sprite changes.
+    crate::core_loop::process_request::emit_xfixes_cursor_notify(state, backend);
 
     // Drain-before-compose (spec "Loop-order and clock contract" item 1):
     // an entry executed here must be visible to THIS iteration's

@@ -353,6 +353,7 @@ pub fn process_disconnect_reporting(
     state
         .xfixes_cursor_masks
         .retain(|(owner, _), _| *owner != client_id.0);
+    crate::core_loop::process_request::release_xfixes_client_state(state, backend, client_id);
     state
         .shape_windows
         .retain(|window, _| !dead_windows.contains(window));

@@ -124,6 +124,24 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   21.1.24 captures. Known gaps kept: XI1 Set/GetDeviceFocus(3) still use
   their own record rather than the core focus, and slave-keyboard focus
   changes emit XI1 DeviceFocus events but no XI2 FocusIn/Out.
+- **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
+  now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,
+  sticky per-client major) and gates requests on the negotiated major
+  (`ProcXFixesDispatch`: before QueryVersion only QueryVersion is legal).
+  HideCursor/ShowCursor keep per-client counts; the KMS sprite blanks on the
+  first hide anywhere and returns on the last show or the hider's
+  disconnect (scene cursor entry dropped; under direct scanout the legacy
+  plane is detached in place). CursorNotify is sent per (client, window)
+  selection whenever the effective cursor switches, with the serial
+  GetCursorImage reports and the cursor's name; selections die with their
+  window. ChangeCursor/ChangeCursorByName retarget every XID of the old
+  cursor and the backend replaces window, root-default and grab uses
+  (names are kept per host cursor, so a freed-but-displayed cursor still
+  matches); ExpandRegion is real; GetCursorImageAndName reports the name;
+  SetCursorName/GetCursorName/ChangeCursor raise BadCursor. Ground truth:
+  Xvfb 21.1.24 captures with an xcb probe. Known limit: a hidden cursor
+  reads as a software/hidden cursor mode, so fullscreen direct scanout is
+  not entered while a client hides the cursor (content stays correct).
 
 - **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
   branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports

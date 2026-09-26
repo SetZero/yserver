@@ -452,7 +452,7 @@ pub fn process_request(
         // ── COMPOSITE extension dispatcher ──
         144 => handle_composite_request(state, backend, origin, client_id, sequence, header, body),
         // ── XFIXES extension dispatcher ──
-        140 => handle_xfixes_request(state, backend, origin, client_id, sequence, header, body),
+        140 => dispatch_xfixes_request(state, backend, origin, client_id, sequence, header, body),
         // ── SHAPE extension dispatcher ──
         141 => handle_shape_request(state, backend, origin, client_id, sequence, header, body),
         // ── SYNC extension dispatcher ──
@@ -6257,6 +6257,177 @@ fn handle_shape_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcXFixesDispatch`: a client may only use the requests of the
+/// XFIXES major version it negotiated — before its first `QueryVersion`
+/// that is `QueryVersion` alone. Anything else is BadRequest.
+fn dispatch_xfixes_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    let client_major = state
+        .xfixes_client_major
+        .get(&client_id.0)
+        .copied()
+        .unwrap_or(0);
+    if !x11xfixes::request_allowed(client_major, header.data) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(header.data),
+            header.opcode,
+        );
+    }
+    handle_xfixes_request(state, backend, origin, client_id, sequence, header, body)
+}
+
+/// Xorg `VERIFY_CURSOR` for XFIXES: resolve a cursor XID to its host
+/// handle, or send BadCursor naming it. `Err(outcome)` carries the error
+/// already written.
+fn xfixes_verify_cursor(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    cursor: u32,
+) -> Result<Option<u32>, io::Result<RequestOutcome>> {
+    if state.resources.cursor_exists(ResourceId(cursor)) {
+        return Ok(state.resources.cursor_host_xid(ResourceId(cursor)));
+    }
+    Err(emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        x11::error::BAD_CURSOR,
+        cursor,
+        u16::from(header.data),
+        header.opcode,
+    ))
+}
+
+/// Xorg `ReplaceCursor` for XFIXES `ChangeCursor` / `ChangeCursorByName`:
+/// every cursor XID and every displayed use of host cursor `old_host`
+/// switches to `source`'s cursor. Replacing a cursor with itself is a
+/// no-op, and the old host cursor is released once nothing names it.
+fn xfixes_replace_cursor(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    old_host: u32,
+    source: ResourceId,
+) {
+    let Some(new_host) = state.resources.cursor_host_xid(source) else {
+        return;
+    };
+    if old_host == new_host {
+        return;
+    }
+    state.resources.retarget_cursor_host(old_host, source);
+    let _ = backend.replace_cursor(origin, old_host, new_host);
+    if !state.resources.cursor_host_referenced(old_host) {
+        let _ = backend.free_cursor(origin, old_host);
+    }
+}
+
+/// Xorg `ExpandRegion` (`xfixes/region.c`): grow each rectangle of
+/// `source` by the four margins and union the results. Coordinates are
+/// computed wide and clamped to the protocol's 16-bit range.
+fn xfixes_expand_region_rects(
+    source: &[yserver_protocol::x11::xfixes::RegionRect],
+    left: u16,
+    right: u16,
+    top: u16,
+    bottom: u16,
+) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
+    use yserver_protocol::x11::xfixes::RegionRect;
+    let clamp_i16 = |v: i32| {
+        i16::try_from(v.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or_default()
+    };
+    let grown: Vec<RegionRect> = source
+        .iter()
+        .map(|r| {
+            let x1 = i32::from(r.x) - i32::from(left);
+            let y1 = i32::from(r.y) - i32::from(top);
+            let x2 = i32::from(r.x) + i32::from(r.width) + i32::from(right);
+            let y2 = i32::from(r.y) + i32::from(r.height) + i32::from(bottom);
+            let (x1, y1, x2, y2) = (clamp_i16(x1), clamp_i16(y1), clamp_i16(x2), clamp_i16(y2));
+            RegionRect {
+                x: x1,
+                y: y1,
+                width: u16::try_from(i32::from(x2) - i32::from(x1)).unwrap_or(0),
+                height: u16::try_from(i32::from(y2) - i32::from(y1)).unwrap_or(0),
+            }
+        })
+        .collect();
+    grown.iter().fold(Vec::new(), |acc, rect| {
+        crate::nested::union_regions(&acc, &[*rect])
+    })
+}
+
+/// Send XFIXES `DisplayCursorNotify` for a backend-reported sprite change
+/// to every (client, window) that selected it — one event per selection,
+/// as Xorg's `CursorDisplayCursor` walks its `cursorEvents` list. Called
+/// after each request and at the end of each loop iteration.
+pub(crate) fn emit_xfixes_cursor_notify(state: &mut ServerState, backend: &mut dyn Backend) {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    let Some(change) = backend.take_displayed_cursor_change() else {
+        return;
+    };
+    let mut selections: Vec<(u32, u32)> = state
+        .xfixes_cursor_masks
+        .iter()
+        .filter(|(_, mask)| **mask & x11xfixes::DISPLAY_CURSOR_NOTIFY_MASK != 0)
+        .map(|((client, window), _)| (*client, window.0))
+        .collect();
+    if selections.is_empty() {
+        return;
+    }
+    selections.sort_unstable();
+    let name = state
+        .resources
+        .cursor_name_for_host(change.host_xid)
+        .map_or(0, |atom| atom.0);
+    let timestamp = state.timestamp_now();
+    for (client, window) in selections {
+        let _dropped = fanout_event_to_clients(state, &[ClientId(client)], |buf, seq, order| {
+            x11xfixes::encode_cursor_notify_event(
+                buf,
+                order,
+                crate::nested::XFIXES_FIRST_EVENT,
+                seq,
+                window,
+                change.serial,
+                timestamp,
+                name,
+            );
+        });
+    }
+}
+
+/// Drop `client`'s XFIXES per-client state on disconnect. Xorg frees the
+/// client's `CursorHideCountRec` resource, which re-displays the sprite
+/// once no other client holds a hide.
+pub(crate) fn release_xfixes_client_state(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client: ClientId,
+) {
+    state.xfixes_client_major.remove(&client.0);
+    if state.xfixes_cursor_hide_counts.remove(&client.0).is_some()
+        && state.xfixes_cursor_hide_counts.is_empty()
+    {
+        backend.set_cursor_hidden(false);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_xfixes_request(
     state: &mut ServerState,
@@ -6275,16 +6446,43 @@ fn handle_xfixes_request(
     let minor = header.data;
     match minor {
         x11xfixes::QUERY_VERSION => {
+            // Xorg `ProcXFixesQueryVersion`: REQUEST_SIZE_MATCH, then the
+            // lower-of-the-two rule with a sticky per-client major.
+            let Some((client_major, client_minor)) =
+                x11xfixes::parse_query_version(byte_order, body)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            let previous = state
+                .xfixes_client_major
+                .get(&client_id.0)
+                .copied()
+                .unwrap_or(0);
+            let negotiated = x11xfixes::negotiate_version(previous, client_major, client_minor);
+            state
+                .xfixes_client_major
+                .insert(client_id.0, negotiated.client_major);
+            debug!(
+                "client {} #{} XFIXES::QueryVersion client={client_major}.{client_minor} -> {}.{}",
+                client_id.0, sequence.0, negotiated.reply_major, negotiated.reply_minor,
+            );
             let reply = x11xfixes::encode_query_version_reply(
                 byte_order,
                 sequence,
-                x11xfixes::MAJOR_VERSION,
-                x11xfixes::MINOR_VERSION,
+                negotiated.reply_major,
+                negotiated.reply_minor,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::SELECT_SELECTION_INPUT => {
@@ -6326,6 +6524,30 @@ fn handle_xfixes_request(
         }
         x11xfixes::SELECT_CURSOR_INPUT => {
             if let Some(req) = x11xfixes::parse_select_cursor_input(body) {
+                // Xorg `ProcXFixesSelectCursorInput`: window first, then
+                // the mask (captured on Xvfb: BadWindow, BadValue).
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+                if req.event_mask & !x11xfixes::CURSOR_ALL_EVENTS_MASK != 0 {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.event_mask,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
                 let key = (client_id.0, ResourceId(req.window));
                 if req.event_mask == 0 {
                     state.xfixes_cursor_masks.remove(&key);
@@ -6365,26 +6587,31 @@ fn handle_xfixes_request(
         x11xfixes::GET_CURSOR_IMAGE_AND_NAME => {
             // Superset of GetCursorImage (opcode 25). Real X screen
             // recorders (gpu-screen-recorder, …) call this to grab the
-            // cursor; with no reply they block forever in poll().
-            // TODO: plumb the active cursor's name atom through
-            // `ActiveCursorImage`; until then report it as unnamed
-            // (atom 0 / empty name — a valid X state), which is all the
-            // recorders need (they consume the image).
+            // cursor; with no reply they block forever in poll(). The
+            // name is the displayed cursor's XFIXES name (Xorg
+            // `pCursor->name`), empty when it was never named.
             let reply = match backend.get_active_cursor_image() {
-                Some(img) => x11xfixes::encode_get_cursor_image_and_name_reply(
-                    byte_order,
-                    sequence,
-                    img.x,
-                    img.y,
-                    img.width,
-                    img.height,
-                    img.hot_x,
-                    img.hot_y,
-                    img.serial,
-                    0,
-                    &[],
-                    img.bgra_bytes.as_ref(),
-                ),
+                Some(img) => {
+                    let atom = state
+                        .resources
+                        .cursor_name_for_host(img.host_xid)
+                        .unwrap_or(AtomId(0));
+                    let name = state.atoms.name(atom).map(str::as_bytes).unwrap_or(&[]);
+                    x11xfixes::encode_get_cursor_image_and_name_reply(
+                        byte_order,
+                        sequence,
+                        img.x,
+                        img.y,
+                        img.width,
+                        img.height,
+                        img.hot_x,
+                        img.hot_y,
+                        img.serial,
+                        atom.0,
+                        name,
+                        img.bgra_bytes.as_ref(),
+                    )
+                }
                 None => {
                     x11xfixes::encode_get_cursor_image_and_name_empty_reply(byte_order, sequence)
                 }
@@ -7061,11 +7288,99 @@ fn handle_xfixes_request(
                 }
             }
         }
+        x11xfixes::CHANGE_CURSOR => {
+            // Xorg `ProcXFixesChangeCursor`: both cursors must exist
+            // (source checked first), then every use of `destination` —
+            // its XIDs, window cursors, grabs — becomes `source`.
+            let Some((source, destination)) = x11xfixes::parse_change_cursor(byte_order, body)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            if let Err(outcome) = xfixes_verify_cursor(state, client_id, sequence, header, source) {
+                return outcome;
+            }
+            let dest_host =
+                match xfixes_verify_cursor(state, client_id, sequence, header, destination) {
+                    Ok(host) => host,
+                    Err(outcome) => return outcome,
+                };
+            if let Some(dest_host) = dest_host {
+                xfixes_replace_cursor(state, backend, origin, dest_host, ResourceId(source));
+            }
+        }
         x11xfixes::CHANGE_CURSOR_BY_NAME => {
+            // Xorg `ProcXFixesChangeCursorByName`: the source must exist;
+            // a name that was never interned matches nothing (MakeAtom
+            // with create=FALSE) and succeeds silently.
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_change_cursor_by_name(body) {
-                let host_cursor = state.resources.cursor_host_xid(ResourceId(cursor_xid));
-                if let Some(host_cursor) = host_cursor {
-                    let _ = backend.xfixes_change_cursor_by_name(origin, host_cursor, name_bytes);
+                if let Err(outcome) =
+                    xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+                {
+                    return outcome;
+                }
+                let name = std::str::from_utf8(name_bytes).unwrap_or("");
+                let atom = state.atoms.intern(name, true);
+                if atom.0 != 0 {
+                    for host in state.resources.cursor_hosts_named(atom) {
+                        xfixes_replace_cursor(state, backend, origin, host, ResourceId(cursor_xid));
+                    }
+                }
+            }
+        }
+        x11xfixes::EXPAND_REGION => {
+            let Some(req) = x11xfixes::parse_expand_region(byte_order, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            // VERIFY_REGION source then destination: XFixes BadRegion
+            // (error base + 0).
+            for region in [req.source, req.destination] {
+                if !state.xfixes_regions.contains_key(&region) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        crate::nested::XFIXES_FIRST_ERROR,
+                        region,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+            }
+            let source = state.xfixes_regions[&req.source].rects.clone();
+            // An empty source leaves the destination untouched (Xorg only
+            // rewrites it inside `if (nBoxes)`; confirmed on Xvfb).
+            if !source.is_empty() {
+                let rects =
+                    xfixes_expand_region_rects(&source, req.left, req.right, req.top, req.bottom);
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "ExpandRegion src=0x{:08x} dst=0x{:08x} l={} r={} t={} b={} rects{}",
+                    req.source,
+                    req.destination,
+                    req.left,
+                    req.right,
+                    req.top,
+                    req.bottom,
+                    format_region_rects(&rects),
+                );
+                if let Some(dest) = state.xfixes_regions.get_mut(&req.destination) {
+                    dest.rects = rects;
                 }
             }
         }
@@ -7076,6 +7391,11 @@ fn handle_xfixes_request(
             // GetCursorName can read it back. yserver mirrors the same
             // shape: intern, store on `Cursor.name_atom`.
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_set_cursor_name(body) {
+                if let Err(outcome) =
+                    xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+                {
+                    return outcome;
+                }
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, false);
                 state
@@ -7101,6 +7421,11 @@ fn handle_xfixes_request(
                 .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                 .unwrap_or(0);
+            if let Err(outcome) =
+                xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+            {
+                return outcome;
+            }
             let atom = state
                 .resources
                 .cursor_name_atom(ResourceId(cursor_xid))
@@ -7121,15 +7446,74 @@ fn handle_xfixes_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
+            // Xorg `ProcXFixesHideCursor` / `ProcXFixesShowCursor`: the
+            // window only names the screen (one here); the hide count is
+            // per client. The sprite hides on the first count anywhere and
+            // returns when the last one goes (ShowCursor to zero, or the
+            // client disconnecting).
+            let Some(window) = x11xfixes::parse_window(byte_order, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            if minor == x11xfixes::HIDE_CURSOR {
+                let was_visible = state.xfixes_cursor_hide_counts.is_empty();
+                *state
+                    .xfixes_cursor_hide_counts
+                    .entry(client_id.0)
+                    .or_insert(0) += 1;
+                if was_visible {
+                    backend.set_cursor_hidden(true);
+                }
+            } else {
+                // Showing without a prior hide is BadMatch (Xvfb: error 8,
+                // value = the window).
+                let Some(count) = state.xfixes_cursor_hide_counts.get_mut(&client_id.0) else {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        window,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                };
+                *count -= 1;
+                if *count == 0 {
+                    state.xfixes_cursor_hide_counts.remove(&client_id.0);
+                    if state.xfixes_cursor_hide_counts.is_empty() {
+                        backend.set_cursor_hidden(false);
+                    }
+                }
+            }
             debug!(
-                "client {} #{} XFIXES::{}Cursor (stub)",
+                "client {} #{} XFIXES::{}Cursor window=0x{window:x} hide_counts={:?}",
                 client_id.0,
                 sequence.0,
                 if minor == x11xfixes::HIDE_CURSOR {
                     "Hide"
                 } else {
                     "Show"
-                }
+                },
+                state.xfixes_cursor_hide_counts,
             );
         }
         other if other > x11xfixes::DELETE_POINTER_BARRIER => {
@@ -7144,8 +7528,10 @@ fn handle_xfixes_request(
             );
         }
         other => {
+            // Every 5.0 request has an arm above; the gate in
+            // `dispatch_xfixes_request` keeps higher minors out.
             debug!(
-                "client {} #{} XFIXES::known unsupported minor={}",
+                "client {} #{} XFIXES::unexpected minor={}",
                 client_id.0, sequence.0, other
             );
         }
@@ -8813,7 +9199,14 @@ fn handle_xtest_request(
                     header.opcode,
                 );
             };
-            let same = effective_window_cursor(state, window) == comparison;
+            // Xorg compares cursor objects: after XFIXES ChangeCursor two
+            // XIDs can name the same cursor, so compare their host handles.
+            let effective = effective_window_cursor(state, window);
+            let same = effective == comparison
+                || matches!((effective, comparison), (Some(a), Some(b))
+                    if state.resources.cursor_host_xid(a).is_some()
+                        && state.resources.cursor_host_xid(a)
+                            == state.resources.cursor_host_xid(b));
             debug!(
                 "client {} #{} XTEST::CompareCursor window=0x{:x} cursor=0x{:x} same={same}",
                 client_id.0, sequence.0, window.0, cursor.0,
@@ -59173,6 +59566,593 @@ mod tests {
         assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
     }
 
+    /// One XFIXES request through the real dispatcher (version gate
+    /// included), little-endian body.
+    fn xfixes_req(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("xfixes request");
+    }
+
+    fn xfixes_u32s(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Split queued 32-byte packets (errors, events, fixed replies).
+    fn wire_packets(peer: &mut UnixStream) -> Vec<[u8; 32]> {
+        read_all_available(peer)
+            .chunks_exact(32)
+            .map(|c| <[u8; 32]>::try_from(c).unwrap())
+            .collect()
+    }
+
+    fn le_u32(p: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(p[at..at + 4].try_into().unwrap())
+    }
+
+    /// Error packet → (code, bad value, minor, major).
+    fn error_fields(p: &[u8; 32]) -> (u8, u32, u16, u8) {
+        assert_eq!(p[0], 0, "expected an error packet, got type {}", p[0]);
+        (p[1], le_u32(p, 4), u16::from_le_bytes([p[8], p[9]]), p[10])
+    }
+
+    /// QueryVersion follows Xorg's rule and gates requests on the
+    /// negotiated major. Ground truth: Xorg 21.1.24 Xvfb, raw xcb probe —
+    /// HideCursor before QueryVersion is BadRequest (major 138 there,
+    /// minor 29, value 0); 4.0 → 4.0; then 2.0 → 2.0 while HideCursor
+    /// still succeeds and DeletePointerBarrier (a 5.0 request) is
+    /// BadRequest; 7.0 is capped at the server version.
+    #[test]
+    fn xfixes_query_version_negotiates_and_gates_requests() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_REQUEST, 0, 29, XFIXES_MAJOR_OPCODE)
+        );
+        assert!(state.xfixes_cursor_hide_counts.is_empty());
+
+        let query = |state: &mut ServerState,
+                     backend: &mut RecordingBackend,
+                     peer: &mut UnixStream,
+                     major: u32,
+                     minor: u32| {
+            xfixes_req(
+                state,
+                backend,
+                1,
+                x11xfixes::QUERY_VERSION,
+                &xfixes_u32s(&[major, minor]),
+            );
+            let packets = wire_packets(peer);
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0][0], 1, "reply");
+            (le_u32(&packets[0], 8), le_u32(&packets[0], 12))
+        };
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 4, 0), (4, 0));
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 2, 0), (2, 0));
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert!(wire_packets(&mut peer).is_empty(), "4.0 request set kept");
+        assert_eq!(state.xfixes_cursor_hide_counts.get(&1), Some(&1));
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::DELETE_POINTER_BARRIER,
+            &xfixes_u32s(&[0x1234]),
+        );
+        let packets = wire_packets(&mut peer);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_REQUEST, 0, 32, XFIXES_MAJOR_OPCODE)
+        );
+
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 7, 0), (5, 0));
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 3, 7), (3, 7));
+    }
+
+    /// Hide/Show counting, captured on Xvfb: bad window → BadWindow (value
+    /// = window) for both; ShowCursor without a hide → BadMatch (value =
+    /// window); two hides need two shows and a third show is BadMatch.
+    /// Across clients the sprite hides on the first hide anywhere and
+    /// comes back when the last hider shows or disconnects.
+    #[test]
+    fn xfixes_hide_show_cursor_counts_per_client() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        state.xfixes_client_major.insert(1, 5);
+        state.xfixes_client_major.insert(2, 5);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+        let hidden_calls = |backend: &RecordingBackend| -> Vec<bool> {
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|c| match c {
+                    RecordedCall::SetCursorHidden(h) => Some(*h),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        for minor in [x11xfixes::HIDE_CURSOR, x11xfixes::SHOW_CURSOR] {
+            xfixes_req(
+                &mut state,
+                &mut backend,
+                1,
+                minor,
+                &xfixes_u32s(&[0x0bad_bad0]),
+            );
+            let packets = wire_packets(&mut peer1);
+            assert_eq!(
+                error_fields(&packets[0]),
+                (
+                    x11::error::BAD_WINDOW,
+                    0x0bad_bad0,
+                    u16::from(minor),
+                    XFIXES_MAJOR_OPCODE
+                )
+            );
+        }
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_MATCH, root, 30, XFIXES_MAJOR_OPCODE)
+        );
+        assert!(hidden_calls(&backend).is_empty());
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            2,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert_eq!(
+            hidden_calls(&backend),
+            vec![true],
+            "one edge for three hides"
+        );
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert!(wire_packets(&mut peer1).is_empty());
+        assert_eq!(hidden_calls(&backend), vec![true], "client 2 still hides");
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_MATCH, root, 30, XFIXES_MAJOR_OPCODE)
+        );
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+        );
+        assert_eq!(
+            hidden_calls(&backend),
+            vec![true, false],
+            "disconnect shows"
+        );
+        assert!(state.xfixes_cursor_hide_counts.is_empty());
+        assert!(!state.xfixes_client_major.contains_key(&2));
+    }
+
+    /// CursorNotify fan-out, per the Xvfb capture: one event per
+    /// (client, window) selection carrying that window, the cursor serial
+    /// and its name atom; a destroyed window's selection is gone; bad mask
+    /// → BadValue, bad window → BadWindow.
+    #[test]
+    fn xfixes_cursor_notify_goes_to_each_selection() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const CHILD: u32 = 0x0040_0001;
+        const CURSOR: u32 = 0x0040_0010;
+        const HOST: u32 = 0x0001_0077;
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
+        state.xfixes_client_major.insert(1, 5);
+        state.xfixes_client_major.insert(2, 5);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+        create_present_test_window(&mut state, CHILD, 0, 0, 10, 10);
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(CURSOR));
+        state.resources.set_cursor_host_xid(
+            ResourceId(CURSOR),
+            crate::backend::CursorHandle::from_raw(HOST).unwrap(),
+        );
+        let name = state.atoms.intern("bname", false);
+        state
+            .resources
+            .set_cursor_name_atom(ResourceId(CURSOR), name);
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[root, 2]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer1)[0]),
+            (x11::error::BAD_VALUE, 2, 3, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[0x0bad_bad0, 1]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer1)[0]),
+            (x11::error::BAD_WINDOW, 0x0bad_bad0, 3, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[root, 1]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[CHILD, 1]),
+        );
+        assert!(wire_packets(&mut peer1).is_empty());
+
+        backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
+            host_xid: HOST,
+            serial: 3,
+        });
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        let events = wire_packets(&mut peer1);
+        assert_eq!(events.len(), 2, "one per selection");
+        let mut windows = Vec::new();
+        for e in &events {
+            assert_eq!(e[0], crate::nested::XFIXES_FIRST_EVENT + 1);
+            assert_eq!(e[1], x11xfixes::DISPLAY_CURSOR_NOTIFY);
+            windows.push(le_u32(e, 4));
+            assert_eq!(le_u32(e, 8), 3, "serial");
+            assert_eq!(le_u32(e, 16), name.0, "name atom");
+        }
+        windows.sort_unstable();
+        assert_eq!(windows, vec![root, CHILD]);
+        assert!(
+            wire_packets(&mut peer2).is_empty(),
+            "client 2 never selected"
+        );
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        assert!(
+            wire_packets(&mut peer1).is_empty(),
+            "the report is consumed"
+        );
+
+        // Destroying the child drops its selection (Xorg CursorFreeWindow).
+        destroy_window_subtree(&mut state, &mut backend, None, ResourceId(CHILD));
+        backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
+            host_xid: 0x0001_0099,
+            serial: 1,
+        });
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        let events = wire_packets(&mut peer1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(le_u32(&events[0], 4), root);
+        assert_eq!(le_u32(&events[0], 16), 0, "unnamed cursor");
+    }
+
+    /// ChangeCursor: every XID of the destination cursor now names the
+    /// source cursor, and the backend replaces its displayed uses. Xvfb:
+    /// bad source / bad destination → BadCursor naming it.
+    #[test]
+    fn xfixes_change_cursor_retargets_cursor_and_backend() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const A: u32 = 0x0040_0020;
+        const D: u32 = 0x0040_0021;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        for (xid, host) in [(A, 0x0001_0010), (D, 0x0001_0020)] {
+            state.resources.create_cursor(ClientId(1), ResourceId(xid));
+            state.resources.set_cursor_host_xid(
+                ResourceId(xid),
+                crate::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[0x0bad_bad0, A]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer)[0]),
+            (x11::error::BAD_CURSOR, 0x0bad_bad0, 26, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[D, 0x0bad_bad0]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer)[0]),
+            (x11::error::BAD_CURSOR, 0x0bad_bad0, 26, XFIXES_MAJOR_OPCODE)
+        );
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[D, A]),
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+        assert_eq!(
+            state.resources.cursor_host_xid(ResourceId(A)),
+            Some(0x0001_0020)
+        );
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(calls.contains(&RecordedCall::ReplaceCursor {
+            old_host_xid: 0x0001_0010,
+            new_host_xid: 0x0001_0020,
+        }));
+        // A and D now share one host cursor: freeing one XID must not free it.
+        assert_eq!(state.resources.free_cursor(ResourceId(A)), None);
+        assert_eq!(
+            state.resources.free_cursor(ResourceId(D)),
+            Some(0x0001_0020)
+        );
+    }
+
+    /// ChangeCursorByName matches the cursor object's name even after the
+    /// client freed its XID (the window still shows it); a name nobody
+    /// interned matches nothing and is not an error (Xvfb: OK).
+    #[test]
+    fn xfixes_change_cursor_by_name_replaces_named_cursors() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const A: u32 = 0x0040_0030;
+        const B: u32 = 0x0040_0031;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        for (xid, host) in [(A, 0x0001_0030), (B, 0x0001_0031)] {
+            state.resources.create_cursor(ClientId(1), ResourceId(xid));
+            state.resources.set_cursor_host_xid(
+                ResourceId(xid),
+                crate::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+        let name = state.atoms.intern("bname", false);
+        state.resources.set_cursor_name_atom(ResourceId(B), name);
+        let _ = state.resources.free_cursor(ResourceId(B));
+
+        let by_name = |name: &[u8]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&A.to_le_bytes());
+            body.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(name);
+            body.resize(body.len().div_ceil(4) * 4, 0);
+            body
+        };
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR_BY_NAME,
+            &by_name(b"zzznoname"),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR_BY_NAME,
+            &by_name(b"bname"),
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+        let replaces: Vec<RecordedCall> = backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ReplaceCursor { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            replaces,
+            vec![RecordedCall::ReplaceCursor {
+                old_host_xid: 0x0001_0031,
+                new_host_xid: 0x0001_0030,
+            }]
+        );
+        assert_eq!(state.resources.cursor_name_for_host(0x0001_0031), None);
+    }
+
+    /// ExpandRegion against Xvfb: {(10,10 5x5),(30,30 5x5)} expanded by
+    /// l1 r2 t3 b4 → {(9,7 8x12),(29,27 8x12)}; by l20 r20 → the
+    /// overlapping boxes are unioned into {(-10,10 45x5),(10,30 45x5)}; an
+    /// empty source leaves the destination as it was; bad source or
+    /// destination → XFixes BadRegion (error base + 0) naming it.
+    #[test]
+    fn xfixes_expand_region_matches_xvfb() {
+        use yserver_protocol::x11::xfixes::{self as x11xfixes, RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        let rect = |x, y, width, height| RegionRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let region = |rects| crate::server::XFixesRegion {
+            owner: ClientId(1),
+            rects,
+        };
+        state
+            .xfixes_regions
+            .insert(0x10, region(vec![rect(10, 10, 5, 5), rect(30, 30, 5, 5)]));
+        state
+            .xfixes_regions
+            .insert(0x11, region(vec![rect(100, 100, 7, 7)]));
+        state.xfixes_regions.insert(0x12, region(Vec::new()));
+        let expand = |src: u32, dst: u32, l: u16, r: u16, t: u16, b: u16| {
+            let mut body = xfixes_u32s(&[src, dst]);
+            for v in [l, r, t, b] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body
+        };
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x10, 0x11, 1, 2, 3, 4),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(9, 7, 8, 12), rect(29, 27, 8, 12)]
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x10, 0x11, 20, 20, 0, 0),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x12, 0x11, 1, 1, 1, 1),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+
+        for (src, dst) in [(0x0bad_bad0, 0x11), (0x10, 0x0bad_bad0)] {
+            xfixes_req(
+                &mut state,
+                &mut backend,
+                1,
+                x11xfixes::EXPAND_REGION,
+                &expand(src, dst, 1, 1, 1, 1),
+            );
+            assert_eq!(
+                error_fields(&wire_packets(&mut peer)[0]),
+                (
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    0x0bad_bad0,
+                    28,
+                    XFIXES_MAJOR_OPCODE
+                )
+            );
+        }
+    }
+
     fn xfixes_create_barrier(
         state: &mut ServerState,
         client: ClientId,
@@ -61110,6 +62090,8 @@ mod tests {
         body.extend_from_slice(&0x10u32.to_le_bytes());
         body.extend_from_slice(&0x11u32.to_le_bytes());
         body.extend_from_slice(&0x12u32.to_le_bytes());
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(1, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -62862,6 +63844,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&PICTURE_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -62914,6 +63898,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&UNKNOWN_PIC.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -62967,6 +63953,8 @@ mod tests {
         body.push(0); // kind = Bounding (valid)
         body.extend_from_slice(&[0u8; 3]);
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -63045,6 +64033,8 @@ mod tests {
         body.push(INVALID_KIND);
         body.extend_from_slice(&[0u8; 3]);
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -63115,6 +64105,8 @@ mod tests {
         let mut body = Vec::with_capacity(4);
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -63252,6 +64244,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&GC_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -63385,6 +64379,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&GC_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -63445,6 +64441,8 @@ mod tests {
         body.extend_from_slice(&PRIMARY.to_le_bytes());
         body.extend_from_slice(&x11xfixes::SELECTION_MASK_SET_OWNER.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(CLIENT, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -63518,6 +64516,8 @@ mod tests {
         body.extend_from_slice(&PRIMARY.to_le_bytes());
         body.extend_from_slice(&ILLEGAL_MASK.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(CLIENT, 5);
         process_request(
             &mut state,
             &mut backend,

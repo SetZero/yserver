@@ -149,6 +149,11 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    ReplaceCursor {
+        old_host_xid: u32,
+        new_host_xid: u32,
+    },
+    SetCursorHidden(bool),
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
@@ -234,6 +239,10 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
+    /// Queued "the sprite now shows this cursor" report handed out by
+    /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
+    /// sprite change.
+    pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -519,6 +528,7 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            displayed_cursor_change: None,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -2170,13 +2180,25 @@ impl Backend for RecordingBackend {
         Ok(None)
     }
 
-    fn xfixes_change_cursor_by_name(
+    fn replace_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_cursor_xid: u32,
-        _name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::ReplaceCursor {
+            old_host_xid,
+            new_host_xid,
+        });
         Ok(())
+    }
+
+    fn set_cursor_hidden(&mut self, hidden: bool) {
+        self.record(RecordedCall::SetCursorHidden(hidden));
+    }
+
+    fn take_displayed_cursor_change(&mut self) -> Option<crate::backend::DisplayedCursor> {
+        self.displayed_cursor_change.take()
     }
 
     fn set_shape_rectangles(

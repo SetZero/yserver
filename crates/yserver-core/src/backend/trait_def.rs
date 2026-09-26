@@ -136,6 +136,9 @@ pub use crate::host_x11::HostSocketStatus;
 /// encoder premultiplies + byte-swaps at the wire boundary.
 #[derive(Debug, Clone)]
 pub struct ActiveCursorImage {
+    /// Host handle of the displayed cursor (the core maps it to the
+    /// cursor's XFIXES name).
+    pub host_xid: u32,
     pub width: u16,
     pub height: u16,
     pub hot_x: u16,
@@ -147,6 +150,19 @@ pub struct ActiveCursorImage {
     /// changes. Backed by `Arc<CursorRecord>.version` in v2.
     pub serial: u32,
     pub bgra_bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// The cursor the backend's sprite now shows after a change, reported
+/// through `Backend::take_displayed_cursor_change` so the core can send
+/// XFIXES `CursorNotify`. This is the cursor the pointer *should* show —
+/// an XFIXES `HideCursor` does not change it (Xorg `CursorDisplayCursor`
+/// compares the requested cursor, not the blanked one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayedCursor {
+    /// Host handle of the cursor, as stored in the core's cursor table.
+    pub host_xid: u32,
+    /// Same serial `get_active_cursor_image` reports for this cursor.
+    pub serial: u32,
 }
 
 /// Present capability surface. Phase 4.2 design §4. Per-window
@@ -2708,12 +2724,33 @@ pub trait Backend {
         None
     }
 
-    fn xfixes_change_cursor_by_name(
+    /// XFIXES `ChangeCursor` / `ChangeCursorByName` (Xorg `ReplaceCursor`):
+    /// every place that displays host cursor `old_host_xid` — window cursor
+    /// attributes, the root's default, an active grab's cursor — now uses
+    /// `new_host_xid`, and the sprite refreshes if it showed the old one.
+    /// The core resolves names and cursor ids; the backend only ever sees
+    /// host handles.
+    fn replace_cursor(
         &mut self,
         origin: Option<OriginContext>,
-        host_cursor_xid: u32,
-        name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()>;
+
+    /// XFIXES `HideCursor` / `ShowCursor`: blank (`true`) or restore
+    /// (`false`) the sprite while leaving the effective cursor, and so
+    /// `GetCursorImage` and `CursorNotify`, unchanged. The core only calls
+    /// this on the edges: the first hide by any client and the last show.
+    /// Default no-op for backends that draw no sprite of their own.
+    fn set_cursor_hidden(&mut self, _hidden: bool) {}
+
+    /// Take the pending "the effective cursor changed" report, if the sprite
+    /// switched to a different cursor since the last call. Drained by the
+    /// core after every request and loop iteration to send XFIXES
+    /// `CursorNotify`. Default `None` for backends that track no sprite.
+    fn take_displayed_cursor_change(&mut self) -> Option<DisplayedCursor> {
+        None
+    }
 
     /// Stage 5 unblock — XFIXES `GetCursorImage` data source for the
     /// active on-screen cursor. Returns the straight-alpha BGRA
