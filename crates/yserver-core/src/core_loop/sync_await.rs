@@ -7,8 +7,10 @@
 //! `IgnoreClient`) while every other client keeps running. The await ends
 //! when one of its triggers fires: a counter changes (`SetCounter`,
 //! `ChangeCounter`, the SERVERTIME / IDLETIME system counters advancing),
-//! a fence triggers (`TriggerFence`, a Present idle fence), or a counter or
-//! fence it names is destroyed. Firing sends the `CounterNotify` events
+//! a fence triggers (`TriggerFence`, or a Present idle fence the server
+//! triggers — which Xorg's `present_fence_set_triggered` does without
+//! waking awaits; yserver wakes them rather than leave the client
+//! suspended), or a counter or fence it names is destroyed. Firing sends the `CounterNotify` events
 //! Xorg's `SyncAwaitTriggerFired` would and removes the entry, which makes
 //! the client runnable again (`AttendClient`). Nothing here ever blocks the
 //! loop itself.

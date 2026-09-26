@@ -61047,9 +61047,11 @@ mod tests {
         );
     }
 
-    /// A Present idle fence triggered by the server (Xorg
-    /// `present_fence_set_triggered` → `miSyncTriggerFence`) wakes an
-    /// AwaitFence on it.
+    /// A Present idle fence triggered by the server wakes an AwaitFence on
+    /// it. A deliberate difference from Xorg: `present_fence_set_triggered`
+    /// only calls the fence's `SetTriggered`, not `miSyncTriggerFence`, so
+    /// on Xorg such an await is only re-checked by a TriggerFence request
+    /// or the fence's destruction and would otherwise stay suspended.
     #[test]
     fn sync_await_fence_wakes_on_server_side_trigger() {
         use yserver_protocol::x11::sync as s;
