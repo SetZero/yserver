@@ -107,7 +107,7 @@ struct DeliveredPress {
     core_mask: u32,
     /// Merged XI2 selection of ALL clients on `window`, snapshot at
     /// delivery (Xorg xi2mask_merge of the window's masks); 0 for core.
-    xi2_mask: u32,
+    xi2_mask: u64,
 }
 
 #[derive(Default)]
@@ -930,7 +930,11 @@ fn pointer_event_fanout_to_state_inner(
             via_xi2: grab.via_xi2,
             implicit: false,
             passive: true,
-            xi2_mask: if grab.via_xi2 { grab.event_mask } else { 0 },
+            xi2_mask: if grab.via_xi2 {
+                u64::from(grab.event_mask)
+            } else {
+                0
+            },
         });
 
         // Xorg `ActivatePointerGrab` → `DoEnterLeaveEvents(sprite →
@@ -1415,9 +1419,9 @@ fn pointer_event_fanout_to_state_inner(
                 // xi2mask_merge, events.c:2183-2189) — an implicit owner
                 // that never selected XI_Motion must not start receiving
                 // motion for the duration of every click. Explicit
-                // XIGrabDevice grabs carry u32::MAX (wire mask not parsed
+                // XIGrabDevice grabs carry u64::MAX (wire mask not parsed
                 // — pre-existing permissive delivery, unchanged).
-                let grab_xi2_mask = state.active_pointer_grab.map_or(u32::MAX, |g| g.xi2_mask);
+                let grab_xi2_mask = state.active_pointer_grab.map_or(u64::MAX, |g| g.xi2_mask);
                 if grab_xi2_mask & (1 << xi2_evtype) != 0 {
                     xi2_targets.push(grab_client);
                     nested_id = grab_window;
@@ -1728,7 +1732,7 @@ fn pointer_event_fanout_to_state_inner(
                 // the only path that can install. Merge every client's mask
                 // on this form's event window, as Xorg ActivateImplicitGrab
                 // does with the window's XI2 mask.
-                let merged: u32 = state
+                let merged: u64 = state
                     .clients
                     .values()
                     .map(|c| {
@@ -1740,9 +1744,9 @@ fn pointer_event_fanout_to_state_inner(
                         ]
                         .iter()
                         .filter_map(|d| c.xi2_masks.get(&(ev_win, *d)))
-                        .fold(0u32, |m, v| m | v)
+                        .fold(0u64, |m, v| m | v)
                     })
-                    .fold(0u32, |m, v| m | v);
+                    .fold(0u64, |m, v| m | v);
                 info.consider_xi2_press(
                     &state.resources,
                     DeliveredPress {
@@ -2910,7 +2914,7 @@ fn xi2_form_selected_on(
         Xi2PointerForm::Slave => &[XI2_SLAVE_POINTER_DEVICE_ID, 0],
         Xi2PointerForm::Master => &[XI2_MASTER_POINTER_DEVICE_ID, 1, 0],
     };
-    let bit = 1u32 << evtype;
+    let bit = 1u64 << evtype;
     devices.iter().any(|device| {
         client
             .xi2_masks
@@ -3512,7 +3516,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         let mut xid_map = HostXidMap::new();
@@ -5498,9 +5502,13 @@ mod tests {
                 counter: x11sync::IDLETIME_DEVICE_VCP,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: false,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         let xid_map = HostXidMap::new();
@@ -5548,9 +5556,13 @@ mod tests {
                 counter: x11sync::IDLETIME_DEVICE_VCP,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: true, // load-bearing
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         let xid_map = HostXidMap::new();
@@ -5609,26 +5621,22 @@ mod tests {
         let win = ResourceId(0x10_0009);
         const XI_BUTTON_PRESS_MASK: u32 = 1 << 4;
         // client 1: slave-pointer selection (Enlightenment's pattern).
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((win, XI2_SLAVE_POINTER_DEVICE_ID), XI_BUTTON_PRESS_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (win, XI2_SLAVE_POINTER_DEVICE_ID),
+            u64::from(XI_BUTTON_PRESS_MASK),
+        );
         // client 2: master-pointer selection (Chromium's pattern).
-        state
-            .clients
-            .get_mut(&2)
-            .unwrap()
-            .xi2_masks
-            .insert((win, XI2_MASTER_POINTER_DEVICE_ID), XI_BUTTON_PRESS_MASK);
+        state.clients.get_mut(&2).unwrap().xi2_masks.insert(
+            (win, XI2_MASTER_POINTER_DEVICE_ID),
+            u64::from(XI_BUTTON_PRESS_MASK),
+        );
         // client 3: XIAllMasterDevices (1) wildcard.
         state
             .clients
             .get_mut(&3)
             .unwrap()
             .xi2_masks
-            .insert((win, 1), XI_BUTTON_PRESS_MASK);
+            .insert((win, 1), u64::from(XI_BUTTON_PRESS_MASK));
         // client 4: no XI2 selection at all.
 
         assert_eq!(
@@ -5674,7 +5682,7 @@ mod tests {
             .get_mut(&11)
             .unwrap()
             .xi2_masks
-            .insert((window, 1u16), 0x381c_00c0u32);
+            .insert((window, 1u16), 0x381c_00c0u64);
         // XIAllDevices(0): DeviceChanged(1)+ButtonPress(4)+ButtonRelease(5)+
         // Motion(6)+Enter(7)+Leave(8)+Hierarchy(11)+Property(12).
         state
@@ -5682,7 +5690,7 @@ mod tests {
             .get_mut(&11)
             .unwrap()
             .xi2_masks
-            .insert((window, 0u16), 0x19f2u32);
+            .insert((window, 0u16), 0x19f2u64);
 
         // XI_ButtonPress (4) is selected ONLY under XIAllDevices(0). Under
         // the old first-match semantics device 1 matched first and had no
@@ -5731,7 +5739,7 @@ mod tests {
             let client = state.clients.get_mut(&11).unwrap();
             client.xi2_masks.clear();
             for &(dev, mask) in masks {
-                client.xi2_masks.insert((win, dev), mask);
+                client.xi2_masks.insert((win, dev), u64::from(mask));
             }
         };
 

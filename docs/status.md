@@ -59,6 +59,136 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   instead of a press with `XIKeyRepeat`; `XIGrabDevice(keyboard)` sends the
   grabber unselected XI_FocusIn/Out; XIQueryVersion replies do not follow
   Xorg's stored version / BadValue.
+- **2026-09-26 GLX 1.0 pixmaps, QueryContext and IsDirect as Xorg answers
+  them (extension audit §6):** `CreateGLXPixmap` (13) and `DestroyGLXPixmap`
+  (15) used to fall into the `GLXBadRenderRequest` catch-all, so an app
+  calling `glXCreateGLXPixmap` (mesa sends 13 even for direct contexts) was
+  killed by Xlib's default error handler. Both now follow Xorg's GLXVND stub
+  and `DoCreateGLXPixmap` / `DoDestroyDrawable`: the same errors, bad values
+  and check order as Xvfb 21.1.24, and the same GLXPixmap record and export
+  ref as GLX 1.3 `CreatePixmap`, so TFP is untouched. A GLX 1.0 pixmap
+  reports `GLX_TEXTURE_RECTANGLE_EXT`, as on Xorg. `QueryContext` answers
+  Xorg's five attributes from a context record that now keeps the screen,
+  visual, FBConfig, render type, share list and isDirect (CreateNewContext
+  used to store the screen as the render type). `IsDirect` answers the
+  recorded flag, and both answer GLXBadContext for an XID that is not a
+  context. `GLX_EXT_import_context` is no longer advertised: Xorg lists it
+  only with `+iglx`, and yserver has no indirect GLX. Open, not changed
+  here: yserver accepts `isDirect=0` contexts, which Xorg refuses with
+  BadValue by default. It always reports `GLX_TEXTURE_2D_EXT` for windows,
+  pbuffers, SGIX pixmaps and NPOT GLX 1.3 pixmaps, where Xorg says
+  RECTANGLE; left alone because Compiz picks its TFP target from this
+  reply. A GLX pixmap whose X pixmap was freed reports 0×0, where Xorg
+  still reports the pixmap's size. GLX requests from big-endian clients are
+  not byte-swapped.
+- **2026-09-26 reply byte order: GE, MIT-SHM, XKB (extension audit §7/§8):**
+  GE QueryVersion writes major/minor in the client's byte order (a big-endian
+  client read 256.0). MIT-SHM QueryVersion reports the server's euid/egid and
+  pixmapFormat 0 without shared pixmaps, as `ProcShmQueryVersion`. XKB stays
+  little-endian only (request parsers and reply encoders), so big-endian
+  clients are now refused the Xorg way instead of getting little-endian
+  replies with a mangled sequence number: XkbUseExtension answers
+  supported=False in the client's byte order (byte-for-byte Xvfb's
+  big-endian refusal), and every other XKB request is then BadAccess, as for
+  any client that isn't XKB-initialised; Xlib and xkbcommon-x11 fall back to
+  the core keyboard protocol. The UseExtension reply is built by the core
+  loop; backend XKB replies get their sequence number in the client's byte
+  order. Still little-endian only for big-endian clients: the XI
+  XIQueryDevice/DeviceChanged class blocks and the XTEST/DPMS/
+  MIT-SCREEN-SAVER/X-Resource request parsers (audit §8 project).
+
+- **2026-09-26 XI 2.0 XIWarpPointer / XISetFocus / XIChangeHierarchy (extension
+  audit §1):** the three XI minors that fell into a silent catch-all now
+  answer as Xorg does, and the catch-all is gone — every minor outside 1..=61
+  is BadRequest, like `ProcIDispatch`. **XIWarpPointer** runs the core warp
+  path (now shared: dst-before-src BadWindow, Xorg's source-rectangle test
+  with inclusive edges and `PointInWindowIsVisible`, clamp to the screen,
+  barrier bypass, `warp_pointer_root` motion/crossing) for the master pointer
+  only (anything else BadDevice, errorValue = id); FP16.16 coordinates
+  truncate toward zero, and the XI source test keeps Xorg's slip (right edge
+  compared against 0). Core WarpPointer picked up the same Xorg-exact source
+  test (it had exclusive right/bottom edges and no visibility check).
+  **XISetFocus** on the master keyboard is core SetInputFocus with
+  RevertToParent (core + XI2 focus events); on the slave keyboard it sets
+  that device's own focus; pointers/unknown ids BadDevice (errorValue 0).
+  FollowKeyboard on the master keyboard → BadValue (Xvfb segfaults on it).
+  **XIGetFocus(3)** now reads the core focus; pointers are BadDevice.
+  **XIChangeHierarchy** walks the change list like Xorg (length checks,
+  unknown types skipped) and gives Xorg's answer for the fixed devices:
+  RemoveMaster/Attach/Detach → BadDevice/BadValue exactly as Xvfb answers for
+  its fixed XTest slaves at the same ids, AddMaster → BadAlloc; no change
+  succeeds, so no HierarchyChanged. **XISelectEvents** keeps bit 32 (masks
+  are u64), rejects bits past XI2LASTEVENT with BadValue(bit) before applying
+  anything; XIGetSelectedEvents writes masks in device order, trimmed to 1 or
+  2 words, header fields in client byte order. All expected values are Xvfb
+  21.1.24 captures. Known gaps kept: XI1 Set/GetDeviceFocus(3) still use
+  their own record rather than the core focus, and slave-keyboard focus
+  changes emit XI1 DeviceFocus events but no XI2 FocusIn/Out.
+- **2026-09-26 SYNC Await / AwaitFence suspend the client (extension audit
+  §2):** an Await or AwaitFence now suspends the client the way Xorg's
+  `IgnoreClient` does: the fair request queue treats a client with an entry
+  in `ServerState::sync_awaits` as not runnable (the same predicate that
+  parks a client behind an asynchronous CRTC configuration), so its later
+  requests stay queued in order while every other client runs, and the poll
+  does not spin on it. `core_loop/sync_await.rs` ports
+  `SyncAwaitEpilogue` / `SyncAwaitTriggerFired`: a trigger that already
+  holds fires at once; firing sends the CounterNotify events (threshold
+  rule, contiguous with descending `count`, `destroyed` for a destroyed
+  counter or fence) and resumes the client. Triggers: Set/ChangeCounter,
+  DestroyCounter and a counter owner's disconnect (which also deactivate
+  alarms on the counter with an AlarmNotify), TriggerFence, Present idle
+  fences, DestroyFence / fence owner disconnect, and the SERVERTIME and
+  IDLETIME system counters (post-poll evaluation plus a poll deadline;
+  SERVERTIME alarms now fire too). Await/AwaitFence/counter/fence requests
+  raise Xorg's errors (BadCounter, BadFence, BadAccess on system counters,
+  BadValue, BadMatch for resetting an untriggered fence); Initialize always
+  answers 3.1. Ground truth: Xvfb 21.1.24 with a two-connection xcb probe.
+  Deliberate deviation: a PositiveTransition on SERVERTIME fires when the
+  clock crosses it; Xorg never wakes for it (`SyncComputeBracketValues`
+  skips positive transitions on a never-decreasing counter), which only
+  ever hangs the client. DRI3 FenceFromFD xshmfences are read from their
+  shared memory, as Xorg's `misyncshm.c`: QueryFence, the AwaitFence
+  check and ResetFence's BadMatch test see the client's own
+  `xshmfence_trigger` / `xshmfence_reset`; ResetFence resets the memory and
+  DestroyFence (or the owner's disconnect) triggers it before unmapping.
+  As in Xorg nothing watches the memory, so an AwaitFence already suspended
+  on such a fence resumes on a TriggerFence request or the fence's
+  destruction, not on the client's in-memory trigger. ChangeAlarm / QueryAlarm / DestroyAlarm on a missing
+  alarm answer BadAlarm in Xorg's check order (size, lookup, then the value
+  list against the mask). Alarms keep Xorg's event-client list: any client
+  may ChangeAlarm (events selects AlarmNotify for it; the owner's flag is
+  separate) or DestroyAlarm; every AlarmNotify — fired, Inactive on counter
+  destruction, Destroyed on DestroyAlarm or the owner's disconnect — goes
+  to the owner (if selected) and each selecting client; CreateAlarm uses
+  Xorg's defaults and counterless alarms behave as Xorg's. CreateAlarm /
+  ChangeAlarm port `SyncChangeAlarmAttributes` + `SyncInitTrigger`: BadValue
+  (events, unknown mask bits, value type, INT64 overflow, test type),
+  BadMatch (delta sign, Relative without a counter), BadCounter, in Xorg's
+  order, with Xorg's partial effects on a failing ChangeAlarm (the event
+  selection, delta, value type, raw value and test type stick; a stored bad
+  test type is what QueryAlarm reports while the alarm keeps its old test).
+  One bound Xorg lacks: after that quirk a wrong-sign delta can reach the
+  re-arm loop, which on Xorg steps toward INT64 overflow (a hung Xvfb);
+  yserver caps it.
+
+- **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
+  now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,
+  sticky per-client major) and gates requests on the negotiated major
+  (`ProcXFixesDispatch`: before QueryVersion only QueryVersion is legal).
+  HideCursor/ShowCursor keep per-client counts; the KMS sprite blanks on the
+  first hide anywhere and returns on the last show or the hider's
+  disconnect (scene cursor entry dropped; under direct scanout the legacy
+  plane is detached in place). CursorNotify is sent per (client, window)
+  selection whenever the effective cursor switches, with the serial
+  GetCursorImage reports and the cursor's name; selections die with their
+  window. ChangeCursor/ChangeCursorByName retarget every XID of the old
+  cursor and the backend replaces window, root-default and grab uses
+  (names are kept per host cursor, so a freed-but-displayed cursor still
+  matches); ExpandRegion is real; GetCursorImageAndName reports the name;
+  SetCursorName/GetCursorName/ChangeCursor raise BadCursor. Ground truth:
+  Xvfb 21.1.24 captures with an xcb probe. Known limit: a hidden cursor
+  reads as a software/hidden cursor mode, so fullscreen direct scanout is
+  not entered while a client hides the cursor (content stays correct).
 
 - **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
   branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports

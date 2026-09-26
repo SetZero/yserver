@@ -452,7 +452,7 @@ pub fn process_request(
         // ── COMPOSITE extension dispatcher ──
         144 => handle_composite_request(state, backend, origin, client_id, sequence, header, body),
         // ── XFIXES extension dispatcher ──
-        140 => handle_xfixes_request(state, backend, origin, client_id, sequence, header, body),
+        140 => dispatch_xfixes_request(state, backend, origin, client_id, sequence, header, body),
         // ── SHAPE extension dispatcher ──
         141 => handle_shape_request(state, backend, origin, client_id, sequence, header, body),
         // ── SYNC extension dispatcher ──
@@ -1773,9 +1773,7 @@ pub(crate) fn purge_present_for_destroyed_windows(
                         "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} failed: {error}"
                     );
                 }
-                if let Some(fence) = state.sync_fences.get_mut(idle_fence_xid) {
-                    fence.triggered = true;
-                }
+                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
             }
             crate::backend::PresentWake::PixmapSynced {
                 release,
@@ -5210,6 +5208,106 @@ fn reply_set_crtc_config(
     Ok(write_to_client(client, client_id, &reply))
 }
 
+/// A SYNC protocol error: `code` is either a core error or
+/// `SYNC_FIRST_ERROR + x11sync::BAD_*`.
+fn sync_error(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    code: u8,
+    value: u32,
+) -> io::Result<RequestOutcome> {
+    emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        code,
+        value,
+        u16::from(header.data),
+        header.opcode,
+    )
+}
+
+/// Xorg's lookup of a client-writable counter for SetCounter /
+/// ChangeCounter / DestroyCounter: an unknown XID is BadCounter, a system
+/// counter BadAccess (both naming the counter; captured on Xvfb).
+fn sync_writable_counter(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    counter: u32,
+) -> Result<i64, io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if crate::core_loop::sync_await::is_system_counter(counter) {
+        return Err(sync_error(
+            state,
+            client_id,
+            sequence,
+            header,
+            x11::error::BAD_ACCESS,
+            counter,
+        ));
+    }
+    match state.sync_counters.get(&counter) {
+        Some(c) => Ok(c.value),
+        None => Err(sync_error(
+            state,
+            client_id,
+            sequence,
+            header,
+            crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+            counter,
+        )),
+    }
+}
+
+/// Xorg `RTFence` lookup: an unknown fence is BadFence naming it.
+fn sync_known_fence(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    fence: u32,
+) -> Result<(), io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if state.sync_fences.contains_key(&fence) {
+        return Ok(());
+    }
+    Err(sync_error(
+        state,
+        client_id,
+        sequence,
+        header,
+        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_FENCE,
+        fence,
+    ))
+}
+
+/// Xorg's `RTAlarm` lookup: an alarm that does not exist (never created,
+/// None, or destroyed) is BadAlarm naming it.
+fn sync_known_alarm(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    alarm: u32,
+) -> Result<(), io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if state.sync_alarms.contains_key(&alarm) {
+        return Ok(());
+    }
+    Err(sync_error(
+        state,
+        client_id,
+        sequence,
+        header,
+        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_ALARM,
+        alarm,
+    ))
+}
+
 fn handle_sync_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -5226,19 +5324,17 @@ fn handle_sync_request(
     let minor = header.data;
     match minor {
         x11sync::INITIALIZE => {
-            let (client_major, client_minor) =
-                x11sync::parse_initialize(body).unwrap_or((x11sync::MAJOR_VERSION, 0));
-            let major = x11sync::MAJOR_VERSION.min(client_major);
-            let minor_ver = if major < x11sync::MAJOR_VERSION {
-                client_minor
-            } else {
-                x11sync::MINOR_VERSION
-            };
-            let reply = x11sync::encode_initialize_reply(byte_order, sequence, major, minor_ver);
+            // Xorg `ProcSyncInitialize` always answers its own version
+            // (Xvfb: client 3.1 / 3.0 / 2.0 / 4.0 all get 3.1).
+            let reply = x11sync::encode_initialize_reply(
+                byte_order,
+                sequence,
+                x11sync::MAJOR_VERSION,
+                x11sync::MINOR_VERSION,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::LIST_SYSTEM_COUNTERS => {
@@ -5262,46 +5358,55 @@ fn handle_sync_request(
         }
         x11sync::SET_COUNTER => {
             if let Some((counter, value)) = x11sync::parse_counter_value(body) {
-                let transition = state.sync_counters.get_mut(&counter).map(|c| {
-                    let old = c.value;
+                let old = match sync_writable_counter(state, client_id, sequence, header, counter) {
+                    Ok(old) => old,
+                    Err(outcome) => return outcome,
+                };
+                if let Some(c) = state.sync_counters.get_mut(&counter) {
                     c.value = value;
-                    (old, value)
-                });
-                if let Some((old, new)) = transition {
-                    evaluate_alarms_for_counter(state, counter, old, new);
                 }
+                crate::core_loop::sync_await::counter_changed(state, counter, old, value);
             }
         }
         x11sync::CHANGE_COUNTER => {
             if let Some((counter, delta)) = x11sync::parse_counter_value(body) {
-                let transition = state.sync_counters.get_mut(&counter).map(|c| {
-                    let old = c.value;
-                    c.value = old.saturating_add(delta);
-                    (old, c.value)
-                });
-                if let Some((old, new)) = transition {
-                    evaluate_alarms_for_counter(state, counter, old, new);
+                let old = match sync_writable_counter(state, client_id, sequence, header, counter) {
+                    Ok(old) => old,
+                    Err(outcome) => return outcome,
+                };
+                // Xorg: an INT64 overflow is BadValue naming the high half
+                // of the delta (Xvfb: value 0x7fffffff for i64::MAX).
+                let Some(new) = old.checked_add(delta) else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let value_hi = (delta >> 32) as u32;
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        value_hi,
+                    );
+                };
+                if let Some(c) = state.sync_counters.get_mut(&counter) {
+                    c.value = new;
                 }
+                crate::core_loop::sync_await::counter_changed(state, counter, old, new);
             }
         }
         x11sync::QUERY_COUNTER => {
             let counter = x11sync::parse_resource(body).unwrap_or(0);
-            let value = match counter {
-                x11sync::SERVERTIME_COUNTER => i64::from(state.timestamp_now()),
-                x11sync::IDLETIME_COUNTER
-                | x11sync::IDLETIME_DEVICE_VCP
-                | x11sync::IDLETIME_DEVICE_VCK => {
-                    // X11 timestamps are 32-bit ms; saturate at u32::MAX
-                    // (~49 days idle) per X11 spec. After saturation the
-                    // value fits in i64 without sign-loss or truncation.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let elapsed_ms = std::time::Instant::now()
-                        .duration_since(state.idletime_baseline(counter))
-                        .as_millis()
-                        .min(u128::from(u32::MAX)) as i64;
-                    elapsed_ms
-                }
-                _ => state.sync_counters.get(&counter).map_or(0, |c| c.value),
+            // IDLETIME saturates at u32::MAX ms (~49 days) inside
+            // `idletime_current_idle`. An unknown counter is BadCounter.
+            let Some(value) = crate::core_loop::sync_await::counter_value(state, counter) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                    counter,
+                );
             };
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -5312,101 +5417,259 @@ fn handle_sync_request(
         }
         x11sync::DESTROY_COUNTER => {
             if let Some(counter) = x11sync::parse_resource(body) {
+                let last = match sync_writable_counter(state, client_id, sequence, header, counter)
+                {
+                    Ok(last) => last,
+                    Err(outcome) => return outcome,
+                };
                 state.sync_counters.remove(&counter);
+                crate::core_loop::sync_await::counter_destroyed(state, counter, last);
             }
         }
         x11sync::AWAIT => {
-            // Non-blocking stub.
+            // Xorg `ProcSyncAwait`: validate every wait condition, then
+            // suspend the client until one of the triggers fires. Its later
+            // requests stay queued behind this one (see `sync_await`).
+            let Some(conditions) = x11sync::parse_await(byte_order, body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if conditions.is_empty() {
+                return sync_error(state, client_id, sequence, header, x11::error::BAD_VALUE, 0);
+            }
+            let mut waits = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                // `SyncInitTrigger` order: counter, value type, value, test
+                // type. Captured on Xvfb: None / unknown → BadCounter,
+                // bad value type / test type → BadValue naming it, relative
+                // overflow → BadValue naming the high half of the wait.
+                let current = if c.counter == 0 {
+                    None
+                } else {
+                    crate::core_loop::sync_await::counter_value(state, c.counter)
+                };
+                let Some(current) = current else {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                        c.counter,
+                    );
+                };
+                let test_value = match c.value_type {
+                    x11sync::VALUE_TYPE_ABSOLUTE => c.wait_value,
+                    x11sync::VALUE_TYPE_RELATIVE => {
+                        let Some(v) = current.checked_add(c.wait_value) else {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let value_hi = (c.wait_value >> 32) as u32;
+                            return sync_error(
+                                state,
+                                client_id,
+                                sequence,
+                                header,
+                                x11::error::BAD_VALUE,
+                                value_hi,
+                            );
+                        };
+                        v
+                    }
+                    other => {
+                        return sync_error(
+                            state,
+                            client_id,
+                            sequence,
+                            header,
+                            x11::error::BAD_VALUE,
+                            other,
+                        );
+                    }
+                };
+                if c.test_type > x11sync::TEST_NEGATIVE_COMPARISON {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        c.test_type,
+                    );
+                }
+                waits.push(crate::server::SyncAwaitCondition::Counter {
+                    counter: c.counter,
+                    test_type: c.test_type,
+                    test_value,
+                    event_threshold: c.event_threshold,
+                });
+            }
+            debug!(
+                "client {} #{} SYNC::Await {} condition(s)",
+                client_id.0,
+                sequence.0,
+                waits.len()
+            );
+            crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::CREATE_ALARM => {
-            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body) {
-                let mut a = crate::server::SyncAlarm {
-                    owner: client_id,
-                    state: x11sync::ALARM_STATE_ACTIVE,
-                    events: true,
-                    ..crate::server::SyncAlarm::default()
-                };
-                apply_alarm_attributes(state, &mut a, &attrs);
-                let counter = a.counter;
-                let class = state
-                    .client_wm_class
-                    .get(&client_id.0)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                log::trace!(
-                    "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
-                     counter={cname}(0x{counter:x}) test={test} \
-                     wait_value={wait} delta={delta} events={events}",
-                    client_id.0,
-                    cname = sync_counter_name(counter),
-                    test = sync_test_type_name(u32::from(a.test_type)),
-                    wait = a.wait_value,
-                    delta = a.delta,
-                    events = a.events,
+            // Xorg `ProcSyncCreateAlarm`: the value list must match the mask.
+            let Some((alarm, mask)) = x11sync::parse_alarm_with_mask(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
                 );
-                state.sync_alarms.insert(alarm, a);
-                // Per the X Synchronization Extension spec the trigger is
-                // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately. For IDLETIME-family
-                // counters the value is derived from last_activity rather
-                // than `sync_counters`.
-                let now_value = if matches!(
-                    counter,
-                    x11sync::IDLETIME_COUNTER
-                        | x11sync::IDLETIME_DEVICE_VCP
-                        | x11sync::IDLETIME_DEVICE_VCK
-                ) {
-                    idletime_current_idle(state, counter)
-                } else {
-                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
-                };
-                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+            };
+            if body.len() != x11sync::alarm_request_len(mask) {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
             }
+            // Xorg's defaults (`ProcSyncCreateAlarm` + `SyncInitTrigger` on
+            // None): no counter, Absolute 0, PositiveComparison, delta 1,
+            // the owner selected for events. An error discards the alarm.
+            let mut a = crate::server::SyncAlarm {
+                owner: client_id,
+                state: x11sync::ALARM_STATE_INACTIVE,
+                events: true,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON,
+                check_type: x11sync::TEST_POSITIVE_COMPARISON,
+                delta: 1,
+                ..crate::server::SyncAlarm::default()
+            };
+            let values = alarm_value_words(body);
+            if let Err((code, value)) =
+                change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values)
+            {
+                return sync_error(state, client_id, sequence, header, code, value);
+            }
+            let counter = a.counter;
+            let class = state
+                .client_wm_class
+                .get(&client_id.0)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            log::trace!(
+                "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
+                 counter={cname}(0x{counter:x}) test={test} \
+                 wait_value={wait} delta={delta} events={events}",
+                client_id.0,
+                cname = sync_counter_name(counter),
+                test = sync_test_type_name(a.test_type),
+                wait = a.wait_value,
+                delta = a.delta,
+                events = a.events,
+            );
+            if counter == 0 {
+                // "NULL counter will not trigger in CreateAlarm and sets
+                // alarm state to Inactive" (Xorg).
+                a.state = x11sync::ALARM_STATE_INACTIVE;
+                state.sync_alarms.insert(alarm, a);
+                return Ok(RequestOutcome::Handled);
+            }
+            state.sync_alarms.insert(alarm, a);
+            // The trigger is tested at creation: a comparison whose
+            // condition already holds fires at once. System counters
+            // (SERVERTIME, IDLETIME) read the clock.
+            check_new_alarm_trigger(state, alarm, counter);
         }
         x11sync::CHANGE_ALARM => {
-            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body)
-                && let Some(mut a) = state.sync_alarms.get(&alarm).cloned()
-            {
-                apply_alarm_attributes(state, &mut a, &attrs);
-                a.state = x11sync::ALARM_STATE_ACTIVE;
-                let counter = a.counter;
-                let class = state
-                    .client_wm_class
-                    .get(&client_id.0)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                log::trace!(
-                    "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
-                     counter={cname}(0x{counter:x}) test={test} \
-                     wait_value={wait} delta={delta} events={events}",
-                    client_id.0,
-                    cname = sync_counter_name(counter),
-                    test = sync_test_type_name(u32::from(a.test_type)),
-                    wait = a.wait_value,
-                    delta = a.delta,
-                    events = a.events,
+            // Xorg `ProcSyncChangeAlarm`: minimum size, then the alarm
+            // lookup (BadAlarm), then the value list against the mask
+            // (BadLength naming the alarm, captured on Xvfb).
+            let Some((alarm, mask)) = x11sync::parse_alarm_with_mask(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
                 );
+            };
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
+                return outcome;
+            }
+            if body.len() != x11sync::alarm_request_len(mask) {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
+            }
+            // Xorg `SyncChangeAlarmAttributes`: any client may change an
+            // alarm; `events` selects AlarmNotify for the requesting client
+            // (the owner's own flag, or the event-client list). A failure
+            // part-way keeps what Xorg keeps (see change_alarm_attributes),
+            // so the copy is written back either way.
+            let Some(mut a) = state.sync_alarms.get(&alarm).cloned() else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let values = alarm_value_words(body);
+            let outcome = change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values);
+            if let Err((code, value)) = outcome {
                 state.sync_alarms.insert(alarm, a);
-                // Per the X Synchronization Extension spec the trigger is
-                // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately. For IDLETIME-family
-                // counters the value is derived from last_activity rather
-                // than `sync_counters`.
-                let now_value = if matches!(
-                    counter,
-                    x11sync::IDLETIME_COUNTER
-                        | x11sync::IDLETIME_DEVICE_VCP
-                        | x11sync::IDLETIME_DEVICE_VCK
-                ) {
-                    idletime_current_idle(state, counter)
-                } else {
-                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
-                };
-                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+                return sync_error(state, client_id, sequence, header, code, value);
+            }
+            let counter = a.counter;
+            let class = state
+                .client_wm_class
+                .get(&client_id.0)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            log::trace!(
+                "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
+                 counter={cname}(0x{counter:x}) test={test} \
+                 wait_value={wait} delta={delta} events={events}",
+                client_id.0,
+                cname = sync_counter_name(counter),
+                test = sync_test_type_name(a.test_type),
+                wait = a.wait_value,
+                delta = a.delta,
+                events = a.events,
+            );
+            state.sync_alarms.insert(alarm, a);
+            if counter == 0 {
+                // "NULL counter WILL trigger in ChangeAlarm" (Xorg): the
+                // alarm goes Inactive with an AlarmNotify.
+                alarm_trigger_fired(state, alarm, 0);
+            } else {
+                check_new_alarm_trigger(state, alarm, counter);
             }
         }
         x11sync::QUERY_ALARM => {
+            // Xorg `ProcSyncQueryAlarm`: exact size, then the lookup.
+            if body.len() != 4 {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            }
             let alarm_id = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm_id) {
+                return outcome;
+            }
             let alarm = state
                 .sync_alarms
                 .get(&alarm_id)
@@ -5417,6 +5680,7 @@ fn handle_sync_request(
                 sequence,
                 alarm.counter,
                 alarm.wait_value,
+                alarm.test_type,
                 alarm.delta,
                 alarm.events,
                 alarm.state,
@@ -5428,9 +5692,24 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::DESTROY_ALARM => {
-            if let Some(alarm) = x11sync::parse_resource(body) {
-                state.sync_alarms.remove(&alarm);
+            // Xorg `ProcSyncDestroyAlarm`: exact size, then the lookup.
+            if body.len() != 4 {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
             }
+            let alarm = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
+                return outcome;
+            }
+            // Xorg `FreeAlarm`: any client may destroy it; a Destroyed
+            // AlarmNotify goes to the owner and the selecting clients.
+            crate::core_loop::sync_await::destroy_alarm(state, alarm);
         }
         x11sync::CREATE_FENCE => {
             if let Some(req) = x11sync::parse_create_fence(body) {
@@ -5449,7 +5728,12 @@ fn handle_sync_request(
         }
         x11sync::DESTROY_FENCE => {
             if let Some(fence) = x11sync::parse_resource(body) {
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
+                }
+                crate::core_loop::sync_await::fence_destroyed(state, fence);
                 state.sync_fences.remove(&fence);
+                backend.dri3_destroy_fence(fence);
                 debug!(
                     "client {} #{} SYNC::DestroyFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
@@ -5458,15 +5742,15 @@ fn handle_sync_request(
         }
         x11sync::TRIGGER_FENCE => {
             if let Some(fence) = x11sync::parse_resource(body) {
-                if let Some(f) = state.sync_fences.get_mut(&fence) {
-                    f.triggered = true;
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
                 }
                 // For DRI3-imported xshmfence-backed fences, the
-                // memory-only `f.triggered=true` above is invisible to
-                // Mesa's local `xshmfence_await`. Forward the trigger
-                // to the backend so it writes the shared 4-byte
-                // counter + futex-wakes any local waiter — Mesa's
-                // `loader_dri3_copy_drawable` blocks on exactly that.
+                // server-side triggered bit is invisible to Mesa's local
+                // `xshmfence_await`. Forward the trigger to the backend so
+                // it writes the shared 4-byte counter + futex-wakes any
+                // local waiter — Mesa's `loader_dri3_copy_drawable` blocks
+                // on exactly that.
                 if let Err(e) = backend.dri3_trigger_fence(fence) {
                     log::warn!("SYNC::TriggerFence 0x{fence:x}: backend trigger failed: {e}");
                 }
@@ -5474,38 +5758,43 @@ fn handle_sync_request(
                     "client {} #{} SYNC::TriggerFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
                 );
-                // Wake any pending Await whose list contains this
-                // fence. We don't actually unblock the client's
-                // request stream (see SyncPendingAwait doc-comment)
-                // but we do log the satisfaction so test harnesses
-                // can assert sequencing.
-                let mut satisfied: Vec<crate::server::SyncPendingAwait> = Vec::new();
-                state.sync_pending_awaits.retain(|a| {
-                    if a.fences.contains(&fence) {
-                        satisfied.push(a.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                for a in &satisfied {
-                    debug!(
-                        "SYNC::AwaitSatisfied client={} seq={} on fence=0x{:x}",
-                        a.client.0, a.sequence.0, fence
-                    );
-                }
+                // Xorg `miSyncTriggerFence`: wakes every AwaitFence on it.
+                crate::core_loop::sync_await::fence_triggered(state, fence);
             }
         }
         x11sync::RESET_FENCE => {
-            if let Some(fence) = x11sync::parse_resource(body)
-                && let Some(f) = state.sync_fences.get_mut(&fence)
-            {
-                f.triggered = false;
+            if let Some(fence) = x11sync::parse_resource(body) {
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
+                }
+                // Xorg `ProcSyncResetFence`: only a triggered fence can be
+                // reset (Xvfb: BadMatch naming the fence); a shared-memory
+                // fence is tested, and reset, in that memory.
+                if !crate::core_loop::sync_await::fence_is_triggered(state, &*backend, fence) {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_MATCH,
+                        fence,
+                    );
+                }
+                backend.dri3_reset_fence(fence);
+                if let Some(f) = state.sync_fences.get_mut(&fence) {
+                    f.triggered = false;
+                }
             }
         }
         x11sync::QUERY_FENCE => {
             let fence = x11sync::parse_resource(body).unwrap_or(0);
-            let triggered = state.sync_fences.get(&fence).is_some_and(|f| f.triggered);
+            if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                return outcome;
+            }
+            // Xorg `ProcSyncQueryFence` → `CheckTriggered`: shared memory
+            // for a DRI3 xshmfence, the server's bit otherwise.
+            let triggered =
+                crate::core_loop::sync_await::fence_is_triggered(state, &*backend, fence);
             let reply = x11sync::encode_query_fence_reply(byte_order, sequence, triggered);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -5513,47 +5802,45 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::AWAIT_FENCE => {
-            // Spec: server must defer further processing of this
-            // client's requests until *any* fence in the list is
-            // triggered. We don't actually suspend the request
-            // stream (real blocking needs core-loop integration —
-            // see SyncPendingAwait doc-comment), but we *do*
-            //
-            // 1. Short-circuit when at least one fence is already
-            //    triggered: the await is trivially satisfied, log
-            //    it and move on. No state change.
-            // 2. Otherwise record the await on `sync_pending_awaits`
-            //    so a later TriggerFence on any of these fences
-            //    fires an `AwaitSatisfied` log line — useful for
-            //    tests that need to assert sequencing.
-            if let Some(fences) = x11sync::parse_await_fence(body) {
-                let any_triggered = fences
-                    .iter()
-                    .any(|f| state.sync_fences.get(f).is_some_and(|s| s.triggered));
-                if any_triggered {
-                    debug!(
-                        "client {} #{} SYNC::AwaitFence n={} -> already triggered",
-                        client_id.0,
-                        sequence.0,
-                        fences.len()
-                    );
-                } else {
-                    state
-                        .sync_pending_awaits
-                        .push(crate::server::SyncPendingAwait {
-                            client: client_id,
-                            sequence,
-                            fences: fences.clone(),
-                        });
-                    debug!(
-                        "client {} #{} SYNC::AwaitFence n={} -> pending (request stream NOT \
-                         suspended — known gap)",
-                        client_id.0,
-                        sequence.0,
-                        fences.len()
+            // Xorg `ProcSyncAwaitFence`: suspend the client until any of
+            // the fences triggers (or is destroyed). Captured on Xvfb:
+            // empty list → BadValue, None / unknown fence → BadFence.
+            let Some(fences) = x11sync::parse_await_fence(byte_order, body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if fences.is_empty() {
+                return sync_error(state, client_id, sequence, header, x11::error::BAD_VALUE, 0);
+            }
+            for &fence in &fences {
+                if !state.sync_fences.contains_key(&fence) {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_FENCE,
+                        fence,
                     );
                 }
             }
+            debug!(
+                "client {} #{} SYNC::AwaitFence n={}",
+                client_id.0,
+                sequence.0,
+                fences.len()
+            );
+            let waits = fences
+                .into_iter()
+                .map(|fence| crate::server::SyncAwaitCondition::Fence { fence })
+                .collect();
+            crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::SET_PRIORITY => {
             // Stub.
@@ -5581,53 +5868,149 @@ fn handle_sync_request(
     Ok(RequestOutcome::Handled)
 }
 
-/// Merge a `CreateAlarm`/`ChangeAlarm` value-list into an alarm,
-/// resolving the `wait_value` against the watched counter's current
-/// value (Relative alarms add `value` to the counter; Absolute alarms
-/// take `value` directly). Only attributes whose mask bit was set are
-/// applied. muffin sets every attribute in a single `CreateAlarm`, so
-/// the per-field defaults below are not load-bearing for the Cinnamon
-/// path.
-fn apply_alarm_attributes(
+/// Xorg `SyncChangeAlarmAttributes` + `SyncInitTrigger` for CreateAlarm
+/// (on a fresh alarm) and ChangeAlarm (on a copy the caller writes back
+/// whatever the outcome). `values` is the value list, one word each and
+/// two for VALUE and DELTA, already length-checked against `mask`.
+///
+/// Order and partial effects, as Xorg (captured on Xvfb):
+/// 1. The list is walked in mask-bit order; an `events` word other than
+///    True/False is BadValue naming it, an unknown bit BadValue naming the
+///    mask bits above it. Nothing is changed yet.
+/// 2. `events` selects AlarmNotify for `client` — it stays selected even
+///    if the request then fails.
+/// 3. With DELTA or TEST_TYPE in the mask, a positive test with a
+///    negative delta or a negative test with a positive delta is
+///    BadMatch; nothing else is changed.
+/// 4. Delta, value type, value and test type are stored.
+/// 5. The trigger is initialised: an unknown counter is BadCounter, an
+///    invalid value type BadValue naming it; the wait value resolves
+///    (Relative without a counter is BadMatch; an INT64 overflow is
+///    BadValue naming the value's high word, with the wrapped sum stored);
+///    an invalid test type is BadValue naming it. Only then do the counter
+///    and the test the trigger runs change, and the alarm goes Active.
+///
+/// So a failing ChangeAlarm can leave step 4 behind: a stored bad test
+/// type is what QueryAlarm reports, while the alarm keeps running its old
+/// test.
+fn change_alarm_attributes(
     state: &ServerState,
+    alarm_id: u32,
     alarm: &mut crate::server::SyncAlarm,
-    attrs: &yserver_protocol::x11::sync::AlarmAttributes,
-) {
+    client: ClientId,
+    mask: u32,
+    values: &[u32],
+) -> Result<(), (u8, u32)> {
     use yserver_protocol::x11::sync as x11sync;
-    if let Some(counter) = attrs.counter {
-        alarm.counter = counter;
+    let int64 = |hi: u32, lo: u32| (i64::from(hi.cast_signed()) << 32) | i64::from(lo);
+    let mut words = values.iter().copied();
+    let mut next = || words.next().unwrap_or(0);
+    let (mut counter, mut value_type, mut raw_wait, mut test_type, mut delta) = (
+        alarm.counter,
+        alarm.value_type,
+        alarm.raw_wait,
+        alarm.test_type,
+        alarm.delta,
+    );
+    let mut select = None;
+    let mut remaining = mask;
+    while remaining != 0 {
+        let bit = 1u32 << remaining.trailing_zeros();
+        remaining &= !bit;
+        match bit {
+            x11sync::CA_COUNTER => counter = next(),
+            x11sync::CA_VALUE_TYPE => value_type = next(),
+            x11sync::CA_VALUE => raw_wait = int64(next(), next()),
+            x11sync::CA_TEST_TYPE => test_type = next(),
+            x11sync::CA_DELTA => delta = int64(next(), next()),
+            x11sync::CA_EVENTS => {
+                let events = next();
+                if events > 1 {
+                    return Err((x11::error::BAD_VALUE, events));
+                }
+                select = Some(events == 1);
+            }
+            _ => return Err((x11::error::BAD_VALUE, remaining)),
+        }
     }
-    if let Some(test_type) = attrs.test_type {
-        alarm.test_type = u8::try_from(test_type).unwrap_or(0);
+    if let Some(want) = select {
+        crate::core_loop::sync_await::select_alarm_events(alarm, client, want);
     }
-    if let Some(delta) = attrs.delta {
-        alarm.delta = delta;
+    if mask & (x11sync::CA_DELTA | x11sync::CA_TEST_TYPE) != 0 {
+        let positive = matches!(
+            test_type,
+            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_POSITIVE_TRANSITION
+        );
+        let negative = matches!(
+            test_type,
+            x11sync::TEST_NEGATIVE_COMPARISON | x11sync::TEST_NEGATIVE_TRANSITION
+        );
+        if (positive && delta < 0) || (negative && delta > 0) {
+            return Err((x11::error::BAD_MATCH, alarm_id));
+        }
     }
-    if let Some(events) = attrs.events {
-        alarm.events = events;
+    alarm.delta = delta;
+    alarm.value_type = value_type;
+    alarm.raw_wait = raw_wait;
+    alarm.test_type = test_type;
+
+    let mut new_counter = alarm.counter;
+    if mask & x11sync::CA_COUNTER != 0 {
+        if counter != 0
+            && !crate::core_loop::sync_await::is_system_counter(counter)
+            && !state.sync_counters.contains_key(&counter)
+        {
+            return Err((
+                crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                counter,
+            ));
+        }
+        new_counter = counter;
     }
-    if attrs.value.is_some() || attrs.value_type.is_some() {
-        let value = attrs.value.unwrap_or(0);
-        let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
-        alarm.wait_value = if relative {
-            let current = if matches!(
-                alarm.counter,
-                x11sync::IDLETIME_COUNTER
-                    | x11sync::IDLETIME_DEVICE_VCP
-                    | x11sync::IDLETIME_DEVICE_VCK
-            ) {
-                idletime_current_idle(state, alarm.counter)
-            } else {
-                state
-                    .sync_counters
-                    .get(&alarm.counter)
-                    .map_or(0, |c| c.value)
-            };
-            current.saturating_add(value)
+    let current = if new_counter == 0 {
+        None
+    } else {
+        crate::core_loop::sync_await::counter_value(state, new_counter)
+    };
+    if mask & x11sync::CA_VALUE_TYPE != 0
+        && value_type != x11sync::VALUE_TYPE_ABSOLUTE
+        && value_type != x11sync::VALUE_TYPE_RELATIVE
+    {
+        return Err((x11::error::BAD_VALUE, value_type));
+    }
+    if mask & (x11sync::CA_VALUE_TYPE | x11sync::CA_VALUE) != 0 {
+        if value_type == x11sync::VALUE_TYPE_ABSOLUTE {
+            alarm.wait_value = raw_wait;
         } else {
-            value
-        };
+            let Some(value) = current else {
+                return Err((x11::error::BAD_MATCH, alarm_id));
+            };
+            let (sum, overflow) = value.overflowing_add(raw_wait);
+            alarm.wait_value = sum;
+            if overflow {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return Err((x11::error::BAD_VALUE, (raw_wait >> 32) as u32));
+            }
+        }
     }
+    if mask & x11sync::CA_TEST_TYPE != 0 {
+        if test_type > x11sync::TEST_NEGATIVE_COMPARISON {
+            return Err((x11::error::BAD_VALUE, test_type));
+        }
+        alarm.check_type = test_type;
+    }
+    alarm.counter = new_counter;
+    alarm.state = x11sync::ALARM_STATE_ACTIVE;
+    Ok(())
+}
+
+/// The value list of a length-checked CreateAlarm / ChangeAlarm body.
+fn alarm_value_words(body: &[u8]) -> Vec<u32> {
+    body.get(8..)
+        .unwrap_or_default()
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect()
 }
 
 fn handle_xinerama_request(
@@ -5810,9 +6193,11 @@ fn sync_alarm_state_name(state: u8) -> &'static str {
     }
 }
 
-/// This is the frame-timing signal mutter/muffin waits on before
-/// compositing a client frame and emitting `_NET_WM_FRAME_DRAWN`, and
-/// also the idle/wake pair used by mate-power-manager.
+/// Run the alarms watching `counter` for a change from `old` to `new`
+/// (Xorg `SyncChangeCounter` → each alarm trigger's `CheckTrigger`). This
+/// is the frame-timing signal mutter/muffin waits on before compositing a
+/// client frame and emitting `_NET_WM_FRAME_DRAWN`, and also the
+/// idle/wake pair used by mate-power-manager.
 pub(crate) fn evaluate_alarms_for_counter(
     state: &mut ServerState,
     counter: u32,
@@ -5820,107 +6205,116 @@ pub(crate) fn evaluate_alarms_for_counter(
     new: i64,
 ) {
     use yserver_protocol::x11::sync as x11sync;
-    let candidates: Vec<u32> = state
+    let mut candidates: Vec<u32> = state
         .sync_alarms
         .iter()
-        .filter(|(_, a)| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE)
+        .filter(|(_, a)| {
+            a.counter == counter
+                && a.state == x11sync::ALARM_STATE_ACTIVE
+                && x11sync::trigger_fires(a.check_type, old, new, a.wait_value)
+        })
         .map(|(id, _)| *id)
         .collect();
-    if candidates.is_empty() {
+    candidates.sort_unstable();
+    for alarm_id in candidates {
+        alarm_trigger_fired(state, alarm_id, new);
+    }
+}
+
+/// The trigger test CreateAlarm / ChangeAlarm run on the one alarm they
+/// set up: its counter's current value, as both old and new (so only a
+/// comparison can already hold).
+fn check_new_alarm_trigger(state: &mut ServerState, alarm_id: u32, counter: u32) {
+    use yserver_protocol::x11::sync as x11sync;
+    let now_value = crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
+    if counter == x11sync::SERVERTIME_COUNTER {
+        state.sync_servertime_last = Some(now_value);
+    }
+    let holds = state
+        .sync_alarms
+        .get(&alarm_id)
+        .is_some_and(|a| x11sync::trigger_fires(a.check_type, now_value, now_value, a.wait_value));
+    if holds {
+        alarm_trigger_fired(state, alarm_id, now_value);
+    }
+}
+
+/// Xorg `SyncAlarmTriggerFired`: alarm `alarm_id` went off with its
+/// counter at `value` (0 and no counter for a counterless alarm). A
+/// counterless alarm, or a comparison with delta 0, goes Inactive;
+/// otherwise the wait value advances by delta until the test no longer
+/// holds (Inactive, value kept, on INT64 overflow). The `AlarmNotify`
+/// carries the new state and the old wait value; the new wait value is
+/// stored after it is sent.
+pub(crate) fn alarm_trigger_fired(state: &mut ServerState, alarm_id: u32, value: i64) {
+    use yserver_protocol::x11::sync as x11sync;
+    let Some(a) = state.sync_alarms.get(&alarm_id) else {
+        return;
+    };
+    if a.state != x11sync::ALARM_STATE_ACTIVE {
         return;
     }
-    let time = state.timestamp_now();
-    for alarm_id in candidates {
-        let Some(a) = state.sync_alarms.get(&alarm_id) else {
-            continue;
-        };
-        let test_type: u32 = a.test_type.into();
-        if !x11sync::trigger_fires(test_type, old, new, a.wait_value) {
-            continue;
-        }
-        let owner = a.owner;
-        let events = a.events;
-        let fired_wait = a.wait_value;
-        let delta = a.delta;
-
-        // Per Xorg sync.c:548-555: state → Inactive when
-        // delta==0 AND test_type is Comparison.
-        // Transitions with delta=0 stay Active — once the edge passes,
-        // the alarm sits quiescent waiting for the next crossing.
-        // Per Xorg sync.c:589-597: re-arm overflow → state Inactive
-        // (test_value left unmodified).
-        let is_comparison = matches!(
-            test_type,
-            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
-        );
-        let (new_wait, new_state) = if delta == 0 && is_comparison {
-            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
-        } else if delta == 0 {
-            // Transition + delta=0: stay Active, wait_value unchanged.
-            (fired_wait, x11sync::ALARM_STATE_ACTIVE)
-        } else {
-            // delta != 0: re-arm by adding delta until trigger stops firing.
-            // Overflow on the addition → state Inactive, wait_value reverts
-            // to fired_wait (Xorg sync.c:589-597).
-            let mut w = fired_wait;
-            let mut guard = 0u32;
-            let mut overflowed = false;
-            while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
-                match w.checked_add(delta) {
-                    Some(next) if next != w => {
-                        w = next;
-                        guard += 1;
-                    }
-                    Some(_) => break, // unreachable: delta != 0 (outer branch) + no overflow ⇒ next != w; defensive
-                    None => {
-                        overflowed = true;
-                        break;
-                    }
+    // Xorg reads the stored test type for the "delta 0 on a comparison"
+    // rule but re-arms with the trigger's check function; the two differ
+    // only after a ChangeAlarm that failed on an invalid test type.
+    let (test_type, check_type) = (a.test_type, a.check_type);
+    let (owner, counter, fired_wait, delta) = (a.owner, a.counter, a.wait_value, a.delta);
+    let is_comparison = matches!(
+        test_type,
+        x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
+    );
+    let (new_wait, new_state) = if counter == 0 || (delta == 0 && is_comparison) {
+        (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+    } else if delta == 0 {
+        // Transition + delta 0: stays Active with the same wait value;
+        // it fires again on the next crossing.
+        (fired_wait, x11sync::ALARM_STATE_ACTIVE)
+    } else {
+        let mut w = fired_wait;
+        let mut guard = 0u32;
+        let mut overflowed = false;
+        // The guard bounds what Xorg does not: after that failed
+        // ChangeAlarm a delta of the wrong sign passes the (unmatched)
+        // sign check, and Xorg's loop then steps toward INT64 overflow
+        // one delta at a time — a hung server (seen on Xvfb).
+        while x11sync::comparison_satisfied(check_type, value, w) && guard < 1_000_000 {
+            match w.checked_add(delta) {
+                Some(next) => {
+                    w = next;
+                    guard += 1;
+                }
+                None => {
+                    overflowed = true;
+                    break;
                 }
             }
-            if overflowed {
-                (fired_wait, x11sync::ALARM_STATE_INACTIVE)
-            } else {
-                (w, x11sync::ALARM_STATE_ACTIVE)
-            }
-        };
-
-        if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
-            a.wait_value = new_wait;
-            a.state = new_state;
         }
-
-        let owner_class = state
-            .client_wm_class
-            .get(&owner.0)
-            .map(String::as_str)
-            .unwrap_or("<unknown>");
-        log::debug!(
-            "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
-             counter={counter_name}(0x{counter:x}) test={test} \
-             old={old} new={new} wait={fired_wait} \
-             → state={state_name} (events={events})",
-            owner_id = owner.0,
-            counter_name = sync_counter_name(counter),
-            test = sync_test_type_name(test_type),
-            state_name = sync_alarm_state_name(new_state),
-        );
-
-        if events {
-            let _dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-                let evt = x11sync::encode_alarm_notify_event(
-                    order,
-                    crate::nested::SYNC_FIRST_EVENT,
-                    seq,
-                    alarm_id,
-                    new,
-                    fired_wait,
-                    time,
-                    new_state,
-                );
-                buf.extend_from_slice(&evt);
-            });
+        if overflowed {
+            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else {
+            (w, x11sync::ALARM_STATE_ACTIVE)
         }
+    };
+    let owner_class = state
+        .client_wm_class
+        .get(&owner.0)
+        .map(String::as_str)
+        .unwrap_or("<unknown>");
+    log::debug!(
+        "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
+         counter={counter_name}(0x{counter:x}) test={test} \
+         value={value} wait={fired_wait} → state={state_name}",
+        owner_id = owner.0,
+        counter_name = sync_counter_name(counter),
+        test = sync_test_type_name(test_type),
+        state_name = sync_alarm_state_name(new_state),
+    );
+    if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+        a.state = new_state;
+    }
+    crate::core_loop::sync_await::send_alarm_notify(state, alarm_id, value);
+    if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+        a.wait_value = new_wait;
     }
 }
 
@@ -6257,6 +6651,177 @@ fn handle_shape_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcXFixesDispatch`: a client may only use the requests of the
+/// XFIXES major version it negotiated — before its first `QueryVersion`
+/// that is `QueryVersion` alone. Anything else is BadRequest.
+fn dispatch_xfixes_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    let client_major = state
+        .xfixes_client_major
+        .get(&client_id.0)
+        .copied()
+        .unwrap_or(0);
+    if !x11xfixes::request_allowed(client_major, header.data) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(header.data),
+            header.opcode,
+        );
+    }
+    handle_xfixes_request(state, backend, origin, client_id, sequence, header, body)
+}
+
+/// Xorg `VERIFY_CURSOR` for XFIXES: resolve a cursor XID to its host
+/// handle, or send BadCursor naming it. `Err(outcome)` carries the error
+/// already written.
+fn xfixes_verify_cursor(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    cursor: u32,
+) -> Result<Option<u32>, io::Result<RequestOutcome>> {
+    if state.resources.cursor_exists(ResourceId(cursor)) {
+        return Ok(state.resources.cursor_host_xid(ResourceId(cursor)));
+    }
+    Err(emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        x11::error::BAD_CURSOR,
+        cursor,
+        u16::from(header.data),
+        header.opcode,
+    ))
+}
+
+/// Xorg `ReplaceCursor` for XFIXES `ChangeCursor` / `ChangeCursorByName`:
+/// every cursor XID and every displayed use of host cursor `old_host`
+/// switches to `source`'s cursor. Replacing a cursor with itself is a
+/// no-op, and the old host cursor is released once nothing names it.
+fn xfixes_replace_cursor(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    old_host: u32,
+    source: ResourceId,
+) {
+    let Some(new_host) = state.resources.cursor_host_xid(source) else {
+        return;
+    };
+    if old_host == new_host {
+        return;
+    }
+    state.resources.retarget_cursor_host(old_host, source);
+    let _ = backend.replace_cursor(origin, old_host, new_host);
+    if !state.resources.cursor_host_referenced(old_host) {
+        let _ = backend.free_cursor(origin, old_host);
+    }
+}
+
+/// Xorg `ExpandRegion` (`xfixes/region.c`): grow each rectangle of
+/// `source` by the four margins and union the results. Coordinates are
+/// computed wide and clamped to the protocol's 16-bit range.
+fn xfixes_expand_region_rects(
+    source: &[yserver_protocol::x11::xfixes::RegionRect],
+    left: u16,
+    right: u16,
+    top: u16,
+    bottom: u16,
+) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
+    use yserver_protocol::x11::xfixes::RegionRect;
+    let clamp_i16 = |v: i32| {
+        i16::try_from(v.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or_default()
+    };
+    let grown: Vec<RegionRect> = source
+        .iter()
+        .map(|r| {
+            let x1 = i32::from(r.x) - i32::from(left);
+            let y1 = i32::from(r.y) - i32::from(top);
+            let x2 = i32::from(r.x) + i32::from(r.width) + i32::from(right);
+            let y2 = i32::from(r.y) + i32::from(r.height) + i32::from(bottom);
+            let (x1, y1, x2, y2) = (clamp_i16(x1), clamp_i16(y1), clamp_i16(x2), clamp_i16(y2));
+            RegionRect {
+                x: x1,
+                y: y1,
+                width: u16::try_from(i32::from(x2) - i32::from(x1)).unwrap_or(0),
+                height: u16::try_from(i32::from(y2) - i32::from(y1)).unwrap_or(0),
+            }
+        })
+        .collect();
+    grown.iter().fold(Vec::new(), |acc, rect| {
+        crate::nested::union_regions(&acc, &[*rect])
+    })
+}
+
+/// Send XFIXES `DisplayCursorNotify` for a backend-reported sprite change
+/// to every (client, window) that selected it — one event per selection,
+/// as Xorg's `CursorDisplayCursor` walks its `cursorEvents` list. Called
+/// after each request and at the end of each loop iteration.
+pub(crate) fn emit_xfixes_cursor_notify(state: &mut ServerState, backend: &mut dyn Backend) {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    let Some(change) = backend.take_displayed_cursor_change() else {
+        return;
+    };
+    let mut selections: Vec<(u32, u32)> = state
+        .xfixes_cursor_masks
+        .iter()
+        .filter(|(_, mask)| **mask & x11xfixes::DISPLAY_CURSOR_NOTIFY_MASK != 0)
+        .map(|((client, window), _)| (*client, window.0))
+        .collect();
+    if selections.is_empty() {
+        return;
+    }
+    selections.sort_unstable();
+    let name = state
+        .resources
+        .cursor_name_for_host(change.host_xid)
+        .map_or(0, |atom| atom.0);
+    let timestamp = state.timestamp_now();
+    for (client, window) in selections {
+        let _dropped = fanout_event_to_clients(state, &[ClientId(client)], |buf, seq, order| {
+            x11xfixes::encode_cursor_notify_event(
+                buf,
+                order,
+                crate::nested::XFIXES_FIRST_EVENT,
+                seq,
+                window,
+                change.serial,
+                timestamp,
+                name,
+            );
+        });
+    }
+}
+
+/// Drop `client`'s XFIXES per-client state on disconnect. Xorg frees the
+/// client's `CursorHideCountRec` resource, which re-displays the sprite
+/// once no other client holds a hide.
+pub(crate) fn release_xfixes_client_state(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client: ClientId,
+) {
+    state.xfixes_client_major.remove(&client.0);
+    if state.xfixes_cursor_hide_counts.remove(&client.0).is_some()
+        && state.xfixes_cursor_hide_counts.is_empty()
+    {
+        backend.set_cursor_hidden(false);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_xfixes_request(
     state: &mut ServerState,
@@ -6275,16 +6840,43 @@ fn handle_xfixes_request(
     let minor = header.data;
     match minor {
         x11xfixes::QUERY_VERSION => {
+            // Xorg `ProcXFixesQueryVersion`: REQUEST_SIZE_MATCH, then the
+            // lower-of-the-two rule with a sticky per-client major.
+            let Some((client_major, client_minor)) =
+                x11xfixes::parse_query_version(byte_order, body)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            let previous = state
+                .xfixes_client_major
+                .get(&client_id.0)
+                .copied()
+                .unwrap_or(0);
+            let negotiated = x11xfixes::negotiate_version(previous, client_major, client_minor);
+            state
+                .xfixes_client_major
+                .insert(client_id.0, negotiated.client_major);
+            debug!(
+                "client {} #{} XFIXES::QueryVersion client={client_major}.{client_minor} -> {}.{}",
+                client_id.0, sequence.0, negotiated.reply_major, negotiated.reply_minor,
+            );
             let reply = x11xfixes::encode_query_version_reply(
                 byte_order,
                 sequence,
-                x11xfixes::MAJOR_VERSION,
-                x11xfixes::MINOR_VERSION,
+                negotiated.reply_major,
+                negotiated.reply_minor,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::SELECT_SELECTION_INPUT => {
@@ -6326,6 +6918,30 @@ fn handle_xfixes_request(
         }
         x11xfixes::SELECT_CURSOR_INPUT => {
             if let Some(req) = x11xfixes::parse_select_cursor_input(body) {
+                // Xorg `ProcXFixesSelectCursorInput`: window first, then
+                // the mask (captured on Xvfb: BadWindow, BadValue).
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+                if req.event_mask & !x11xfixes::CURSOR_ALL_EVENTS_MASK != 0 {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.event_mask,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
                 let key = (client_id.0, ResourceId(req.window));
                 if req.event_mask == 0 {
                     state.xfixes_cursor_masks.remove(&key);
@@ -6365,26 +6981,31 @@ fn handle_xfixes_request(
         x11xfixes::GET_CURSOR_IMAGE_AND_NAME => {
             // Superset of GetCursorImage (opcode 25). Real X screen
             // recorders (gpu-screen-recorder, …) call this to grab the
-            // cursor; with no reply they block forever in poll().
-            // TODO: plumb the active cursor's name atom through
-            // `ActiveCursorImage`; until then report it as unnamed
-            // (atom 0 / empty name — a valid X state), which is all the
-            // recorders need (they consume the image).
+            // cursor; with no reply they block forever in poll(). The
+            // name is the displayed cursor's XFIXES name (Xorg
+            // `pCursor->name`), empty when it was never named.
             let reply = match backend.get_active_cursor_image() {
-                Some(img) => x11xfixes::encode_get_cursor_image_and_name_reply(
-                    byte_order,
-                    sequence,
-                    img.x,
-                    img.y,
-                    img.width,
-                    img.height,
-                    img.hot_x,
-                    img.hot_y,
-                    img.serial,
-                    0,
-                    &[],
-                    img.bgra_bytes.as_ref(),
-                ),
+                Some(img) => {
+                    let atom = state
+                        .resources
+                        .cursor_name_for_host(img.host_xid)
+                        .unwrap_or(AtomId(0));
+                    let name = state.atoms.name(atom).map(str::as_bytes).unwrap_or(&[]);
+                    x11xfixes::encode_get_cursor_image_and_name_reply(
+                        byte_order,
+                        sequence,
+                        img.x,
+                        img.y,
+                        img.width,
+                        img.height,
+                        img.hot_x,
+                        img.hot_y,
+                        img.serial,
+                        atom.0,
+                        name,
+                        img.bgra_bytes.as_ref(),
+                    )
+                }
                 None => {
                     x11xfixes::encode_get_cursor_image_and_name_empty_reply(byte_order, sequence)
                 }
@@ -7061,11 +7682,99 @@ fn handle_xfixes_request(
                 }
             }
         }
+        x11xfixes::CHANGE_CURSOR => {
+            // Xorg `ProcXFixesChangeCursor`: both cursors must exist
+            // (source checked first), then every use of `destination` —
+            // its XIDs, window cursors, grabs — becomes `source`.
+            let Some((source, destination)) = x11xfixes::parse_change_cursor(byte_order, body)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            if let Err(outcome) = xfixes_verify_cursor(state, client_id, sequence, header, source) {
+                return outcome;
+            }
+            let dest_host =
+                match xfixes_verify_cursor(state, client_id, sequence, header, destination) {
+                    Ok(host) => host,
+                    Err(outcome) => return outcome,
+                };
+            if let Some(dest_host) = dest_host {
+                xfixes_replace_cursor(state, backend, origin, dest_host, ResourceId(source));
+            }
+        }
         x11xfixes::CHANGE_CURSOR_BY_NAME => {
+            // Xorg `ProcXFixesChangeCursorByName`: the source must exist;
+            // a name that was never interned matches nothing (MakeAtom
+            // with create=FALSE) and succeeds silently.
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_change_cursor_by_name(body) {
-                let host_cursor = state.resources.cursor_host_xid(ResourceId(cursor_xid));
-                if let Some(host_cursor) = host_cursor {
-                    let _ = backend.xfixes_change_cursor_by_name(origin, host_cursor, name_bytes);
+                if let Err(outcome) =
+                    xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+                {
+                    return outcome;
+                }
+                let name = std::str::from_utf8(name_bytes).unwrap_or("");
+                let atom = state.atoms.intern(name, true);
+                if atom.0 != 0 {
+                    for host in state.resources.cursor_hosts_named(atom) {
+                        xfixes_replace_cursor(state, backend, origin, host, ResourceId(cursor_xid));
+                    }
+                }
+            }
+        }
+        x11xfixes::EXPAND_REGION => {
+            let Some(req) = x11xfixes::parse_expand_region(byte_order, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            // VERIFY_REGION source then destination: XFixes BadRegion
+            // (error base + 0).
+            for region in [req.source, req.destination] {
+                if !state.xfixes_regions.contains_key(&region) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        crate::nested::XFIXES_FIRST_ERROR,
+                        region,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+            }
+            let source = state.xfixes_regions[&req.source].rects.clone();
+            // An empty source leaves the destination untouched (Xorg only
+            // rewrites it inside `if (nBoxes)`; confirmed on Xvfb).
+            if !source.is_empty() {
+                let rects =
+                    xfixes_expand_region_rects(&source, req.left, req.right, req.top, req.bottom);
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "ExpandRegion src=0x{:08x} dst=0x{:08x} l={} r={} t={} b={} rects{}",
+                    req.source,
+                    req.destination,
+                    req.left,
+                    req.right,
+                    req.top,
+                    req.bottom,
+                    format_region_rects(&rects),
+                );
+                if let Some(dest) = state.xfixes_regions.get_mut(&req.destination) {
+                    dest.rects = rects;
                 }
             }
         }
@@ -7076,6 +7785,11 @@ fn handle_xfixes_request(
             // GetCursorName can read it back. yserver mirrors the same
             // shape: intern, store on `Cursor.name_atom`.
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_set_cursor_name(body) {
+                if let Err(outcome) =
+                    xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+                {
+                    return outcome;
+                }
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, false);
                 state
@@ -7101,6 +7815,11 @@ fn handle_xfixes_request(
                 .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                 .unwrap_or(0);
+            if let Err(outcome) =
+                xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+            {
+                return outcome;
+            }
             let atom = state
                 .resources
                 .cursor_name_atom(ResourceId(cursor_xid))
@@ -7121,15 +7840,74 @@ fn handle_xfixes_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
+            // Xorg `ProcXFixesHideCursor` / `ProcXFixesShowCursor`: the
+            // window only names the screen (one here); the hide count is
+            // per client. The sprite hides on the first count anywhere and
+            // returns when the last one goes (ShowCursor to zero, or the
+            // client disconnecting).
+            let Some(window) = x11xfixes::parse_window(byte_order, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            if minor == x11xfixes::HIDE_CURSOR {
+                let was_visible = state.xfixes_cursor_hide_counts.is_empty();
+                *state
+                    .xfixes_cursor_hide_counts
+                    .entry(client_id.0)
+                    .or_insert(0) += 1;
+                if was_visible {
+                    backend.set_cursor_hidden(true);
+                }
+            } else {
+                // Showing without a prior hide is BadMatch (Xvfb: error 8,
+                // value = the window).
+                let Some(count) = state.xfixes_cursor_hide_counts.get_mut(&client_id.0) else {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        window,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                };
+                *count -= 1;
+                if *count == 0 {
+                    state.xfixes_cursor_hide_counts.remove(&client_id.0);
+                    if state.xfixes_cursor_hide_counts.is_empty() {
+                        backend.set_cursor_hidden(false);
+                    }
+                }
+            }
             debug!(
-                "client {} #{} XFIXES::{}Cursor (stub)",
+                "client {} #{} XFIXES::{}Cursor window=0x{window:x} hide_counts={:?}",
                 client_id.0,
                 sequence.0,
                 if minor == x11xfixes::HIDE_CURSOR {
                     "Hide"
                 } else {
                     "Show"
-                }
+                },
+                state.xfixes_cursor_hide_counts,
             );
         }
         other if other > x11xfixes::DELETE_POINTER_BARRIER => {
@@ -7144,8 +7922,10 @@ fn handle_xfixes_request(
             );
         }
         other => {
+            // Every 5.0 request has an arm above; the gate in
+            // `dispatch_xfixes_request` keeps higher minors out.
             debug!(
-                "client {} #{} XFIXES::known unsupported minor={}",
+                "client {} #{} XFIXES::unexpected minor={}",
                 client_id.0, sequence.0, other
             );
         }
@@ -7754,7 +8534,18 @@ fn handle_mit_shm_request(
                 return Ok(RequestOutcome::Handled);
             };
             let byte_order = client.byte_order;
-            let reply = shm::encode_query_version_reply(byte_order, sequence, false);
+            // Xorg reports the server's effective uid/gid, stored in the
+            // 16-bit wire fields (truncating, as the C assignment does).
+            // SAFETY: geteuid/getegid take no arguments and cannot fail.
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            #[allow(clippy::cast_possible_truncation)]
+            let reply = shm::encode_query_version_reply(
+                byte_order,
+                sequence,
+                false,
+                euid as u16,
+                egid as u16,
+            );
             return Ok(write_to_client(client, client_id, &reply));
         }
         shm::ATTACH => {
@@ -8802,7 +9593,14 @@ fn handle_xtest_request(
                     header.opcode,
                 );
             };
-            let same = effective_window_cursor(state, window) == comparison;
+            // Xorg compares cursor objects: after XFIXES ChangeCursor two
+            // XIDs can name the same cursor, so compare their host handles.
+            let effective = effective_window_cursor(state, window);
+            let same = effective == comparison
+                || matches!((effective, comparison), (Some(a), Some(b))
+                    if state.resources.cursor_host_xid(a).is_some()
+                        && state.resources.cursor_host_xid(a)
+                            == state.resources.cursor_host_xid(b));
             debug!(
                 "client {} #{} XTEST::CompareCursor window=0x{:x} cursor=0x{:x} same={same}",
                 client_id.0, sequence.0, window.0, cursor.0,
@@ -9044,16 +9842,13 @@ fn dispatch_fake_input_with_body(
             );
         }
         x11xtest::FAKE_MOTION_NOTIFY => {
-            // detail==0 means absolute coords; detail==1 means relative.
-            // We only support absolute for now — relative needs the
-            // backend's current cursor position which isn't on the trait
-            // surface. xts does most motion as absolute.
-            if fi.detail != 0 {
-                log::debug!("XTEST FakeInput: relative MotionNotify not supported, dropping");
-                return;
-            }
-            backend.on_host_input(
-                state,
+            // detail 0 = absolute, detail 1 = relative (Xorg xtest.c: rootX/
+            // rootY become the valuators, POINTER_ABSOLUTE only for 0). A
+            // relative fake moves the sprite by the delta from its current
+            // position, unaccelerated (XTEST doesn't set POINTER_ACCELERATE);
+            // the backend clips to the screen. The delta also rides as the
+            // raw relative motion, so XI2 RawMotion reports it.
+            let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
@@ -9061,8 +9856,23 @@ fn dispatch_fake_input_with_body(
                     relative: false,
                     dx: 0,
                     dy: 0,
-                },
-            );
+                }
+            } else {
+                let (x, y) = state.pointer_root;
+                let (dx, dy) = (i32::from(fi.root_x), i32::from(fi.root_y));
+                HostInputEvent::PointerMotion {
+                    x: i32::from(x) + dx,
+                    y: i32::from(y) + dy,
+                    time: fi.time,
+                    relative: true,
+                    dx,
+                    dy,
+                }
+            };
+            backend.on_host_input(state, motion);
+            // Like WarpPointer: the physical-input tracker must continue
+            // from the faked position, or the next real motion jumps back.
+            backend.resync_input_position();
         }
         other => {
             log::debug!("XTEST FakeInput: unknown event type {other}, dropping");
@@ -9275,9 +10085,8 @@ pub(crate) fn emit_screen_saver_notify(
 
 /// Current idle value for an IDLETIME-family counter, expressed as
 /// milliseconds since `state.idletime_baseline(counter)`. Used by
-/// CREATE_ALARM, CHANGE_ALARM, and apply_alarm_attributes' Relative
-/// branch for resolving counter values that aren't stored in
-/// `state.sync_counters`.
+/// CREATE_ALARM / CHANGE_ALARM (Relative values, trigger checks) for
+/// counter values that aren't stored in `state.sync_counters`.
 pub(crate) fn idletime_current_idle(state: &ServerState, counter: u32) -> i64 {
     let baseline = state.idletime_baseline(counter);
     #[allow(clippy::cast_possible_truncation)]
@@ -9316,7 +10125,12 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
         return;
     }
     // Global IDLETIME: always reset on any input.
-    evaluate_alarms_for_counter(state, x11sync::IDLETIME_COUNTER, prior_global_idle_ms, 0);
+    crate::core_loop::sync_await::counter_changed(
+        state,
+        x11sync::IDLETIME_COUNTER,
+        prior_global_idle_ms,
+        0,
+    );
     state
         .idletime_last_evaluated
         .insert(x11sync::IDLETIME_COUNTER, 0);
@@ -9327,7 +10141,7 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
         3 => x11sync::IDLETIME_DEVICE_VCK,
         _ => return,
     };
-    evaluate_alarms_for_counter(state, device_counter, prior_device_idle_ms, 0);
+    crate::core_loop::sync_await::counter_changed(state, device_counter, prior_device_idle_ms, 0);
     state.idletime_last_evaluated.insert(device_counter, 0);
 }
 
@@ -10064,9 +10878,7 @@ fn supersede_covered_pending_presents(
                         "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
                     );
                 }
-                if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
-                    f.triggered = true;
-                }
+                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
             }
             crate::backend::PresentWake::PixmapSynced {
                 release,
@@ -10894,9 +11706,7 @@ fn execute_present_pixmap_copy_or_reroute(
                              failed: {e}"
                         );
                     }
-                    if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
-                        f.triggered = true;
-                    }
+                    crate::core_loop::sync_await::fence_triggered(state, idle_fence_xid);
                 }
                 crate::backend::PresentWake::PixmapSynced {
                     release,
@@ -12479,9 +13289,8 @@ pub(crate) fn discard_stale_present_event(
     backend.signal_present_wake(event.present_id);
     if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        fence.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
 }
 
@@ -12535,9 +13344,8 @@ pub(crate) fn complete_present_with_clock(
     if emit_idle
         && let PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(f) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        f.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
     fire_present_completion_events_at(state, event, clock, mode, emit_idle, true);
 }
@@ -12555,9 +13363,8 @@ pub(crate) fn retire_present_idle(
     backend.signal_present_wake(event.present_id);
     if let PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        fence.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
     let clock = refresh_present_crtc_completion_clock(
         state,
@@ -13602,7 +14409,7 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     attribs.push((g::GLX_HEIGHT, height));
     attribs.push((g::GLX_SCREEN, 0));
     if let Some(d) = drawable {
-        attribs.push((g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT));
+        attribs.push((g::GLX_TEXTURE_TARGET_EXT, d.texture_target));
         attribs.push((g::GLX_EVENT_MASK, d.event_mask));
         attribs.push((g::GLX_FBCONFIG_ID, d.fbconfig));
         if d.kind == crate::server::GlxDrawableKind::Pbuffer {
@@ -14671,10 +15478,27 @@ fn handle_glx_request(
             );
         }
         x11glx::IS_DIRECT => {
-            // We always claim direct rendering; the actual GL execution
-            // happens client-side via libGLX_mesa hitting our DRI3
-            // backend.
-            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, true);
+            // Xorg answers the context's recorded isDirect and
+            // GLXBadContext for an XID that is not a context
+            // (glxcmds.c:702-726, glx/vnd_dispatch_stubs.c:509-525). Mesa's
+            // glXImportContextEXT sends this first and returns NULL for a
+            // direct context without ever sending QueryContext.
+            let context = match glx_request_context(state, body) {
+                Ok(context) => context,
+                Err((code, value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let is_direct = state.glx_contexts[&context].is_direct;
+            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, is_direct);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -14722,37 +15546,46 @@ fn handle_glx_request(
         x11glx::CREATE_CONTEXT
         | x11glx::CREATE_NEW_CONTEXT
         | x11glx::CREATE_CONTEXT_ATTRIBS_ARB => {
-            // Allocate a GlxContext resource keyed by the client-
-            // chosen XID at body[0..4]. The fbconfig at body[4..8]
-            // and renderType at body[8..12] are recorded for the
-            // eventual MakeCurrent reply but otherwise unused — we
-            // never execute server-side GL.
-            let xid = if body.len() >= 4 {
-                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
-            } else {
-                0
+            // Allocate a GlxContext resource keyed by the client-chosen
+            // XID. We never execute server-side GL; the recorded config,
+            // share list, render type and isDirect flag are what
+            // QueryContext / IsDirect report back (Xorg DoCreateContext
+            // stores the same fields, glxcmds.c:318-325).
+            let Some(req) = x11glx::parse_create_context(minor, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
             };
-            let fbconfig = if body.len() >= 8 {
-                u32::from_le_bytes([body[4], body[5], body[6], body[7]])
-            } else {
-                0
-            };
-            let render_type = if body.len() >= 12 {
-                u32::from_le_bytes([body[8], body[9], body[10], body[11]])
-            } else {
-                0
+            let (visual_id, fbconfig) = match req.config {
+                x11glx::ContextConfigRef::Visual(visual) => {
+                    (visual, glx_visual_fbconfig(visual).unwrap_or(0))
+                }
+                x11glx::ContextConfigRef::FbConfig(fbconfig) => {
+                    (glx_fbconfig_visual(fbconfig), fbconfig)
+                }
             };
             state.glx_contexts.insert(
-                xid,
+                req.context,
                 crate::server::GlxContext {
                     owner: client_id,
+                    screen: req.screen,
+                    visual_id,
                     fbconfig,
-                    render_type,
+                    render_type: req.render_type,
+                    share_list: req.share_list,
+                    is_direct: req.is_direct,
                 },
             );
             debug!(
-                "client {} #{} GLX::CreateContext xid=0x{:x} fbconfig=0x{:x}",
-                client_id.0, sequence.0, xid, fbconfig
+                "client {} #{} GLX::CreateContext minor={minor} xid=0x{:x} fbconfig=0x{:x} \
+                 visual=0x{visual_id:x} share=0x{:x} direct={}",
+                client_id.0, sequence.0, req.context, fbconfig, req.share_list, req.is_direct
             );
         }
         x11glx::DESTROY_CONTEXT => {
@@ -14846,43 +15679,31 @@ fn handle_glx_request(
                     );
                 }
 
-                // For CREATE_PIXMAP: resolve the host_xid NOW and store it on
-                // the GlxDrawable so release is robust to the X pixmap being
-                // freed (X11 FreePixmap) before glXDestroyPixmap/disconnect —
-                // re-resolving x_drawable→host_xid at release time would fail
-                // once the resource is gone, leaking the export ref forever.
-                let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
-                    state
-                        .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
-                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+                if minor == x11glx::CREATE_PIXMAP {
+                    insert_glx_pixmap_record(
+                        state,
+                        backend,
+                        client_id,
+                        req.glx_window,
+                        req.x_window,
+                        req.fbconfig,
+                        x11glx::GLX_TEXTURE_2D_EXT,
+                    );
                 } else {
-                    None
-                };
-
-                state.glx_drawables.insert(
-                    req.glx_window,
-                    crate::server::GlxDrawable {
-                        owner: client_id,
-                        kind: if minor == x11glx::CREATE_PIXMAP {
-                            crate::server::GlxDrawableKind::Pixmap
-                        } else {
-                            crate::server::GlxDrawableKind::Window
+                    state.glx_drawables.insert(
+                        req.glx_window,
+                        crate::server::GlxDrawable {
+                            owner: client_id,
+                            kind: crate::server::GlxDrawableKind::Window,
+                            x_drawable: req.x_window,
+                            fbconfig: req.fbconfig,
+                            width: 0,
+                            height: 0,
+                            event_mask: 0,
+                            glx_export_host_xid: None,
+                            texture_target: x11glx::GLX_TEXTURE_2D_EXT,
                         },
-                        x_drawable: req.x_window,
-                        fbconfig: req.fbconfig,
-                        width: 0,
-                        height: 0,
-                        event_mask: 0,
-                        glx_export_host_xid: acquire_host_xid,
-                    },
-                );
-
-                // Acquire an export-lifetime ref on the backing so the
-                // ExportedBacking entry (and its dmabuf fd) outlives any early
-                // FreePixmap until glXDestroyPixmap.
-                if let Some(host_xid) = acquire_host_xid {
-                    backend.acquire_glx_pixmap_export(host_xid);
+                    );
                 }
 
                 debug!(
@@ -14916,6 +15737,7 @@ fn handle_glx_request(
                         height: req.height,
                         event_mask: 0,
                         glx_export_host_xid: None,
+                        texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
                     },
                 );
                 // #96 tier-2: back the pbuffer with a real GPU pixmap under its
@@ -14960,6 +15782,117 @@ fn handle_glx_request(
                     client_id.0, sequence.0
                 );
             }
+        }
+        x11glx::CREATE_GLX_PIXMAP => {
+            // GLX 1.0 glXCreateGLXPixmap: the visual-based counterpart of
+            // CreatePixmap. Checks run in Xorg's order — GLXVND's
+            // dispatch_CreateGLXPixmap (size, LEGAL_NEW_RESOURCE, screen →
+            // BadMatch; glx/vnd_dispatch_stubs.c:143-169), then
+            // __glXDisp_CreateGLXPixmap (visual → BadValue) and
+            // DoCreateGLXPixmap (dixLookupDrawable → BadDrawable, a window →
+            // BadPixmap; glxcmds.c:1198-1220, :1267-1280). Xorg compares
+            // neither the pixmap depth nor its visual with the config.
+            let glx_error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                )
+            };
+            let Some(req) = x11glx::parse_create_glx_pixmap(body) else {
+                return glx_error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let owned = state.clients.get(&client_id.0).is_some_and(|c| {
+                crate::server::IdAllocator::validate_owned(
+                    req.glx_pixmap,
+                    c.resource_id_base,
+                    c.resource_id_mask,
+                )
+            });
+            if !owned || state.xid_occupied(req.glx_pixmap) {
+                return glx_error(state, x11::error::BAD_ID_CHOICE, req.glx_pixmap);
+            }
+            // yserver has exactly one screen (screenInfo.numScreens == 1).
+            if req.screen != 0 {
+                return glx_error(state, x11::error::BAD_MATCH, req.screen);
+            }
+            let Some(fbconfig) = glx_visual_fbconfig(req.visual) else {
+                return glx_error(state, x11::error::BAD_VALUE, req.visual);
+            };
+            if state.resources.pixmap(ResourceId(req.pixmap)).is_none() {
+                let code = if state.resources.window(ResourceId(req.pixmap)).is_some() {
+                    x11::error::BAD_PIXMAP
+                } else {
+                    x11::error::BAD_DRAWABLE
+                };
+                return glx_error(state, code, req.pixmap);
+            }
+            // Xorg never runs determineTextureTarget for the GLX 1.0 form,
+            // so the target stays 0 and GetDrawableAttributes reports
+            // GLX_TEXTURE_RECTANGLE_EXT (glxcmds.c:1896-1897).
+            insert_glx_pixmap_record(
+                state,
+                backend,
+                client_id,
+                req.glx_pixmap,
+                req.pixmap,
+                fbconfig,
+                x11glx::GLX_TEXTURE_RECTANGLE_EXT,
+            );
+            debug!(
+                "client {} #{} GLX::CreateGLXPixmap glx_xid=0x{:x} x_pixmap=0x{:x} \
+                 visual=0x{:x} fbconfig=0x{fbconfig:x}",
+                client_id.0, sequence.0, req.glx_pixmap, req.pixmap, req.visual
+            );
+        }
+        x11glx::DESTROY_GLX_PIXMAP => {
+            // GLX 1.0 glXDestroyGLXPixmap. Only a live GLX pixmap — created
+            // by either CreateGLXPixmap or CreatePixmap, which Xorg keeps as
+            // the same GLX_DRAWABLE_PIXMAP type — may be destroyed; any other
+            // XID is GLXBadPixmap (glx/vnd_dispatch_stubs.c:189-205,
+            // glxcmds.c validGlxDrawable / DoDestroyDrawable).
+            let Some(xid) = x11glx::parse_single_xid(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            };
+            let is_glx_pixmap = state
+                .glx_drawables
+                .get(&xid)
+                .is_some_and(|d| d.kind == crate::server::GlxDrawableKind::Pixmap);
+            if !is_glx_pixmap {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::GLX_FIRST_ERROR + x11glx::ERROR_GLX_BAD_PIXMAP,
+                    xid,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            }
+            // Release the export ref through the host xid stored at create
+            // time, never by re-resolving the X pixmap: it may already be
+            // freed (see the DESTROY_PIXMAP arm).
+            if let Some(record) = state.glx_drawables.remove(&xid)
+                && let Some(host_xid) = record.glx_export_host_xid
+            {
+                backend.release_glx_pixmap_export(host_xid);
+            }
+            debug!(
+                "client {} #{} GLX::DestroyGLXPixmap glx_xid=0x{xid:x}",
+                client_id.0, sequence.0
+            );
         }
         x11glx::DELETE_WINDOW | x11glx::DESTROY_PIXMAP | x11glx::DESTROY_PBUFFER => {
             let xid = if body.len() >= 4 {
@@ -15099,10 +16032,39 @@ fn handle_glx_request(
             );
         }
         x11glx::QUERY_CONTEXT => {
-            // Reply with zero attribs — Mesa direct-rendering doesn't
-            // act on what comes back here.
-            let reply = x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &[]);
-            debug!("client {} #{} GLX::QueryContext", client_id.0, sequence.0);
+            // GLX 1.3 QueryContext, the request behind
+            // glXImportContextEXT (GLX_EXT_import_context, which, like Xorg
+            // without +iglx, we do not advertise). Xorg's DoQueryContext reports five
+            // attributes, in this order, for a live context of ANY client
+            // (glxcmds.c:1659-1708); an XID that is not a context is
+            // GLXBadContext (glx/vnd_dispatch_stubs.c:492-508).
+            let context = match glx_request_context(state, body) {
+                Ok(context) => context,
+                Err((code, value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let ctx = &state.glx_contexts[&context];
+            let attribs = [
+                (x11glx::GLX_SHARE_CONTEXT_EXT, ctx.share_list),
+                (x11glx::GLX_VISUAL_ID, ctx.visual_id),
+                (x11glx::GLX_SCREEN, ctx.screen),
+                (x11glx::GLX_FBCONFIG_ID, ctx.fbconfig),
+                (x11glx::GLX_RENDER_TYPE, ctx.render_type),
+            ];
+            let reply = x11glx::encode_query_context_reply(byte_order, sequence, &attribs);
+            debug!(
+                "client {} #{} GLX::QueryContext 0x{context:x} -> {attribs:x?}",
+                client_id.0, sequence.0
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -15272,8 +16234,12 @@ fn handle_glx_request(
                             req.context,
                             crate::server::GlxContext {
                                 owner: client_id,
+                                screen: req.screen,
+                                visual_id: glx_fbconfig_visual(req.fbconfig),
                                 fbconfig: req.fbconfig,
                                 render_type: req.render_type,
+                                share_list: req.share_list,
+                                is_direct: req.is_direct,
                             },
                         );
                         debug!(
@@ -15325,30 +16291,15 @@ fn handle_glx_request(
                                 crate::nested::GLX_MAJOR_OPCODE,
                             );
                         }
-                        // Resolve host_xid at create time (same lifetime
-                        // semantics as CREATE_PIXMAP — see comment there).
-                        let acquire_host_xid = state
-                            .resources
-                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
-                            .and_then(|p| p.host_xid.map(|h| h.as_raw()));
-
-                        state.glx_drawables.insert(
+                        insert_glx_pixmap_record(
+                            state,
+                            backend,
+                            client_id,
                             req.glx_pixmap,
-                            crate::server::GlxDrawable {
-                                owner: client_id,
-                                kind: crate::server::GlxDrawableKind::Pixmap,
-                                x_drawable: req.pixmap,
-                                fbconfig: req.fbconfig,
-                                width: 0,
-                                height: 0,
-                                event_mask: 0,
-                                glx_export_host_xid: acquire_host_xid,
-                            },
+                            req.pixmap,
+                            req.fbconfig,
+                            x11glx::GLX_TEXTURE_2D_EXT,
                         );
-
-                        if let Some(host_xid) = acquire_host_xid {
-                            backend.acquire_glx_pixmap_export(host_xid);
-                        }
 
                         debug!(
                             "client {} #{} GLX::CreateGLXPixmapWithConfigSGIX \
@@ -15469,6 +16420,26 @@ const XI1_USE_X_KEYBOARD: u16 = 255;
 /// keyboard. Mirrors `crate::xinput::initial_xi_devices`.
 fn xi1_device_valid(id: u16) -> bool {
     (2..=5).contains(&id)
+}
+
+/// The virtual core pointer (2) and keyboard (3) are the masters.
+fn xi1_device_is_master(id: u16) -> bool {
+    matches!(id, 2 | 3)
+}
+
+/// `XI2LASTEVENT` for XI 2.4 (`XI_GestureSwipeEnd`, XI2.h).
+const XI2_LAST_EVENT: u32 = 32;
+
+/// Xorg `XICheckInvalidMaskBits` (Xi/xiselectev.c): the lowest set bit
+/// above [`XI2_LAST_EVENT`] in an XI2 event mask (a bit array, bit n in
+/// byte n/8), if any.
+fn xi2_first_invalid_mask_bit(mask: &[u8]) -> Option<u32> {
+    mask.iter().enumerate().find_map(|(i, &byte)| {
+        let first_bit = u32::try_from(i * 8).ok()?;
+        (0..8u32)
+            .map(|b| first_bit + b)
+            .find(|&bit| bit > XI2_LAST_EVENT && byte & (1 << (bit - first_bit)) != 0)
+    })
 }
 
 /// Keyboards (3, 5) carry a KeyClass; pointers don't.
@@ -15617,6 +16588,251 @@ fn xi1_send_extension_event_resolve_targets(
         }
     }
     std::collections::HashSet::new()
+}
+
+/// XIWarpPointer (XI 2.0 minor 41) — Xorg `ProcXIWarpPointer`
+/// (Xi/xiwarppointer.c): core WarpPointer for one device, with FP16.16
+/// coordinates. Only a master pointer or a floating slave may be warped;
+/// yserver's only candidate is the master pointer (2), whose sprite is the
+/// core one, so this runs the core warp path with the XI source-rectangle
+/// rule.
+fn handle_xi_warp_pointer(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    // Length is gated to exactly 9 units above, so the body is 32 bytes.
+    let u32_at = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+    let fp1616_pixels = |o: usize| u32_at(o).cast_signed() / 65536;
+    let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+    let deviceid = u16_at(28);
+    if deviceid != crate::xinput::DEVICEID_MASTER_POINTER {
+        return xi1_error(
+            state,
+            client_id,
+            sequence,
+            XI1_ERROR_BAD_DEVICE,
+            u32::from(deviceid),
+            41,
+        );
+    }
+    let req = WarpRequest {
+        src: ResourceId(u32_at(0)),
+        dst: ResourceId(u32_at(4)),
+        src_x: fp1616_pixels(8),
+        src_y: fp1616_pixels(12),
+        src_w: u16_at(16),
+        src_h: u16_at(18),
+        dst_x: fp1616_pixels(20),
+        dst_y: fp1616_pixels(24),
+    };
+    if let Some(bad) = warp_pointer_bad_window(state, &req) {
+        return xi1_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+    }
+    if warp_pointer_src_allows(state, &req, WarpSrcRule::XInput2) {
+        apply_pointer_warp(state, backend, origin, &req);
+    }
+    debug!(
+        "client {} #{} XIWarpPointer dst=0x{:x} ({}, {})",
+        client_id.0, sequence.0, req.dst.0, req.dst_x, req.dst_y
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// XISetFocus (XI 2.0 minor 49) — Xorg `ProcXISetFocus`
+/// (Xi/xisetdevfocus.c): `SetInputFocus(dev, focus, RevertToParent,
+/// time, followOK=TRUE)` on a device with a focus class, i.e. a keyboard.
+/// Pointers and unknown ids are BadDevice (Xorg sets no errorValue).
+///
+/// The master keyboard's focus is the core focus, so device 3 runs core
+/// SetInputFocus. The slave keyboard (5) keeps its own focus
+/// (`xi1_device_focus`, shared with XI1 SetDeviceFocus) and may follow
+/// the keyboard. FollowKeyboard on the master keyboard itself would make
+/// it follow itself: Xorg stores `FollowKeyboardWin` and then crashes
+/// dereferencing it (Xvfb 21.1.24 segfaults at address 0x7), so yserver
+/// answers BadValue instead.
+fn handle_xi_set_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use crate::core_loop::xi1_focus;
+    const MINOR: u8 = 49;
+    // Length is gated to at least 4 units above.
+    let focus = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let req_time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let deviceid = u16::from_le_bytes([body[8], body[9]]);
+    if !xi1_device_has_keys(deviceid) {
+        return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, MINOR);
+    }
+    let revert_to = xi1_focus::REVERT_TO_PARENT;
+    if deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+        if focus == xi1_focus::FOCUS_FOLLOW_KEYBOARD {
+            return xi1_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                focus,
+                MINOR,
+            );
+        }
+        if let Some((code, value)) = core_focus_window_error(state, ResourceId(focus)) {
+            return xi1_error(state, client_id, sequence, code, value, MINOR);
+        }
+        apply_core_input_focus(
+            state,
+            client_id,
+            sequence,
+            ResourceId(focus),
+            revert_to,
+            req_time,
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    if focus != xi1_focus::FOCUS_FOLLOW_KEYBOARD
+        && let Some((code, value)) = core_focus_window_error(state, ResourceId(focus))
+    {
+        return xi1_error(state, client_id, sequence, code, value, MINOR);
+    }
+    // Timestamp gate (dix/events.c:4920-4922), as XI1 SetDeviceFocus.
+    let now = state.timestamp_now();
+    let time = if req_time == 0 { now } else { req_time };
+    let prev = xi1_focus::device_focus(state, deviceid);
+    if xi1_focus::time_after(time, now) || xi1_focus::time_after(prev.time, time) {
+        debug!(
+            "client {} #{} XISetFocus device={deviceid} stale time {time} \
+             (now={now} last={}) — ignored",
+            client_id.0, sequence.0, prev.time
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    xi1_focus::set_device_focus(state, deviceid, focus, revert_to, time);
+    debug!(
+        "client {} #{} XISetFocus device={deviceid} focus=0x{focus:x}",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// XIChangeHierarchy (XI 2.0 minor 43) — Xorg `ProcXIChangeHierarchy`
+/// (Xi/xichangehierarchy.c) over yserver's fixed device set: masters 2/3
+/// (the virtual core pair) and one fixed slave each (4/5).
+///
+/// The change list is walked exactly as Xorg walks it — same length
+/// checks, unknown change types skipped, processing stops at the first
+/// failing change — and every change gets the answer Xorg gives for the
+/// same devices:
+/// - RemoveMaster: return_mode must be Float/AttachToMaster (BadValue);
+///   the virtual core pair can never be removed (BadDevice), and a slave
+///   is not a master (BadDevice, errorValue = id).
+/// - AttachSlave / DetachSlave: masters are BadDevice (errorValue = id);
+///   yserver's slaves are fixed, which Xorg answers for its own fixed
+///   slaves (the XTest devices, ids 4/5 on Xvfb) with BadDevice,
+///   errorValue = id.
+/// - AddMaster: Xorg creates a new pair; yserver can't add devices, so it
+///   gives Xorg's answer when no device can be allocated (BadAlloc).
+///
+/// Unknown device ids are BadDevice with errorValue 0 (dixLookupDevice
+/// sets none). No change ever succeeds, so no HierarchyChanged event is
+/// sent. The change records are opaque to the request swapper and are
+/// read in the client's byte order (Xorg swaps only type/length/name_len
+/// and reads the device ids unswapped — for a big-endian client on a
+/// little-endian server that only changes the errorValue of the same
+/// BadDevice error).
+fn handle_xi_change_hierarchy(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    const MINOR: u8 = 43;
+    const ADD_MASTER: u16 = 1;
+    const REMOVE_MASTER: u16 = 2;
+    const ATTACH_SLAVE: u16 = 3;
+    const DETACH_SLAVE: u16 = 4;
+    const ATTACH_TO_MASTER: u8 = 1;
+    const FLOATING: u8 = 2;
+    let rd16 = |o: usize| {
+        let b = [body[o], body[o + 1]];
+        match byte_order {
+            ClientByteOrder::LittleEndian => u16::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u16::from_be_bytes(b),
+        }
+    };
+    let fail = |state: &mut ServerState, code: u8, value: u32| {
+        xi1_error(state, client_id, sequence, code, value, MINOR)
+    };
+    // Length is gated to at least 2 units above: num_changes + pad.
+    let num_changes = body[0];
+    let mut pos = 4usize;
+    for _ in 0..num_changes {
+        let len = body.len() - pos;
+        if len < 4 {
+            return fail(state, x11::error::BAD_LENGTH, 0);
+        }
+        let change_type = rd16(pos);
+        let change_bytes = usize::from(rd16(pos + 2)) * 4;
+        if len < change_bytes {
+            return fail(state, x11::error::BAD_LENGTH, 0);
+        }
+        // CHANGE_SIZE_MATCH: fixed-size records must state their own size.
+        let size_matches = |size: usize| len >= size && change_bytes == size;
+        match change_type {
+            ADD_MASTER => {
+                if len < 8 || usize::from(rd16(pos + 4)) > len - 8 {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                return fail(state, x11::error::BAD_ALLOC, 0);
+            }
+            REMOVE_MASTER => {
+                if !size_matches(12) {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                let return_mode = body[pos + 6];
+                if return_mode != ATTACH_TO_MASTER && return_mode != FLOATING {
+                    return fail(state, x11::error::BAD_VALUE, 0);
+                }
+                let deviceid = rd16(pos + 4);
+                // A slave is "not a master" (errorValue = id); the virtual
+                // core pair can't be removed and unknown ids don't exist
+                // (Xorg sets no errorValue for either).
+                let value = if xi1_device_valid(deviceid) && !xi1_device_is_master(deviceid) {
+                    u32::from(deviceid)
+                } else {
+                    0
+                };
+                return fail(state, XI1_ERROR_BAD_DEVICE, value);
+            }
+            ATTACH_SLAVE | DETACH_SLAVE => {
+                if !size_matches(8) {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                let deviceid = rd16(pos + 4);
+                // Masters and the fixed slaves report their id; unknown
+                // ids report 0.
+                let value = if xi1_device_valid(deviceid) {
+                    u32::from(deviceid)
+                } else {
+                    0
+                };
+                return fail(state, XI1_ERROR_BAD_DEVICE, value);
+            }
+            _ => {}
+        }
+        pos += change_bytes;
+    }
+    debug!(
+        "client {} #{} XIChangeHierarchy: {num_changes} change(s), nothing to do",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
 }
 
 fn handle_xi2_request(
@@ -15797,29 +17013,45 @@ fn handle_xi2_request(
             if body.len() >= 8 {
                 let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                 let num_masks = u16::from_le_bytes([body[4], body[5]]) as usize;
+                // Xorg ProcXISelectEvents checks every mask before
+                // setting any, so a rejected request changes nothing.
+                let mut masks: Vec<(u16, u64)> = Vec::with_capacity(num_masks);
                 let mut pos = 8;
+                for _ in 0..num_masks {
+                    if pos + 4 > body.len() {
+                        break;
+                    }
+                    let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
+                    let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
+                    pos += 4;
+                    let byte_len = mask_len.saturating_mul(4);
+                    if pos + byte_len > body.len() {
+                        break;
+                    }
+                    let mask_bytes = &body[pos..pos + byte_len];
+                    // XICheckInvalidMaskBits: a bit past XI2LASTEVENT is
+                    // BadValue with the bit number as errorValue.
+                    if let Some(bit) = xi2_first_invalid_mask_bit(mask_bytes) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            bit,
+                            46,
+                            header.opcode,
+                        );
+                    }
+                    // The mask is a bit array (bit n in byte n/8), so the
+                    // bytes are little-endian whatever the client order.
+                    let mut word = [0u8; 8];
+                    let keep = byte_len.min(8);
+                    word[..keep].copy_from_slice(&mask_bytes[..keep]);
+                    masks.push((deviceid, u64::from_le_bytes(word)));
+                    pos += byte_len;
+                }
                 if let Some(client) = state.clients.get_mut(&client_id.0) {
-                    for _ in 0..num_masks {
-                        if pos + 4 > body.len() {
-                            break;
-                        }
-                        let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
-                        let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
-                        pos += 4;
-                        let byte_len = mask_len.saturating_mul(4);
-                        if pos + byte_len > body.len() {
-                            break;
-                        }
-                        let mask = if mask_len > 0 {
-                            u32::from_le_bytes([
-                                body[pos],
-                                body[pos + 1],
-                                body[pos + 2],
-                                body[pos + 3],
-                            ])
-                        } else {
-                            0
-                        };
+                    for (deviceid, mask) in masks {
                         debug!(
                             "client {} XISelectEvents window=0x{:x} deviceid={} mask=0x{:x}",
                             client_id.0, window.0, deviceid, mask
@@ -15830,12 +17062,11 @@ fn handle_xi2_request(
                             client.xi2_masks.insert((window, deviceid), mask);
                             if window == ROOT_WINDOW
                                 && matches!(deviceid, 0..=2)
-                                && (mask & XI2_DEVICE_CHANGED_MASK) != 0
+                                && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
                             {
                                 send_device_changed_bootstrap = true;
                             }
                         }
-                        pos += byte_len;
                     }
                 }
             }
@@ -16451,24 +17682,39 @@ fn handle_xi2_request(
                 return Ok(RequestOutcome::Handled);
             }
             let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            // Xorg ProcXIGetSelectedEvents: one xXIEventMask per device
+            // in device-id order, each trimmed to the words that hold set
+            // bits. deviceid/mask_len follow the client byte order; the
+            // mask itself is a bit array (bit n in byte n/8), written as
+            // little-endian bytes for every client.
+            let mut selected: Vec<(u16, u64)> = state
+                .clients
+                .get(&client_id.0)
+                .map(|client| {
+                    client
+                        .xi2_masks
+                        .iter()
+                        .filter(|&(&(win, _), &mask)| win == window && mask != 0)
+                        .map(|(&(_, dev), &mask)| (dev, mask))
+                        .collect()
+                })
+                .unwrap_or_default();
+            selected.sort_unstable_by_key(|&(dev, _)| dev);
             let mut masks = Vec::new();
-            if let Some(client) = state.clients.get(&client_id.0) {
-                for (&(win, dev), &mask) in &client.xi2_masks {
-                    if win == window {
-                        x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, dev);
-                        x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, 1);
-                        x11::write_u32(ClientByteOrder::LittleEndian, &mut masks, mask);
-                    }
-                }
+            for &(dev, mask) in &selected {
+                let mask_len: u16 = if mask >> 32 == 0 { 1 } else { 2 };
+                x11::write_u16(byte_order, &mut masks, dev);
+                x11::write_u16(byte_order, &mut masks, mask_len);
+                masks.extend_from_slice(&mask.to_le_bytes()[..4 * usize::from(mask_len)]);
             }
-            let num_masks = (masks.len() / 8) as u16;
+            let num_masks = u16::try_from(selected.len()).unwrap_or(u16::MAX);
             let mut reply = x11::fixed_reply(
                 byte_order,
                 sequence,
                 0,
                 x11::checked_units(masks.len())? as u32,
             );
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, num_masks);
+            x11::write_u16(byte_order, &mut reply, num_masks);
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&masks);
             buf.extend_from_slice(&reply);
@@ -16722,7 +17968,7 @@ fn handle_xi2_request(
                         via_xi2: true,
                         implicit: false,
                         passive: false,
-                        xi2_mask: u32::MAX,
+                        xi2_mask: u64::MAX,
                     });
                 }
                 // Core↔XI bridge — Xorg `ActivateKeyboardGrab` /
@@ -20455,32 +21701,32 @@ fn handle_xi2_request(
         }
         50 => {
             // XIGetFocus { deviceid:CARD16 } -> xXIGetFocusReply
-            // { focus:WINDOW @8, 20 bytes pad }. Returns the raw stored
-            // per-device focus (None=0 / PointerRoot=1 / window), the same
-            // source XI1 GetDeviceFocus (minor 20) reads; Xorg
-            // (Xi/xifocus.c) doesn't resolve the sentinel here either.
+            // { focus:WINDOW @8, 20 bytes pad }. Xorg ProcXIGetFocus
+            // (Xi/xisetdevfocus.c) reports the device's raw focus (None=0 /
+            // PointerRoot=1 / FollowKeyboard=3 / window) without resolving
+            // the sentinels. Only keyboards have a focus class; pointers
+            // and unknown ids are BadDevice with no errorValue. The master
+            // keyboard's focus is the core focus; the slave keyboard's is
+            // its own (shared with XI1 GetDeviceFocus).
             let dev = if body.len() >= 2 {
                 u16::from_le_bytes([body[0], body[1]])
             } else {
                 0
             };
-            if !xi1_device_valid(dev) {
-                return xi1_error(
-                    state,
-                    client_id,
-                    sequence,
-                    XI1_ERROR_BAD_DEVICE,
-                    u32::from(dev),
-                    minor,
-                );
+            if !xi1_device_has_keys(dev) {
+                return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, minor);
             }
-            let f = crate::core_loop::xi1_focus::device_focus(state, dev);
+            let focus = if dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+                state.core_focus.raw
+            } else {
+                crate::core_loop::xi1_focus::device_focus(state, dev).focus
+            };
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u32(byte_order, &mut reply, f.focus); // bytes 8-11
+            x11::write_u32(byte_order, &mut reply, focus); // bytes 8-11
             reply.extend_from_slice(&[0u8; 20]); // bytes 12-31 pad
             debug!(
-                "client {} #{} XIGetFocus device={dev} -> focus=0x{:x}",
-                client_id.0, sequence.0, f.focus
+                "client {} #{} XIGetFocus device={dev} -> focus=0x{focus:x}",
+                client_id.0, sequence.0
             );
             buf.extend_from_slice(&reply);
         }
@@ -20526,7 +21772,17 @@ fn handle_xi2_request(
                 }
             }
         }
-        _ if minor == 0 || minor > XINPUT_LAST_REQUEST => {
+        41 => {
+            return handle_xi_warp_pointer(state, backend, origin, client_id, sequence, body);
+        }
+        43 => {
+            return handle_xi_change_hierarchy(state, client_id, sequence, byte_order, body);
+        }
+        49 => return handle_xi_set_focus(state, client_id, sequence, body),
+        // Every minor in 1..=XINPUT_LAST_REQUEST has an arm above; like
+        // Xorg's ProcIDispatch, anything else is BadRequest.
+        _ => {
+            debug_assert!(minor == 0 || minor > XINPUT_LAST_REQUEST);
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -20536,13 +21792,6 @@ fn handle_xi2_request(
                 u16::from(minor),
                 header.opcode,
             );
-        }
-        _ => {
-            debug!(
-                "client {} #{} known unsupported XI request minor={}",
-                client_id.0, sequence.0, minor
-            );
-            return Ok(RequestOutcome::Handled);
         }
     }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -20613,11 +21862,27 @@ fn handle_xkb_request(
             header.opcode,
         );
     }
-    let mut use_extension_supported = None;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(x11::ClientByteOrder::LittleEndian, |c| c.byte_order);
     if minor == X_KB_USE_EXTENSION {
-        use_extension_supported = Some(crate::core_loop::xkb_select::use_extension(
-            state, client_id, body,
-        ));
+        // Whether the client is supported is the core loop's decision (it
+        // tracks the client's XKB state), and so is the reply, which must
+        // be in the client's byte order. The backend still sees the request:
+        // a nested backend initialises XKB on its host connection with it.
+        let supported = crate::core_loop::xkb_select::use_extension(state, client_id, body);
+        let _backend_reply = {
+            let atoms = &mut state.atoms;
+            let mut intern = |name: &str| atoms.intern(name, false).0;
+            backend.xkb_proxy(origin, minor, body, &mut intern)
+        };
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        let mut buf = Vec::with_capacity(32);
+        x11::write_xkb_use_extension_reply(&mut buf, byte_order, sequence, supported)?;
+        return Ok(write_to_client(client, client_id, &buf));
     }
     // SelectEvents is applied here; on success the request still reaches
     // the backend (a nested backend forwards it to its host).
@@ -20712,9 +21977,7 @@ fn handle_xkb_request(
             backend.xkb_get_kbd_by_name(body, &mut intern)
         };
         if let Some((mut bytes, notify)) = kbn {
-            if bytes.len() >= 4 {
-                bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-            }
+            stamp_reply_sequence(&mut bytes, byte_order, sequence);
             // Broadcast NewKeyboardNotify on a successful load, BEFORE writing
             // the reply (Xorg order is reply-then-notify, but the notify fans
             // out to a different client set; ordering across clients is
@@ -20801,16 +22064,7 @@ fn handle_xkb_request(
             .flatten()
     };
     if let Some(mut bytes) = reply {
-        if bytes.len() >= 4 {
-            bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-        }
-        // UseExtension: whether the requested version is supported is the
-        // core loop's decision (it tracks the client's XKB state).
-        if let Some(supported) = use_extension_supported
-            && bytes.len() >= 2
-        {
-            bytes[1] = u8::from(supported);
-        }
+        stamp_reply_sequence(&mut bytes, byte_order, sequence);
         // GetControls: the per-key repeat is the core keyboard feedback's
         // (Xorg keeps XKB `per_key_repeat` and `autoRepeats` in sync), which
         // lives here, not in the backend.
@@ -20820,10 +22074,24 @@ fn handle_xkb_request(
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
         };
-        let _byte_order = client.byte_order;
         return Ok(write_to_client(client, client_id, &bytes));
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Write `sequence` into bytes 2..4 of a reply a backend built, in the
+/// client's byte order.
+fn stamp_reply_sequence(
+    bytes: &mut [u8],
+    byte_order: x11::ClientByteOrder,
+    sequence: SequenceNumber,
+) {
+    if let Some(field) = bytes.get_mut(2..4) {
+        field.copy_from_slice(&match byte_order {
+            x11::ClientByteOrder::LittleEndian => sequence.0.to_le_bytes(),
+            x11::ClientByteOrder::BigEndian => sequence.0.to_be_bytes(),
+        });
+    }
 }
 
 /// Send what an XKB Set* request did, in Xorg's order: each
@@ -22947,7 +24215,7 @@ fn emit_property_change(
         .filter_map(|(id, client)| {
             let selected = client.xi2_masks.iter().any(|(&(_, dev), &mask)| {
                 let device_matches = dev == deviceid || dev == XI_ALL_DEVICES;
-                device_matches && (mask & XI2_PROPERTY_EVENT_MASK) != 0
+                device_matches && (mask & u64::from(XI2_PROPERTY_EVENT_MASK)) != 0
             });
             selected.then_some(ClientId(*id))
         })
@@ -26515,96 +27783,109 @@ fn handle_set_input_focus(
                 42,
             );
         }
-        if window.0 > 1 {
-            let Some(w) = state.resources.window(window) else {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_WINDOW,
-                    window.0,
-                    42,
-                );
-            };
-            if w.map_state != crate::resources::MapState::Viewable {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    window.0,
-                    42,
-                );
-            }
+        if let Some((code, value)) = core_focus_window_error(state, window) {
+            return emit_x11_error(state, client_id, sequence, code, value, 42);
         }
-        // Xorg SetInputFocus: requests with a time LATER than the
-        // current time or EARLIER than the last focus time are
-        // silently ignored.
         let time = body
             .get(4..8)
             .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        let now = state
-            .timestamp_now()
-            .max(state.xi1_last_input_time)
-            .max(state.core_focus.time);
-        if time != 0
-            && (crate::core_loop::xi1_focus::time_after(time, now)
-                || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
-        {
-            debug!(
-                "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
-                client_id.0, sequence.0, state.core_focus.time
-            );
-            return Ok(RequestOutcome::Handled);
-        }
-        debug!(
-            "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
-            client_id.0, window.0
-        );
-        log::trace!(
-            target: "yserver::input::focus",
-            "SetInputFocus client={} window={} revert_to={revert_to}",
-            state.debug_client_label(client_id),
-            state.debug_window_label(window),
-        );
-        let from_raw = state.core_focus.raw;
-        let to_raw = window.0;
-        if from_raw != to_raw {
-            // Xorg SetInputFocus (dix/events.c:4923): the focus transition
-            // is reported NotifyWhileGrabbed (3) while a keyboard grab is
-            // active, else NotifyNormal (0). bspwm focuses a newly-mapped
-            // window WHILE sxhkd's synchronous passive key grab is still
-            // active; emitting NotifyNormal there told GLFW/kitty it had
-            // genuinely taken focus mid-grab, and its focus state machine
-            // then ignored every typed key (the keys still routed
-            // correctly to its window — only the FocusIn mode was wrong).
-            // Mirrors the same gate in `revert_core_focus_from`.
-            let mode = if state.active_keyboard_grab.is_some() {
-                3 // NotifyWhileGrabbed
-            } else {
-                0 // NotifyNormal
-            };
-            emit_core_focus_transition(state, from_raw, to_raw, mode);
-        }
-        state.core_focus = crate::server::CoreFocus {
-            raw: to_raw,
-            revert_to,
-            time: if time == 0 { now } else { time },
-        };
-        // Legacy mirror — the key fanout's `current_focus` and other
-        // readers still consult the per-client field; None/PointerRoot
-        // map to ROOT_WINDOW there (the fanout resolves PointerRoot
-        // through `state.core_focus` directly).
-        let mirror = match to_raw {
-            0 | 1 => ROOT_WINDOW,
-            w => ResourceId(w),
-        };
-        for c in state.clients.values_mut() {
-            c.focused_window = mirror;
-        }
+        apply_core_input_focus(state, client_id, sequence, window, revert_to, time);
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// The window check of Xorg `SetInputFocus`: a focus other than
+/// None(0)/PointerRoot(1) must be an existing window (BadWindow) that is
+/// viewable (BadMatch). Returns `(error code, errorValue)`.
+fn core_focus_window_error(state: &ServerState, window: ResourceId) -> Option<(u8, u32)> {
+    if window.0 <= 1 {
+        return None;
+    }
+    match state.resources.window(window) {
+        None => Some((x11::error::BAD_WINDOW, window.0)),
+        Some(w) if w.map_state != crate::resources::MapState::Viewable => {
+            Some((x11::error::BAD_MATCH, window.0))
+        }
+        Some(_) => None,
+    }
+}
+
+/// The rest of Xorg `SetInputFocus` for the master keyboard, whose focus
+/// is the core focus (core SetInputFocus and XISetFocus on device 3 both
+/// land here): the timestamp gate, the FocusOut/FocusIn chain, and the
+/// new focus/revert_to/time. `window` has passed
+/// [`core_focus_window_error`].
+fn apply_core_input_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    window: ResourceId,
+    revert_to: u8,
+    time: u32,
+) {
+    // Xorg SetInputFocus: requests with a time LATER than the
+    // current time or EARLIER than the last focus time are
+    // silently ignored.
+    let now = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.core_focus.time);
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
+    {
+        debug!(
+            "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
+            client_id.0, sequence.0, state.core_focus.time
+        );
+        return;
+    }
+    debug!(
+        "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
+        client_id.0, window.0
+    );
+    log::trace!(
+        target: "yserver::input::focus",
+        "SetInputFocus client={} window={} revert_to={revert_to}",
+        state.debug_client_label(client_id),
+        state.debug_window_label(window),
+    );
+    let from_raw = state.core_focus.raw;
+    let to_raw = window.0;
+    if from_raw != to_raw {
+        // Xorg SetInputFocus (dix/events.c:4923): the focus transition
+        // is reported NotifyWhileGrabbed (3) while a keyboard grab is
+        // active, else NotifyNormal (0). bspwm focuses a newly-mapped
+        // window WHILE sxhkd's synchronous passive key grab is still
+        // active; emitting NotifyNormal there told GLFW/kitty it had
+        // genuinely taken focus mid-grab, and its focus state machine
+        // then ignored every typed key (the keys still routed
+        // correctly to its window — only the FocusIn mode was wrong).
+        // Mirrors the same gate in `revert_core_focus_from`.
+        let mode = if state.active_keyboard_grab.is_some() {
+            3 // NotifyWhileGrabbed
+        } else {
+            0 // NotifyNormal
+        };
+        emit_core_focus_transition(state, from_raw, to_raw, mode);
+    }
+    state.core_focus = crate::server::CoreFocus {
+        raw: to_raw,
+        revert_to,
+        time: if time == 0 { now } else { time },
+    };
+    // Legacy mirror — the key fanout's `current_focus` and other
+    // readers still consult the per-client field; None/PointerRoot
+    // map to ROOT_WINDOW there (the fanout resolves PointerRoot
+    // through `state.core_focus` directly).
+    let mirror = match to_raw {
+        0 | 1 => ROOT_WINDOW,
+        w => ResourceId(w),
+    };
+    for c in state.clients.values_mut() {
+        c.focused_window = mirror;
+    }
 }
 
 /// Focus revert when the focus window (or an ancestor) becomes
@@ -29688,7 +30969,7 @@ fn handle_send_event(
     // guard targets the wnck/mate-panel case, which delivers by mask.
     let core_type = req.event[0] & 0x7f;
     if req.event_mask != 0 && matches!(core_type, 4..=8) {
-        let xi2_bit = 1u32 << core_type;
+        let xi2_bit = 1u64 << core_type;
         let before = targets.len();
         targets.retain(|target| {
             let Some(target_client) = state.clients.get(&target.0) else {
@@ -29892,98 +31173,179 @@ fn handle_warp_pointer(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
-        let src_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-        let dst_x = i16::from_le_bytes([body[16], body[17]]);
-        let dst_y = i16::from_le_bytes([body[18], body[19]]);
-        // Xorg ProcWarpPointer: BadWindow for a nonexistent src or
-        // dst window.
-        if src_window.0 != 0 && state.resources.window(src_window).is_none() {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_WINDOW,
-                src_window.0,
-                41,
+        let rd16 = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]);
+        let rdu16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+        let req = WarpRequest {
+            src: ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]])),
+            dst: ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]])),
+            src_x: i32::from(rd16(8)),
+            src_y: i32::from(rd16(10)),
+            src_w: rdu16(12),
+            src_h: rdu16(14),
+            dst_x: i32::from(rd16(16)),
+            dst_y: i32::from(rd16(18)),
+        };
+        if let Some(bad) = warp_pointer_bad_window(state, &req) {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+        }
+        if !warp_pointer_src_allows(state, &req, WarpSrcRule::Core) {
+            debug!(
+                "client {} #{} WarpPointer no-op (pointer outside src rect)",
+                client_id.0, sequence.0
             );
+            return Ok(RequestOutcome::Handled);
         }
-        if dst_window.0 != 0 && state.resources.window(dst_window).is_none() {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_WINDOW,
-                dst_window.0,
-                41,
-            );
-        }
-        // src_window != None: the warp only happens when the pointer
-        // is currently inside the source rectangle of src_window
-        // (width/height 0 extend to the window edge).
-        if src_window.0 != 0 {
-            let src_x = i16::from_le_bytes([body[8], body[9]]);
-            let src_y = i16::from_le_bytes([body[10], body[11]]);
-            let src_w = u16::from_le_bytes([body[12], body[13]]);
-            let src_h = u16::from_le_bytes([body[14], body[15]]);
-            let (px, py) = state.pointer_root;
-            let (ox, oy) = state.resources.window_absolute_position(src_window);
-            let rel_x = i32::from(px) - ox;
-            let rel_y = i32::from(py) - oy;
-            let (win_w, win_h) = state
-                .resources
-                .window(src_window)
-                .map_or((0, 0), |w| (i32::from(w.width), i32::from(w.height)));
-            let x0 = i32::from(src_x);
-            let y0 = i32::from(src_y);
-            let x1 = if src_w == 0 {
-                win_w
-            } else {
-                x0 + i32::from(src_w)
-            };
-            let y1 = if src_h == 0 {
-                win_h
-            } else {
-                y0 + i32::from(src_h)
-            };
-            if rel_x < x0 || rel_x >= x1 || rel_y < y0 || rel_y >= y1 {
-                debug!(
-                    "client {} #{} WarpPointer no-op (pointer outside src rect)",
-                    client_id.0, sequence.0
-                );
-                return Ok(RequestOutcome::Handled);
-            }
-        }
-        if dst_window.0 == 0 {
-            // dst=None: move relative to the current pointer position.
-            if let Ok(p) = backend.query_pointer(origin) {
-                let abs_x = i32::from(p.win_x) + i32::from(dst_x);
-                let abs_y = i32::from(p.win_y) + i32::from(dst_y);
-                let prev = state.barrier_bypass;
-                state.barrier_bypass = true;
-                backend.warp_pointer_root(state, abs_x, abs_y);
-                state.barrier_bypass = prev;
-            }
-        } else {
-            let host_target = state
-                .resources
-                .host_drawable_target(dst_window)
-                .map(|t| (t.host_xid(), dst_x, dst_y));
-            if let Some((host_xid, x, y)) = host_target {
-                let _ = backend.warp_pointer(origin, host_xid, x, y);
-            }
-            // Resolve the destination to root-absolute coordinates for
-            // self-contained backends (KMS) — see
-            // `Backend::warp_pointer_root`. No-op for proxy backends.
-            let (wx, wy) = state.resources.window_absolute_position(dst_window);
-            let prev = state.barrier_bypass;
-            state.barrier_bypass = true;
-            backend.warp_pointer_root(state, wx + i32::from(dst_x), wy + i32::from(dst_y));
-            state.barrier_bypass = prev;
-        }
+        apply_pointer_warp(state, backend, origin, &req);
     }
     debug!("client {} #{} WarpPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// Which of Xorg's two source-rectangle tests a warp uses. Xorg keeps
+/// two copies that differ in one term (see [`warp_pointer_src_allows`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarpSrcRule {
+    /// `ProcWarpPointer` (dix/events.c).
+    Core,
+    /// `ProcXIWarpPointer` (Xi/xiwarppointer.c).
+    XInput2,
+}
+
+/// A decoded core `WarpPointer` or `XIWarpPointer`. The XI FP16.16
+/// coordinates are already converted to whole pixels the way Xorg does
+/// it (`int src_x = stuff->src_x / (double)(1 << 16)`, which truncates
+/// toward zero).
+struct WarpRequest {
+    src: ResourceId,
+    dst: ResourceId,
+    src_x: i32,
+    src_y: i32,
+    src_w: u16,
+    src_h: u16,
+    dst_x: i32,
+    dst_y: i32,
+}
+
+/// The first nonexistent window of a warp, in Xorg's lookup order: the
+/// destination is looked up before the source in both ProcWarpPointer
+/// and ProcXIWarpPointer.
+fn warp_pointer_bad_window(state: &ServerState, req: &WarpRequest) -> Option<u32> {
+    [req.dst, req.src]
+        .into_iter()
+        .find(|w| w.0 != 0 && state.resources.window(*w).is_none())
+        .map(|w| w.0)
+}
+
+/// Whether the pointer is inside the warp's source rectangle, so the
+/// warp goes ahead (always true without a source window).
+///
+/// Ported term for term, including the XI copy's slip: its right-edge
+/// test compares against 0 instead of the pointer x
+/// (`winX + src_x + src_width < 0`, Xi/xiwarppointer.c), so an XI warp
+/// ignores the right edge of the rectangle — only the window's own
+/// extent (via the visibility test) bounds it. Both copies treat the
+/// right/bottom edges as inclusive, and a zero width/height as "to the
+/// window's edge". The core copy skips the visibility test for the root
+/// window (`source->parent &&`); the XI copy always runs it.
+fn warp_pointer_src_allows(state: &ServerState, req: &WarpRequest, rule: WarpSrcRule) -> bool {
+    if req.src.0 == 0 {
+        return true;
+    }
+    let (x, y) = (
+        i32::from(state.pointer_root.0),
+        i32::from(state.pointer_root.1),
+    );
+    let (win_x, win_y) = state.resources.window_absolute_position(req.src);
+    let left = win_x + req.src_x;
+    let top = win_y + req.src_y;
+    let right_limit = match rule {
+        WarpSrcRule::Core => x,
+        WarpSrcRule::XInput2 => 0,
+    };
+    let outside = x < left
+        || y < top
+        || (req.src_w != 0 && left + i32::from(req.src_w) < right_limit)
+        || (req.src_h != 0 && top + i32::from(req.src_h) < y);
+    if outside {
+        return false;
+    }
+    let check_visibility = rule == WarpSrcRule::XInput2 || req.src != ROOT_WINDOW;
+    !check_visibility || point_in_window_is_visible(state, req.src, x, y)
+}
+
+/// Xorg `PointInWindowIsVisible` (dix/window.c): the window is viewable
+/// and the root point lies in its visible border-inclusive region and
+/// input shape. The pointer hit test resolves exactly that — the point is
+/// in `window`'s region iff the deepest window under it is `window` or
+/// one of its inferiors.
+fn point_in_window_is_visible(state: &ServerState, window: ResourceId, x: i32, y: i32) -> bool {
+    if window == ROOT_WINDOW {
+        return true;
+    }
+    let viewable = state
+        .resources
+        .window(window)
+        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+    if !viewable {
+        return false;
+    }
+    let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) else {
+        return false;
+    };
+    state
+        .root_pointer_target_at(x, y)
+        .is_some_and(|(hit, _, _)| {
+            hit == window || crate::core_loop::xi1_focus::is_ancestor(state, window, hit)
+        })
+}
+
+/// Move the sprite for a validated warp: relative to the destination
+/// window's origin, or to the current position when there is none,
+/// clamped to the screen like ProcWarpPointer/ProcXIWarpPointer, then
+/// through the backend's absolute-motion path (which generates the
+/// crossing and motion events a warp is specified to produce). Warps
+/// bypass pointer barriers.
+fn apply_pointer_warp(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    req: &WarpRequest,
+) {
+    let (base_x, base_y) = if req.dst.0 == 0 {
+        (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        )
+    } else {
+        state.resources.window_absolute_position(req.dst)
+    };
+    let (root_w, root_h) = state
+        .resources
+        .window(ROOT_WINDOW)
+        .map_or((1, 1), |r| (i32::from(r.width), i32::from(r.height)));
+    let x = base_x
+        .saturating_add(req.dst_x)
+        .clamp(0, (root_w - 1).max(0));
+    let y = base_y
+        .saturating_add(req.dst_y)
+        .clamp(0, (root_h - 1).max(0));
+    if req.dst.0 != 0 {
+        // Proxy backends warp the host pointer relative to the host
+        // window (a no-op on KMS, which only uses `warp_pointer_root`).
+        let to_i16 = |v: i32| i16::try_from(v).unwrap_or(if v < 0 { i16::MIN } else { i16::MAX });
+        if let Some(target) = state.resources.host_drawable_target(req.dst) {
+            let _ = backend.warp_pointer(
+                origin,
+                target.host_xid(),
+                to_i16(req.dst_x),
+                to_i16(req.dst_y),
+            );
+        }
+    }
+    let prev = state.barrier_bypass;
+    state.barrier_bypass = true;
+    backend.warp_pointer_root(state, x, y);
+    state.barrier_bypass = prev;
 }
 
 fn handle_get_modifier_mapping(
@@ -31560,6 +32922,113 @@ fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11
     })
 }
 
+/// Record a GLXPixmap over the (already validated) X pixmap `x_pixmap` and
+/// take its export-lifetime ref — the one resource model behind GLX 1.0
+/// `CreateGLXPixmap`, GLX 1.3 `CreatePixmap` and
+/// `CreateGLXPixmapWithConfigSGIX`, as Xorg funnels all three through
+/// `DoCreateGLXPixmap` (glxcmds.c:1198-1220).
+///
+/// The host xid is resolved NOW and stored on the record so release is
+/// robust to the X pixmap being freed (X11 `FreePixmap`) before the GLX
+/// destroy / disconnect — re-resolving `x_drawable → host_xid` at release
+/// time would fail once the resource is gone, leaking the ref forever. The
+/// ref keeps the `ExportedBacking` entry (and its dmabuf fd) alive past an
+/// early `FreePixmap`, the counterpart of Xorg's `pixmap->refcnt++`.
+fn insert_glx_pixmap_record(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    owner: ClientId,
+    glx_pixmap: u32,
+    x_pixmap: u32,
+    fbconfig: u32,
+    texture_target: u32,
+) {
+    let acquire_host_xid = state
+        .resources
+        .pixmap(ResourceId(x_pixmap))
+        .and_then(|p| p.host_xid.map(|h| h.as_raw()));
+    state.glx_drawables.insert(
+        glx_pixmap,
+        crate::server::GlxDrawable {
+            owner,
+            kind: crate::server::GlxDrawableKind::Pixmap,
+            x_drawable: x_pixmap,
+            fbconfig,
+            width: 0,
+            height: 0,
+            event_mask: 0,
+            glx_export_host_xid: acquire_host_xid,
+            texture_target,
+        },
+    );
+    if let Some(host_xid) = acquire_host_xid {
+        backend.acquire_glx_pixmap_export(host_xid);
+    }
+}
+
+/// The context XID of a `QueryContext` / `IsDirect` request, or the error
+/// Xorg sends: `BadLength` for a body that is not exactly one XID
+/// (`REQUEST_SIZE_MATCH`), `GLXBadContext` with the XID as bad value when
+/// it names no live context (glx/vnd_dispatch_stubs.c:492-525).
+fn glx_request_context(state: &ServerState, body: &[u8]) -> Result<u32, (u8, u32)> {
+    use yserver_protocol::x11::glx as g;
+    let Some(xid) = g::parse_single_xid(body) else {
+        return Err((x11::error::BAD_LENGTH, 0));
+    };
+    if state.glx_contexts.contains_key(&xid) {
+        Ok(xid)
+    } else {
+        Err((
+            crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_CONTEXT,
+            xid,
+        ))
+    }
+}
+
+/// The FBConfig behind a GLX *visual*, or `None` when `visual` is not one
+/// of the GLX visuals `GetVisualConfigs` advertises. Mirrors Xorg's
+/// `validGlxVisual`, which searches `pGlxScreen->visuals` only — an
+/// FBConfig ID, or an X visual without a GLX config, is not a GLX visual
+/// (glxcmds.c:90-107). `synthesise_glx_fb_configs` stays the single source
+/// of the visual → FBConfig pairing.
+fn glx_visual_fbconfig(visual: u32) -> Option<u32> {
+    use yserver_protocol::x11::glx as g;
+    if !synthesise_glx_visual_configs()
+        .iter()
+        .any(|v| v.visual_id == visual)
+    {
+        return None;
+    }
+    synthesise_glx_fb_configs(false).iter().find_map(|cfg| {
+        cfg.iter()
+            .any(|(a, v)| *a == g::GLX_VISUAL_ID && *v == visual)
+            .then(|| {
+                cfg.iter()
+                    .find(|(a, _)| *a == g::GLX_FBCONFIG_ID)
+                    .map(|(_, v)| *v)
+            })
+            .flatten()
+    })
+}
+
+/// The X visual of a synthesised FBConfig (`GLX_VISUAL_ID`), 0 for a
+/// visual-less or unknown FBConfig — Xorg's `ctx->config->visualID`.
+fn glx_fbconfig_visual(fbconfig: u32) -> u32 {
+    use yserver_protocol::x11::glx as g;
+    synthesise_glx_fb_configs(false)
+        .iter()
+        .find(|cfg| {
+            cfg.iter()
+                .any(|(a, v)| *a == g::GLX_FBCONFIG_ID && *v == fbconfig)
+        })
+        .and_then(|cfg| {
+            cfg.iter()
+                .find(|(a, _)| *a == g::GLX_VISUAL_ID)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
 /// Depth (24 or 32) of a synthesised GLX FBConfig, derived from the X visual
 /// it maps to (`ROOT_VISUAL` depth-24 / `ARGB_VISUAL` depth-32) — the single
 /// source of truth is `synthesise_glx_fb_configs`, so this stays correct if
@@ -32254,6 +33723,23 @@ mod tests {
         assert_eq!(glx_fbconfig_depth(0xDEAD), 24);
     }
 
+    /// Every GLX visual `GetVisualConfigs` advertises has an FBConfig carrying
+    /// that visual (Xorg's `pGlxScreen->visuals[i]` *is* a config), and the
+    /// pairing round-trips. FBConfig IDs and the visual-less FBConfig are
+    /// not GLX visuals.
+    #[test]
+    fn glx_visual_fbconfig_pairs_every_advertised_visual() {
+        for visual in synthesise_glx_visual_configs() {
+            let fbconfig = glx_visual_fbconfig(visual.visual_id)
+                .unwrap_or_else(|| panic!("visual 0x{:x} has no FBConfig", visual.visual_id));
+            assert_eq!(glx_fbconfig_visual(fbconfig), visual.visual_id);
+        }
+        assert_eq!(glx_visual_fbconfig(0x101), None);
+        assert_eq!(glx_visual_fbconfig(0x104), None);
+        assert_eq!(glx_fbconfig_visual(0x104), 0);
+        assert_eq!(glx_fbconfig_visual(0xDEAD), 0);
+    }
+
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
         let (a, b) = UnixStream::pair().unwrap();
         state.clients.insert(
@@ -32491,7 +33977,7 @@ mod tests {
             via_xi2,
             implicit: false,
             passive,
-            xi2_mask: if via_xi2 { u32::MAX } else { 0 },
+            xi2_mask: if via_xi2 { u64::MAX } else { 0 },
         });
     }
 
@@ -33518,16 +35004,15 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // Master keyboard (device 3) focused on a real window.
+        // Master keyboard (device 3) focused on a real window. The master
+        // keyboard's focus IS the core focus (Xorg: `inputInfo.keyboard->
+        // focus`, which ProcSetInputFocus and ProcXIGetFocus share).
         let win = 0x4000_0005u32;
-        state.xi1_device_focus.insert(
-            3,
-            crate::server::Xi1DeviceFocus {
-                focus: win,
-                revert_to: 0,
-                time: 0,
-            },
-        );
+        state.core_focus = crate::server::CoreFocus {
+            raw: win,
+            revert_to: 0,
+            time: 0,
+        };
         // XIGetFocus { deviceid:CARD16=3 } + pad.
         let header = RequestHeader {
             opcode: 137,
@@ -33580,6 +35065,849 @@ mod tests {
         assert_eq!(bytes[0], 0, "error packet");
         assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "BadDevice");
         assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor echoed");
+    }
+
+    // ── XIWarpPointer / XISetFocus / XIChangeHierarchy / XISelectEvents ──
+    //
+    // Expected values below are Xvfb 21.1.24 captures (raw-socket probe,
+    // little-endian client unless noted), cross-checked against
+    // Xi/xiwarppointer.c, Xi/xisetdevfocus.c, Xi/xichangehierarchy.c and
+    // Xi/xiselectev.c.
+
+    /// Send one XInput request (major 137) from client 1 and return what
+    /// the client received.
+    fn send_xi_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let header = RequestHeader {
+            opcode: 137,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        };
+        handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            body,
+        )
+        .expect("xi request");
+        read_all_available(peer)
+    }
+
+    fn assert_xi_error(bytes: &[u8], code: u8, value: u32, minor: u16) {
+        assert_eq!(bytes.len(), 32, "one error packet: {bytes:02x?}");
+        assert_eq!(bytes[0], 0, "error packet: {bytes:02x?}");
+        assert_eq!(bytes[1], code, "error code: {bytes:02x?}");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            value,
+            "errorValue: {bytes:02x?}"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            minor,
+            "minor opcode: {bytes:02x?}"
+        );
+        assert_eq!(bytes[10], XI2_MAJOR_OPCODE, "major opcode");
+    }
+
+    /// A mapped 100×100 child of the root at (100, 100), owned by client 1.
+    fn seed_mapped_window_at_100(state: &mut ServerState, xid: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(xid));
+    }
+
+    fn fp1616(v: f64) -> i32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = (v * 65536.0).round() as i32;
+        raw
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn xi_warp_body(
+        src: u32,
+        dst: u32,
+        src_x: f64,
+        src_y: f64,
+        src_w: u16,
+        src_h: u16,
+        dst_x: f64,
+        dst_y: f64,
+        deviceid: u16,
+    ) -> Vec<u8> {
+        let mut b = Vec::with_capacity(32);
+        b.extend_from_slice(&src.to_le_bytes());
+        b.extend_from_slice(&dst.to_le_bytes());
+        b.extend_from_slice(&fp1616(src_x).to_le_bytes());
+        b.extend_from_slice(&fp1616(src_y).to_le_bytes());
+        b.extend_from_slice(&src_w.to_le_bytes());
+        b.extend_from_slice(&src_h.to_le_bytes());
+        b.extend_from_slice(&fp1616(dst_x).to_le_bytes());
+        b.extend_from_slice(&fp1616(dst_y).to_le_bytes());
+        b.extend_from_slice(&deviceid.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_core_warp(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        src: u32,
+        dst: u32,
+        src_x: i16,
+        src_y: i16,
+        src_w: u16,
+        src_h: u16,
+        dst_x: i16,
+        dst_y: i16,
+    ) {
+        let mut b = Vec::with_capacity(20);
+        b.extend_from_slice(&src.to_le_bytes());
+        b.extend_from_slice(&dst.to_le_bytes());
+        b.extend_from_slice(&src_x.to_le_bytes());
+        b.extend_from_slice(&src_y.to_le_bytes());
+        b.extend_from_slice(&src_w.to_le_bytes());
+        b.extend_from_slice(&src_h.to_le_bytes());
+        b.extend_from_slice(&dst_x.to_le_bytes());
+        b.extend_from_slice(&dst_y.to_le_bytes());
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 41,
+                data: 0,
+                length_units: 6,
+            },
+            &b,
+            None,
+        )
+        .expect("WarpPointer");
+    }
+
+    #[test]
+    fn xi_warp_pointer_moves_to_truncated_fp1616_destination() {
+        // Xvfb: XIWarpPointer(dst=root, 10.75, 20.25) → pointer (10, 20);
+        // then relative (-0.5, -1.5) → (10, 19); relative (+0.99, +2.5)
+        // → (10, 21). ProcXIWarpPointer stores the FP16.16 values in
+        // ints, so the fraction truncates toward zero.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 10.75, 20.25, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert!(bytes.is_empty(), "XIWarpPointer has no reply: {bytes:02x?}");
+        assert_eq!(backend.warped_to, Some((10, 20)));
+
+        state.pointer_root = (10, 20);
+        let body = xi_warp_body(0, 0, 0.0, 0.0, 0, 0, -0.5, -1.5, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((10, 19)));
+
+        state.pointer_root = (10, 19);
+        let body = xi_warp_body(0, 0, 0.0, 0.0, 0, 0, 0.99, 2.5, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((10, 21)));
+    }
+
+    #[test]
+    fn xi_warp_pointer_to_window_and_clamped_to_the_screen() {
+        // Xvfb (1024×768): dst=W(100,100) (5, 6) → (105, 106);
+        // (-5.5, -6.5) → (95, 94); dst=root (5000, 5000) → (w-1, h-1);
+        // (-3, -3) → (0, 0). The test root is 800×600.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const W: u32 = 0x0040_0001;
+        seed_mapped_window_at_100(&mut state, W);
+        for (dx, dy, want) in [(5.0, 6.0, (105, 106)), (-5.5, -6.5, (95, 94))] {
+            let body = xi_warp_body(0, W, 0.0, 0.0, 0, 0, dx, dy, 2);
+            let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_eq!(backend.warped_to, Some(want), "dst=W ({dx}, {dy})");
+        }
+        for (dx, dy, want) in [
+            (5000.0, 5000.0, (799, 599)),
+            (800.0, 600.0, (799, 599)),
+            (-3.0, -3.0, (0, 0)),
+        ] {
+            let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, dx, dy, 2);
+            let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_eq!(backend.warped_to, Some(want), "dst=root ({dx}, {dy})");
+        }
+    }
+
+    #[test]
+    fn xi_warp_pointer_rejects_everything_but_the_master_pointer() {
+        // ProcXIWarpPointer: BadDevice unless the device is a master
+        // pointer or a floating slave (yserver has no floating slaves).
+        // errorValue = deviceid. Xvfb: devices 0,1,3,4,5,99 → BadDevice.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for dev in [0u16, 1, 3, 4, 5, 99] {
+            let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 5.0, 5.0, dev);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, u32::from(dev), 41);
+        }
+        // The device is checked before the windows.
+        let body = xi_warp_body(0, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 3);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 3, 41);
+        assert_eq!(backend.warped_to, None, "no rejected request may warp");
+    }
+
+    #[test]
+    fn xi_warp_pointer_bad_windows_report_dst_before_src() {
+        // Xvfb: dst bad → BadWindow(dst); src bad → BadWindow(src); both
+        // bad → BadWindow(dst).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi_warp_body(0, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 41);
+        let body = xi_warp_body(0x00be_ef00, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00be_ef00, 41);
+        let body = xi_warp_body(0x00be_ef00, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 41);
+        assert_eq!(backend.warped_to, None);
+    }
+
+    #[test]
+    fn xi_warp_pointer_source_rectangle_follows_xorgs_xi_arithmetic() {
+        // Xorg keeps two copies of the source-rectangle test. The XI one
+        // compares the right edge against 0 instead of the pointer x
+        // (`winX + src_x + src_width < 0`), so with W at (100,100) 100×100
+        // and src rect (0,0,10,10):
+        //   pointer (160,105): XIWarpPointer WARPS, core WarpPointer doesn't;
+        //   pointer (105,160): neither warps (the bottom edge is checked);
+        //   pointer (105,110): XI warps (bottom edge inclusive).
+        // Both also require the pointer to be visible in the source window:
+        //   pointer (50,50), src rect (-100,-100,0,0): no warp.
+        // The src coordinates truncate: pointer (104,104) with src_x 4.9
+        // warps, with 5.0 doesn't; pointer (99,99) with -0.9 doesn't.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_mapped_window_at_100(&mut state, W);
+        let cases = [
+            ((160_i16, 105_i16), (0.0, 0.0, 10_u16, 10_u16), true),
+            ((105, 160), (0.0, 0.0, 10, 10), false),
+            ((105, 110), (0.0, 0.0, 10, 10), true),
+            ((50, 50), (-100.0, -100.0, 0, 0), false),
+            ((104, 104), (4.9, 4.9, 0, 0), true),
+            ((104, 104), (5.0, 5.0, 0, 0), false),
+            ((99, 99), (-0.9, -0.9, 0, 0), false),
+        ];
+        for (pointer, (sx, sy, sw, sh), warps) in cases {
+            let mut backend = RecordingBackend::new();
+            state.pointer_root = pointer;
+            let body = xi_warp_body(W, ROOT_WINDOW.0, sx, sy, sw, sh, 300.0, 300.0, 2);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert!(bytes.is_empty(), "no error: {bytes:02x?}");
+            assert_eq!(
+                backend.warped_to,
+                warps.then_some((300, 300)),
+                "pointer {pointer:?} src ({sx},{sy},{sw},{sh})"
+            );
+        }
+        // src = root: always inside.
+        let mut backend = RecordingBackend::new();
+        state.pointer_root = (50, 50);
+        let body = xi_warp_body(ROOT_WINDOW.0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 70.0, 70.0, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((70, 70)));
+    }
+
+    #[test]
+    fn core_warp_pointer_source_rectangle_matches_xorg() {
+        // ProcWarpPointer (Xvfb): W at (100,100) 100×100, src rect
+        // (0,0,10,10): pointer (160,105) → no warp; (110,105) → warp (the
+        // right edge is inclusive: `winX + srcX + srcWidth < x`);
+        // (50,50) with src rect (-100,-100,0,0) → no warp (the pointer is
+        // not visible in W). Bad windows report dst before src.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_mapped_window_at_100(&mut state, W);
+        for (pointer, (sx, sy, sw, sh), warps) in [
+            ((160, 105), (0, 0, 10, 10), false),
+            ((110, 105), (0, 0, 10, 10), true),
+            ((105, 110), (0, 0, 10, 10), true),
+            ((50, 50), (-100, -100, 0, 0), false),
+        ] {
+            let mut backend = RecordingBackend::new();
+            state.pointer_root = pointer;
+            send_core_warp(
+                &mut state,
+                &mut backend,
+                W,
+                ROOT_WINDOW.0,
+                sx,
+                sy,
+                sw,
+                sh,
+                300,
+                300,
+            );
+            assert_eq!(
+                backend.warped_to,
+                warps.then_some((300, 300)),
+                "pointer {pointer:?} src ({sx},{sy},{sw},{sh})"
+            );
+        }
+        let mut backend = RecordingBackend::new();
+        send_core_warp(
+            &mut state,
+            &mut backend,
+            0x00be_ef00,
+            0x00de_ad00,
+            0,
+            0,
+            0,
+            0,
+            5,
+            5,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_WINDOW);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0x00de_ad00,
+            "dst is looked up first"
+        );
+    }
+
+    fn xi_set_focus_body(focus: u32, time: u32, deviceid: u16) -> Vec<u8> {
+        let mut b = Vec::with_capacity(12);
+        b.extend_from_slice(&focus.to_le_bytes());
+        b.extend_from_slice(&time.to_le_bytes());
+        b.extend_from_slice(&deviceid.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    /// Split a byte stream into X packets (GenericEvents carry a tail).
+    fn split_packets(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 32 <= bytes.len() {
+            let mut len = 32;
+            if bytes[pos] & 0x7f == 35 || bytes[pos] == 1 {
+                len += 4 * u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            }
+            out.push(&bytes[pos..pos + len]);
+            pos += len;
+        }
+        out
+    }
+
+    #[test]
+    fn xi_set_focus_on_the_master_keyboard_is_core_set_input_focus() {
+        // Xvfb: XISetFocus(dev 3, W) → GetInputFocus = W with revert_to
+        // RevertToParent (ProcXISetFocus passes RevertToParent), XIGetFocus
+        // (3) = W, and the core + XI2 FocusIn/FocusOut chain is delivered.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        {
+            let client = state.clients.get_mut(&1).unwrap();
+            client.event_masks.insert(ResourceId(W), FOCUS_CHANGE_MASK);
+            client
+                .xi2_masks
+                .insert((ResourceId(W), 0), (1 << 9) | (1 << 10));
+        }
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0, 3),
+        );
+        assert_eq!(state.core_focus.raw, W);
+        assert_eq!(state.core_focus.revert_to, 2, "RevertToParent");
+        let packets = split_packets(&bytes);
+        assert!(
+            packets
+                .iter()
+                .any(|p| p[0] == 9 && u32::from_le_bytes(p[4..8].try_into().unwrap()) == W),
+            "core FocusIn on W: {packets:02x?}"
+        );
+        assert!(
+            packets.iter().any(|p| p[0] == 35
+                && u16::from_le_bytes(p[8..10].try_into().unwrap()) == 9
+                && u32::from_le_bytes(p[24..28].try_into().unwrap()) == W),
+            "XI2 FocusIn on W: {packets:02x?}"
+        );
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[3, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &W.to_le_bytes(), "XIGetFocus(3) = W");
+
+        // Xvfb: None and PointerRoot are accepted and reported back.
+        for focus in [0u32, 1] {
+            let _ = send_xi_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                49,
+                &xi_set_focus_body(focus, 0, 3),
+            );
+            assert_eq!(state.core_focus.raw, focus);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[3, 0, 0, 0]);
+            let bytes = split_packets(&bytes).last().unwrap().to_vec();
+            assert_eq!(&bytes[8..12], &focus.to_le_bytes());
+        }
+
+        // A time later than the server's clock is silently ignored.
+        let _ = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0x7fff_ffff, 3),
+        );
+        assert_eq!(state.core_focus.raw, 1, "future-timestamp request ignored");
+    }
+
+    #[test]
+    fn xi_set_focus_errors_match_xorg() {
+        // Xvfb: devices without a focus class (the pointers) and unknown
+        // ids → BadDevice, errorValue 0 (ProcXISetFocus sets none); a
+        // missing window → BadWindow; an unviewable one → BadMatch with
+        // the window as errorValue.
+        const UNMAPPED: u32 = 0x0040_0002;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(UNMAPPED),
+                parent: ROOT_WINDOW,
+                width: 10,
+                height: 10,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        for dev in [0u16, 1, 2, 4, 99] {
+            let bytes = send_xi_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                49,
+                &xi_set_focus_body(ROOT_WINDOW.0, 0, dev),
+            );
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 0, 49);
+        }
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(0x00de_ad00, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 49);
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(UNMAPPED, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_MATCH, UNMAPPED, 49);
+        // FollowKeyboard on the master keyboard itself would make it
+        // follow itself (Xvfb segfaults on it); yserver rejects it.
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(3, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 3, 49);
+        assert_eq!(state.core_focus.raw, 1, "focus untouched by errors");
+    }
+
+    #[test]
+    fn xi_set_focus_on_the_slave_keyboard_sets_its_own_focus() {
+        // Xvfb: XISetFocus(dev 5, W) leaves the core focus alone and
+        // XIGetFocus(5) = W; FollowKeyboard (3) is accepted on a slave
+        // and reported back as 3.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0, 5),
+        );
+        assert!(bytes.is_empty(), "{bytes:02x?}");
+        assert_eq!(state.core_focus.raw, 1, "core focus unchanged");
+        let f = crate::core_loop::xi1_focus::device_focus(&state, 5);
+        assert_eq!((f.focus, f.revert_to), (W, 2));
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[5, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &W.to_le_bytes());
+        let _ = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(3, 0, 5),
+        );
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[5, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &3u32.to_le_bytes(), "FollowKeyboard");
+    }
+
+    #[test]
+    fn xi_get_focus_rejects_pointer_devices() {
+        // Xvfb: XIGetFocus on devices without a focus class (2, 4) →
+        // BadDevice, errorValue 0.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for dev in [2u8, 4] {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[dev, 0, 0, 0]);
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 0, 50);
+        }
+    }
+
+    fn xi_hierarchy_body(num_changes: u8, changes: &[&[u8]]) -> Vec<u8> {
+        let mut b = vec![num_changes, 0, 0, 0];
+        for c in changes {
+            b.extend_from_slice(c);
+        }
+        b
+    }
+
+    fn le_u16s(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn remove_master_change(dev: u16, mode: u8) -> Vec<u8> {
+        let mut c = le_u16s(&[2, 3, dev]);
+        c.extend_from_slice(&[mode, 0]);
+        c.extend_from_slice(&le_u16s(&[2, 3]));
+        c
+    }
+
+    #[test]
+    fn xi_change_hierarchy_answers_like_xorg_for_the_fixed_devices() {
+        // Every row is an Xvfb 21.1.24 capture. Xvfb's devices 4/5 are the
+        // XTest slaves, which Xorg refuses to attach/detach ("these are
+        // fixed"); yserver's 4/5 are fixed too, so the answers match
+        // device-for-device. `None` = Success (no reply, no event).
+        const BAD_DEVICE: u8 = XI1_ERROR_BAD_DEVICE;
+        let attach = |dev: u16, master: u16| le_u16s(&[3, 2, dev, master]);
+        let detach = |dev: u16| le_u16s(&[4, 2, dev, 0]);
+        // (label, request body, expected error (code, errorValue)).
+        type Case = (&'static str, Vec<u8>, Option<(u8, u32)>);
+        let cases: Vec<Case> = vec![
+            ("empty", xi_hierarchy_body(0, &[]), None),
+            (
+                "remove 2 float",
+                xi_hierarchy_body(1, &[&remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 3 attach",
+                xi_hierarchy_body(1, &[&remove_master_change(3, 1)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 2 mode 5",
+                xi_hierarchy_body(1, &[&remove_master_change(2, 5)]),
+                Some((x11::error::BAD_VALUE, 0)),
+            ),
+            (
+                "remove 4",
+                xi_hierarchy_body(1, &[&remove_master_change(4, 2)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "remove 99",
+                xi_hierarchy_body(1, &[&remove_master_change(99, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 0",
+                xi_hierarchy_body(1, &[&remove_master_change(0, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "attach 4->2",
+                xi_hierarchy_body(1, &[&attach(4, 2)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "attach 4->3",
+                xi_hierarchy_body(1, &[&attach(4, 3)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "attach 5->3",
+                xi_hierarchy_body(1, &[&attach(5, 3)]),
+                Some((BAD_DEVICE, 5)),
+            ),
+            (
+                "attach 2->3",
+                xi_hierarchy_body(1, &[&attach(2, 3)]),
+                Some((BAD_DEVICE, 2)),
+            ),
+            (
+                "attach 99->2",
+                xi_hierarchy_body(1, &[&attach(99, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "detach 4",
+                xi_hierarchy_body(1, &[&detach(4)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "detach 5",
+                xi_hierarchy_body(1, &[&detach(5)]),
+                Some((BAD_DEVICE, 5)),
+            ),
+            (
+                "detach 2",
+                xi_hierarchy_body(1, &[&detach(2)]),
+                Some((BAD_DEVICE, 2)),
+            ),
+            (
+                "detach 99",
+                xi_hierarchy_body(1, &[&detach(99)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "unknown type skipped",
+                xi_hierarchy_body(1, &[&le_u16s(&[9, 1])]),
+                None,
+            ),
+            (
+                "unknown then remove 2",
+                xi_hierarchy_body(2, &[&le_u16s(&[9, 1]), &remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove with length 2",
+                xi_hierarchy_body(1, &[&le_u16s(&[2, 2, 2, 2, 0, 3])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "attach with length 3",
+                xi_hierarchy_body(1, &[&le_u16s(&[3, 3, 4, 2, 0, 0])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "num_changes 2, one change",
+                xi_hierarchy_body(2, &[&remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "change length past the request",
+                xi_hierarchy_body(1, &[&le_u16s(&[3, 9, 4, 2])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "add master, name longer than the request",
+                xi_hierarchy_body(1, &[&[1, 0, 2, 0, 4, 0, 1, 1]]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+        ];
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for (label, body, want) in cases {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 43, &body);
+            match want {
+                None => assert!(bytes.is_empty(), "{label}: {bytes:02x?}"),
+                Some((code, value)) => {
+                    assert!(!bytes.is_empty(), "{label}: expected an error");
+                    assert_eq!(bytes[1], code, "{label}: {bytes:02x?}");
+                    assert_xi_error(&bytes, code, value, 43);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xi_change_hierarchy_add_master_is_refused_with_bad_alloc() {
+        // Xorg creates the pair; yserver's device set is fixed, so it
+        // answers the way Xorg does when it cannot allocate a device
+        // (AllocDevicePair → BadAlloc) and sends no HierarchyChanged.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), 1 << 11);
+        let mut add = le_u16s(&[1, 3, 3]);
+        add.extend_from_slice(&[1, 1]);
+        add.extend_from_slice(b"foo\0");
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            43,
+            &xi_hierarchy_body(1, &[&add]),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_ALLOC, 0, 43);
+    }
+
+    #[test]
+    fn xi_change_hierarchy_reads_changes_in_client_byte_order() {
+        // The change list is opaque to the request swapper; a big-endian
+        // client's AttachSlave(4 → 2) must still name device 4.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let change: Vec<u8> = [3u16, 2, 4, 2]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            43,
+            &xi_hierarchy_body(1, &[&change]),
+        );
+        assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "{bytes:02x?}");
+        assert_eq!(&bytes[4..8], &4u32.to_be_bytes(), "errorValue = device 4");
+    }
+
+    #[test]
+    fn xi_unknown_minor_is_bad_request() {
+        // Xvfb: XI minors 0, 62, 200, 255 → BadRequest (ProcIDispatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for minor in [0u8, 62, 200, 255] {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, minor, &[0; 8]);
+            assert_xi_error(&bytes, x11::error::BAD_REQUEST, 0, u16::from(minor));
+        }
+    }
+
+    fn xi_select_body(window: u32, masks: &[(u16, &[u32])]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&window.to_le_bytes());
+        b.extend_from_slice(&u16::try_from(masks.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        for (dev, words) in masks {
+            b.extend_from_slice(&dev.to_le_bytes());
+            b.extend_from_slice(&u16::try_from(words.len()).unwrap().to_le_bytes());
+            for w in *words {
+                // Event masks are bit arrays: byte i holds bits 8i..8i+7.
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn xi_select_events_keeps_bit_32_and_rejects_bits_past_the_last_event() {
+        // Xvfb: select dev 2 = {2, 30, 31, 32} (mask_len 2) + dev 3 = {3};
+        // XIGetSelectedEvents returns exactly
+        //   02000200 040000c0 01000000 03000100 08000000
+        // (masks in device order, trailing zero words trimmed). Selecting
+        // bit 33 → BadValue(33), bit 69 → BadValue(69), and the rejected
+        // request changes nothing.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        let lo = (1u32 << 2) | (1 << 30) | (1 << 31);
+        let body = xi_select_body(W, &[(2, &[lo, 1]), (3, &[1 << 3])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert!(bytes.is_empty(), "{bytes:02x?}");
+        let expected_tail: [u8; 20] = [
+            0x02, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x01, 0x00, 0x08, 0x00, 0x00, 0x00,
+        ];
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(reply.len(), 52, "{reply:02x?}");
+        assert_eq!(&reply[4..8], &5u32.to_le_bytes(), "reply length");
+        assert_eq!(&reply[8..10], &2u16.to_le_bytes(), "num_masks");
+        assert_eq!(&reply[32..], &expected_tail);
+
+        let body = xi_select_body(W, &[(2, &[0, 1 << 1])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 33, 46);
+        let body = xi_select_body(W, &[(2, &[1 << 2, 0, 1 << 5])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 69, 46);
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(
+            &reply[32..],
+            &expected_tail,
+            "rejected selects applied nothing"
+        );
+    }
+
+    #[test]
+    fn xi_get_selected_events_header_fields_use_client_byte_order() {
+        // Xvfb, big-endian client, same selection as above:
+        //   00020002 040000c0 01000000 00030001 08000000
+        // deviceid/mask_len/num_masks swap; the mask bytes don't.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let lo = (1u32 << 2) | (1 << 30) | (1 << 31);
+        // Request bodies reach the handler already swapped to LE.
+        let body = xi_select_body(W, &[(2, &[lo, 1]), (3, &[1 << 3])]);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(&reply[4..8], &5u32.to_be_bytes(), "reply length");
+        assert_eq!(&reply[8..10], &2u16.to_be_bytes(), "num_masks");
+        assert_eq!(
+            &reply[32..],
+            &[
+                0x00, 0x02, 0x00, 0x02, 0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03,
+                0x00, 0x01, 0x08, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
@@ -38624,7 +40952,7 @@ mod tests {
         // at the root window — the way GDK/Chromium subscribe.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
             (ROOT_WINDOW, DEVICEID_SLAVE_POINTER),
-            XI2_DEVICE_CHANGED_MASK,
+            u64::from(XI2_DEVICE_CHANGED_MASK),
         );
 
         // Touchpad add → DeviceChanged for device 4.
@@ -38703,12 +41031,10 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let non_root = ResourceId(0x4000_0001);
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((non_root, DEVICEID_SLAVE_POINTER), XI2_DEVICE_CHANGED_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (non_root, DEVICEID_SLAVE_POINTER),
+            u64::from(XI2_DEVICE_CHANGED_MASK),
+        );
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
         assert!(dropped.is_empty());
         assert!(
@@ -40141,7 +42467,7 @@ mod tests {
             .get_mut(&client_id)
             .expect("client installed")
             .xi2_masks
-            .insert((ROOT_WINDOW, deviceid), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, deviceid), u64::from(XI2_PROPERTY_EVENT_MASK));
     }
 
     #[test]
@@ -40404,12 +42730,10 @@ mod tests {
         // Selecting `XI_DeviceChanged` only — the
         // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
         // must be skipped.
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ROOT_WINDOW, 4), crate::xinput::XI2_DEVICE_CHANGED_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ROOT_WINDOW, 4),
+            u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK),
+        );
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40457,7 +42781,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .xi2_masks
-            .insert((ROOT_WINDOW, 3), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, 3), u64::from(XI2_PROPERTY_EVENT_MASK));
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40507,7 +42831,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .xi2_masks
-            .insert((ROOT_WINDOW, 0), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, 0), u64::from(XI2_PROPERTY_EVENT_MASK));
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40596,12 +42920,10 @@ mod tests {
         seed_touchpad_for_t3(&mut state);
         // Subscribe via a non-root window — anything keyed by the
         // device id wins.
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ResourceId(0xdead_beef), 4), XI2_PROPERTY_EVENT_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ResourceId(0xdead_beef), 4),
+            u64::from(XI2_PROPERTY_EVENT_MASK),
+        );
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -54836,7 +57158,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
         // Sanity: sibling is NOT a descendant of grab window.
         assert!(
@@ -56013,7 +58335,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
         // ReplayDevice only acts on a FROZEN device with a stored event to
         // replay (Xorg AllowSome) — engage the sync freeze + activating press.
@@ -56124,13 +58446,13 @@ mod tests {
             .get_mut(&GRAB_CLIENT_ID)
             .expect("grab client")
             .xi2_masks
-            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+            .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
         state
             .clients
             .get_mut(&TARGET_CLIENT_ID)
             .expect("target client")
             .xi2_masks
-            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+            .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
         state.button_grabs.push(PassiveButtonGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(TARGET_WIN),
@@ -56576,7 +58898,10 @@ mod tests {
             .get_mut(&OTHER_CLIENT_ID)
             .expect("other client")
             .xi2_masks
-            .insert((ResourceId(OTHER_WIN), 1), XI2_BUTTON_RELEASE_BIT);
+            .insert(
+                (ResourceId(OTHER_WIN), 1),
+                u64::from(XI2_BUTTON_RELEASE_BIT),
+            );
 
         // muffin holds an active master-pointer grab (XIGrabDevice).
         // owner_events=false → every event funnels to the grab owner.
@@ -56590,7 +58915,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         Backend::register_top_level(&mut backend, None, ResourceId(OTHER_WIN), OTHER_HOST_XID)
@@ -57642,6 +59967,2081 @@ mod tests {
         let reply_nbytes = u16::from_le_bytes(wire2[12..14].try_into().unwrap()) as usize;
         assert_eq!(reply_atom, 0, "unnamed cursor reports atom=0 (None)");
         assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
+    }
+
+    /// One XFIXES request through the real dispatcher (version gate
+    /// included), little-endian body.
+    fn xfixes_req(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("xfixes request");
+    }
+
+    fn xfixes_u32s(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Split queued 32-byte packets (errors, events, fixed replies).
+    fn wire_packets(peer: &mut UnixStream) -> Vec<[u8; 32]> {
+        read_all_available(peer)
+            .chunks_exact(32)
+            .map(|c| <[u8; 32]>::try_from(c).unwrap())
+            .collect()
+    }
+
+    fn le_u32(p: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(p[at..at + 4].try_into().unwrap())
+    }
+
+    /// Error packet → (code, bad value, minor, major).
+    fn error_fields(p: &[u8; 32]) -> (u8, u32, u16, u8) {
+        assert_eq!(p[0], 0, "expected an error packet, got type {}", p[0]);
+        (p[1], le_u32(p, 4), u16::from_le_bytes([p[8], p[9]]), p[10])
+    }
+
+    /// QueryVersion follows Xorg's rule and gates requests on the
+    /// negotiated major. Ground truth: Xorg 21.1.24 Xvfb, raw xcb probe —
+    /// HideCursor before QueryVersion is BadRequest (major 138 there,
+    /// minor 29, value 0); 4.0 → 4.0; then 2.0 → 2.0 while HideCursor
+    /// still succeeds and DeletePointerBarrier (a 5.0 request) is
+    /// BadRequest; 7.0 is capped at the server version.
+    #[test]
+    fn xfixes_query_version_negotiates_and_gates_requests() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_REQUEST, 0, 29, XFIXES_MAJOR_OPCODE)
+        );
+        assert!(state.xfixes_cursor_hide_counts.is_empty());
+
+        let query = |state: &mut ServerState,
+                     backend: &mut RecordingBackend,
+                     peer: &mut UnixStream,
+                     major: u32,
+                     minor: u32| {
+            xfixes_req(
+                state,
+                backend,
+                1,
+                x11xfixes::QUERY_VERSION,
+                &xfixes_u32s(&[major, minor]),
+            );
+            let packets = wire_packets(peer);
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0][0], 1, "reply");
+            (le_u32(&packets[0], 8), le_u32(&packets[0], 12))
+        };
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 4, 0), (4, 0));
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 2, 0), (2, 0));
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert!(wire_packets(&mut peer).is_empty(), "4.0 request set kept");
+        assert_eq!(state.xfixes_cursor_hide_counts.get(&1), Some(&1));
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::DELETE_POINTER_BARRIER,
+            &xfixes_u32s(&[0x1234]),
+        );
+        let packets = wire_packets(&mut peer);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_REQUEST, 0, 32, XFIXES_MAJOR_OPCODE)
+        );
+
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 7, 0), (5, 0));
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 3, 7), (3, 7));
+    }
+
+    /// Hide/Show counting, captured on Xvfb: bad window → BadWindow (value
+    /// = window) for both; ShowCursor without a hide → BadMatch (value =
+    /// window); two hides need two shows and a third show is BadMatch.
+    /// Across clients the sprite hides on the first hide anywhere and
+    /// comes back when the last hider shows or disconnects.
+    #[test]
+    fn xfixes_hide_show_cursor_counts_per_client() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        state.xfixes_client_major.insert(1, 5);
+        state.xfixes_client_major.insert(2, 5);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+        let hidden_calls = |backend: &RecordingBackend| -> Vec<bool> {
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|c| match c {
+                    RecordedCall::SetCursorHidden(h) => Some(*h),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        for minor in [x11xfixes::HIDE_CURSOR, x11xfixes::SHOW_CURSOR] {
+            xfixes_req(
+                &mut state,
+                &mut backend,
+                1,
+                minor,
+                &xfixes_u32s(&[0x0bad_bad0]),
+            );
+            let packets = wire_packets(&mut peer1);
+            assert_eq!(
+                error_fields(&packets[0]),
+                (
+                    x11::error::BAD_WINDOW,
+                    0x0bad_bad0,
+                    u16::from(minor),
+                    XFIXES_MAJOR_OPCODE
+                )
+            );
+        }
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_MATCH, root, 30, XFIXES_MAJOR_OPCODE)
+        );
+        assert!(hidden_calls(&backend).is_empty());
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            2,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert_eq!(
+            hidden_calls(&backend),
+            vec![true],
+            "one edge for three hides"
+        );
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert!(wire_packets(&mut peer1).is_empty());
+        assert_eq!(hidden_calls(&backend), vec![true], "client 2 still hides");
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_MATCH, root, 30, XFIXES_MAJOR_OPCODE)
+        );
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+        );
+        assert_eq!(
+            hidden_calls(&backend),
+            vec![true, false],
+            "disconnect shows"
+        );
+        assert!(state.xfixes_cursor_hide_counts.is_empty());
+        assert!(!state.xfixes_client_major.contains_key(&2));
+    }
+
+    /// CursorNotify fan-out, per the Xvfb capture: one event per
+    /// (client, window) selection carrying that window, the cursor serial
+    /// and its name atom; a destroyed window's selection is gone; bad mask
+    /// → BadValue, bad window → BadWindow.
+    #[test]
+    fn xfixes_cursor_notify_goes_to_each_selection() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const CHILD: u32 = 0x0040_0001;
+        const CURSOR: u32 = 0x0040_0010;
+        const HOST: u32 = 0x0001_0077;
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
+        state.xfixes_client_major.insert(1, 5);
+        state.xfixes_client_major.insert(2, 5);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+        create_present_test_window(&mut state, CHILD, 0, 0, 10, 10);
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(CURSOR));
+        state.resources.set_cursor_host_xid(
+            ResourceId(CURSOR),
+            crate::backend::CursorHandle::from_raw(HOST).unwrap(),
+        );
+        let name = state.atoms.intern("bname", false);
+        state
+            .resources
+            .set_cursor_name_atom(ResourceId(CURSOR), name);
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[root, 2]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer1)[0]),
+            (x11::error::BAD_VALUE, 2, 3, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[0x0bad_bad0, 1]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer1)[0]),
+            (x11::error::BAD_WINDOW, 0x0bad_bad0, 3, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[root, 1]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[CHILD, 1]),
+        );
+        assert!(wire_packets(&mut peer1).is_empty());
+
+        backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
+            host_xid: HOST,
+            serial: 3,
+        });
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        let events = wire_packets(&mut peer1);
+        assert_eq!(events.len(), 2, "one per selection");
+        let mut windows = Vec::new();
+        for e in &events {
+            assert_eq!(e[0], crate::nested::XFIXES_FIRST_EVENT + 1);
+            assert_eq!(e[1], x11xfixes::DISPLAY_CURSOR_NOTIFY);
+            windows.push(le_u32(e, 4));
+            assert_eq!(le_u32(e, 8), 3, "serial");
+            assert_eq!(le_u32(e, 16), name.0, "name atom");
+        }
+        windows.sort_unstable();
+        assert_eq!(windows, vec![root, CHILD]);
+        assert!(
+            wire_packets(&mut peer2).is_empty(),
+            "client 2 never selected"
+        );
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        assert!(
+            wire_packets(&mut peer1).is_empty(),
+            "the report is consumed"
+        );
+
+        // Destroying the child drops its selection (Xorg CursorFreeWindow).
+        destroy_window_subtree(&mut state, &mut backend, None, ResourceId(CHILD));
+        backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
+            host_xid: 0x0001_0099,
+            serial: 1,
+        });
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        let events = wire_packets(&mut peer1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(le_u32(&events[0], 4), root);
+        assert_eq!(le_u32(&events[0], 16), 0, "unnamed cursor");
+    }
+
+    /// ChangeCursor: every XID of the destination cursor now names the
+    /// source cursor, and the backend replaces its displayed uses. Xvfb:
+    /// bad source / bad destination → BadCursor naming it.
+    #[test]
+    fn xfixes_change_cursor_retargets_cursor_and_backend() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const A: u32 = 0x0040_0020;
+        const D: u32 = 0x0040_0021;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        for (xid, host) in [(A, 0x0001_0010), (D, 0x0001_0020)] {
+            state.resources.create_cursor(ClientId(1), ResourceId(xid));
+            state.resources.set_cursor_host_xid(
+                ResourceId(xid),
+                crate::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[0x0bad_bad0, A]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer)[0]),
+            (x11::error::BAD_CURSOR, 0x0bad_bad0, 26, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[D, 0x0bad_bad0]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer)[0]),
+            (x11::error::BAD_CURSOR, 0x0bad_bad0, 26, XFIXES_MAJOR_OPCODE)
+        );
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[D, A]),
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+        assert_eq!(
+            state.resources.cursor_host_xid(ResourceId(A)),
+            Some(0x0001_0020)
+        );
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(calls.contains(&RecordedCall::ReplaceCursor {
+            old_host_xid: 0x0001_0010,
+            new_host_xid: 0x0001_0020,
+        }));
+        // A and D now share one host cursor: freeing one XID must not free it.
+        assert_eq!(state.resources.free_cursor(ResourceId(A)), None);
+        assert_eq!(
+            state.resources.free_cursor(ResourceId(D)),
+            Some(0x0001_0020)
+        );
+    }
+
+    /// ChangeCursorByName matches the cursor object's name even after the
+    /// client freed its XID (the window still shows it); a name nobody
+    /// interned matches nothing and is not an error (Xvfb: OK).
+    #[test]
+    fn xfixes_change_cursor_by_name_replaces_named_cursors() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const A: u32 = 0x0040_0030;
+        const B: u32 = 0x0040_0031;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        for (xid, host) in [(A, 0x0001_0030), (B, 0x0001_0031)] {
+            state.resources.create_cursor(ClientId(1), ResourceId(xid));
+            state.resources.set_cursor_host_xid(
+                ResourceId(xid),
+                crate::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+        let name = state.atoms.intern("bname", false);
+        state.resources.set_cursor_name_atom(ResourceId(B), name);
+        let _ = state.resources.free_cursor(ResourceId(B));
+
+        let by_name = |name: &[u8]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&A.to_le_bytes());
+            body.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(name);
+            body.resize(body.len().div_ceil(4) * 4, 0);
+            body
+        };
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR_BY_NAME,
+            &by_name(b"zzznoname"),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR_BY_NAME,
+            &by_name(b"bname"),
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+        let replaces: Vec<RecordedCall> = backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ReplaceCursor { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            replaces,
+            vec![RecordedCall::ReplaceCursor {
+                old_host_xid: 0x0001_0031,
+                new_host_xid: 0x0001_0030,
+            }]
+        );
+        assert_eq!(state.resources.cursor_name_for_host(0x0001_0031), None);
+    }
+
+    /// ExpandRegion against Xvfb: {(10,10 5x5),(30,30 5x5)} expanded by
+    /// l1 r2 t3 b4 → {(9,7 8x12),(29,27 8x12)}; by l20 r20 → the
+    /// overlapping boxes are unioned into {(-10,10 45x5),(10,30 45x5)}; an
+    /// empty source leaves the destination as it was; bad source or
+    /// destination → XFixes BadRegion (error base + 0) naming it.
+    #[test]
+    fn xfixes_expand_region_matches_xvfb() {
+        use yserver_protocol::x11::xfixes::{self as x11xfixes, RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        let rect = |x, y, width, height| RegionRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let region = |rects| crate::server::XFixesRegion {
+            owner: ClientId(1),
+            rects,
+        };
+        state
+            .xfixes_regions
+            .insert(0x10, region(vec![rect(10, 10, 5, 5), rect(30, 30, 5, 5)]));
+        state
+            .xfixes_regions
+            .insert(0x11, region(vec![rect(100, 100, 7, 7)]));
+        state.xfixes_regions.insert(0x12, region(Vec::new()));
+        let expand = |src: u32, dst: u32, l: u16, r: u16, t: u16, b: u16| {
+            let mut body = xfixes_u32s(&[src, dst]);
+            for v in [l, r, t, b] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body
+        };
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x10, 0x11, 1, 2, 3, 4),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(9, 7, 8, 12), rect(29, 27, 8, 12)]
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x10, 0x11, 20, 20, 0, 0),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x12, 0x11, 1, 1, 1, 1),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+
+        for (src, dst) in [(0x0bad_bad0, 0x11), (0x10, 0x0bad_bad0)] {
+            xfixes_req(
+                &mut state,
+                &mut backend,
+                1,
+                x11xfixes::EXPAND_REGION,
+                &expand(src, dst, 1, 1, 1, 1),
+            );
+            assert_eq!(
+                error_fields(&wire_packets(&mut peer)[0]),
+                (
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    0x0bad_bad0,
+                    28,
+                    XFIXES_MAJOR_OPCODE
+                )
+            );
+        }
+    }
+
+    // ── SYNC Await / AwaitFence ─────────────────────────────────────
+    // Ground truth for every expectation below: Xorg 21.1.24 Xvfb driven
+    // by a two-connection xcb probe (client A changes counters and fences,
+    // client B awaits and then sends GetInputFocus; "suspended" means B's
+    // reply had not arrived after A's round trip).
+
+    fn sync_req(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 142,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("sync request");
+    }
+
+    fn sync_i64(v: i64) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        #[allow(clippy::cast_possible_truncation)]
+        out[..4].copy_from_slice(&((v >> 32) as i32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        out[4..].copy_from_slice(&(v as u32).to_le_bytes());
+        out
+    }
+
+    fn sync_counter_body(counter: u32, value: i64) -> Vec<u8> {
+        let mut body = counter.to_le_bytes().to_vec();
+        body.extend_from_slice(&sync_i64(value));
+        body
+    }
+
+    /// One `WAITCONDITION`: counter, value type, wait value, test type,
+    /// event threshold.
+    fn sync_wait(
+        counter: u32,
+        value_type: u32,
+        wait: i64,
+        test_type: u32,
+        threshold: i64,
+    ) -> Vec<u8> {
+        let mut body = counter.to_le_bytes().to_vec();
+        body.extend_from_slice(&value_type.to_le_bytes());
+        body.extend_from_slice(&sync_i64(wait));
+        body.extend_from_slice(&test_type.to_le_bytes());
+        body.extend_from_slice(&sync_i64(threshold));
+        body
+    }
+
+    /// CounterNotify → (counter, wait value, counter value, count, destroyed).
+    fn counter_notify_fields(p: &[u8; 32]) -> (u32, i64, i64, u16, bool) {
+        assert_eq!(p[0], crate::nested::SYNC_FIRST_EVENT, "CounterNotify type");
+        assert_eq!(p[1], 0, "kind CounterNotify");
+        let i64_at = |at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(p, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(p, at + 4))
+        };
+        (
+            le_u32(p, 4),
+            i64_at(8),
+            i64_at(16),
+            u16::from_le_bytes([p[28], p[29]]),
+            p[30] != 0,
+        )
+    }
+
+    struct SyncFixture {
+        state: ServerState,
+        backend: RecordingBackend,
+        _peer_a: UnixStream,
+        peer_b: UnixStream,
+    }
+
+    const SYNC_A: u32 = 1;
+    const SYNC_B: u32 = 2;
+    const SYNC_C1: u32 = 0x0010_0001;
+    const SYNC_C2: u32 = 0x0010_0002;
+
+    fn sync_fixture() -> SyncFixture {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, SYNC_A);
+        let peer_b = install_client(&mut state, SYNC_B);
+        SyncFixture {
+            state,
+            backend: RecordingBackend::new(),
+            _peer_a: peer_a,
+            peer_b,
+        }
+    }
+
+    impl SyncFixture {
+        fn a(&mut self, minor: u8, body: &[u8]) {
+            sync_req(&mut self.state, &mut self.backend, SYNC_A, minor, body);
+        }
+        fn b(&mut self, minor: u8, body: &[u8]) {
+            sync_req(&mut self.state, &mut self.backend, SYNC_B, minor, body);
+        }
+        fn suspended(&self) -> bool {
+            crate::core_loop::sync_await::client_is_suspended(&self.state, ClientId(SYNC_B))
+        }
+        fn b_packets(&mut self) -> Vec<[u8; 32]> {
+            wire_packets(&mut self.peer_b)
+        }
+        fn a_packets(&mut self) -> Vec<[u8; 32]> {
+            wire_packets(&mut self._peer_a)
+        }
+    }
+
+    /// Xvfb: B awaits c1 >= 5 (PositiveComparison); A sets 3 → B stays
+    /// suspended; A sets 7 → B resumes with CounterNotify(c1, wait 5,
+    /// value 7, count 0, not destroyed).
+    #[test]
+    fn sync_await_suspends_until_the_counter_condition_holds() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        assert!(f.b_packets().is_empty());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 3));
+        assert!(f.suspended(), "3 < 5");
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 7));
+        assert!(!f.suspended());
+        let events = f.b_packets();
+        assert_eq!(events.len(), 1);
+        assert_eq!(counter_notify_fields(&events[0]), (SYNC_C1, 5, 7, 0, false));
+
+        // Already satisfied at request time: no suspension, the event
+        // still goes out (Xvfb: reply arrives with CounterNotify wait 5
+        // value 7).
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 5, 7, 0, false)
+        );
+    }
+
+    /// Transitions need a crossing and events respect the threshold, per
+    /// Xvfb: PositiveTransition 10 thr 2 from 7 → set 9 (no), set 12 →
+    /// event value 12; from 12, PositiveTransition 10 → set 1 does not
+    /// fire (no upward crossing); from 1, PositiveTransition 10 → 5 (no),
+    /// 11 → event; PositiveTransition 0 thr 5 from -5 → set 1 resumes the
+    /// client without an event (diff 1 < 5).
+    #[test]
+    fn sync_await_transitions_and_event_threshold() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 7));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                2,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 9));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 12));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 10, 12, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                100,
+            ),
+        );
+        assert!(f.suspended(), "12 >= 10 but no transition yet");
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(f.suspended());
+        f.state.sync_awaits.remove(&SYNC_B);
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                0,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 5));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 11));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 10, 11, 0, false)
+        );
+
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                0,
+                s::TEST_POSITIVE_TRANSITION,
+                5,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(!f.suspended());
+        assert!(f.b_packets().is_empty(), "diff below threshold: no event");
+    }
+
+    /// Xvfb: c1=11, c2=100; B awaits [c1 >= 1000 thr -2000, c2 <= 45 thr
+    /// 0]; A sets c2 50 (suspended) then 40 → both conditions report, in
+    /// order, count 1 then 0. Relative waits add to the counter (c1=11,
+    /// +3 → wait 14); NegativeTransition -3 fires on the way down.
+    #[test]
+    fn sync_await_multi_condition_relative_and_negative() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 11));
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 100));
+        let mut body = sync_wait(
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            -2000,
+        );
+        body.extend(sync_wait(
+            SYNC_C2,
+            s::VALUE_TYPE_ABSOLUTE,
+            45,
+            s::TEST_NEGATIVE_COMPARISON,
+            0,
+        ));
+        f.b(s::AWAIT, &body);
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C2, 50));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C2, 40));
+        assert!(!f.suspended());
+        let events = f.b_packets();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            counter_notify_fields(&events[0]),
+            (SYNC_C1, 1000, 11, 1, false)
+        );
+        assert_eq!(
+            counter_notify_fields(&events[1]),
+            (SYNC_C2, 45, 40, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_RELATIVE,
+                3,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        f.a(s::CHANGE_COUNTER, &sync_counter_body(SYNC_C1, 2));
+        assert!(f.suspended());
+        f.a(s::CHANGE_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 14, 14, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                -3,
+                s::TEST_NEGATIVE_TRANSITION,
+                0,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, -3, -5, 0, false)
+        );
+    }
+
+    /// Xvfb: destroying an awaited counter resumes the client with a
+    /// destroyed event carrying its last value, plus threshold events for
+    /// the other conditions; an alarm on it goes Inactive with an
+    /// AlarmNotify. A counter owner disconnecting does the same (value 0).
+    #[test]
+    fn sync_await_fires_destroyed_when_the_counter_goes_away() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 40));
+        let mut body = sync_wait(
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            0,
+        );
+        body.extend(sync_wait(
+            SYNC_C2,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            -2000,
+        ));
+        f.b(s::AWAIT, &body);
+        f.state.sync_alarms.insert(
+            0x0020_0009,
+            crate::server::SyncAlarm {
+                owner: ClientId(SYNC_B),
+                counter: SYNC_C1,
+                wait_value: 1000,
+                delta: 1,
+                test_type: s::TEST_POSITIVE_COMPARISON,
+                events: true,
+                state: s::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 1000,
+                check_type: s::TEST_POSITIVE_COMPARISON,
+            },
+        );
+        f.a(s::DESTROY_COUNTER, &SYNC_C1.to_le_bytes());
+        assert!(!f.suspended());
+        let packets = f.b_packets();
+        let notifies: Vec<_> = packets
+            .iter()
+            .filter(|p| p[0] == crate::nested::SYNC_FIRST_EVENT)
+            .map(counter_notify_fields)
+            .collect();
+        assert_eq!(
+            notifies,
+            vec![(SYNC_C1, 1000, -5, 1, true), (SYNC_C2, 1000, 40, 0, false)]
+        );
+        let alarm = packets
+            .iter()
+            .find(|p| p[0] == crate::nested::SYNC_FIRST_EVENT + 1)
+            .expect("AlarmNotify for the alarm on the destroyed counter");
+        assert_eq!(alarm[28], s::ALARM_STATE_INACTIVE);
+        assert_eq!(
+            f.state.sync_alarms[&0x0020_0009].state,
+            s::ALARM_STATE_INACTIVE
+        );
+        assert_eq!(f.state.sync_alarms[&0x0020_0009].counter, 0);
+
+        // Owner disconnect: Xvfb sends destroyed, wait 10, value 0.
+        const C3: u32 = 0x0030_0001;
+        let _peer_c = install_client(&mut f.state, 3);
+        sync_req(
+            &mut f.state,
+            &mut f.backend,
+            3,
+            s::CREATE_COUNTER,
+            &sync_counter_body(C3, 0),
+        );
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                C3,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(3),
+        );
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (C3, 10, 0, 0, true)
+        );
+    }
+
+    /// Xvfb: Initialize with client 3.1 / 3.0 / 2.0 / 4.0 always replies 3.1.
+    #[test]
+    fn sync_initialize_always_answers_the_server_version() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        for (major, minor) in [(3u8, 1u8), (3, 0), (2, 0), (4, 0)] {
+            f.b(s::INITIALIZE, &[major, minor, 0, 0]);
+            let reply = f.b_packets();
+            assert_eq!(reply[0][0], 1);
+            assert_eq!((reply[0][8], reply[0][9]), (3, 1), "client {major}.{minor}");
+        }
+    }
+
+    /// Xvfb error table for Await and the counter requests.
+    #[test]
+    fn sync_await_and_counter_errors_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 100));
+        let cases: [(Vec<u8>, u8, u32); 6] = [
+            (Vec::new(), x11::error::BAD_VALUE, 0),
+            (sync_wait(0, 0, 1, 2, 0), bad_counter, 0),
+            (sync_wait(0x0bad_bad0, 0, 1, 2, 0), bad_counter, 0x0bad_bad0),
+            (sync_wait(SYNC_C2, 7, 1, 2, 0), x11::error::BAD_VALUE, 7),
+            (sync_wait(SYNC_C2, 0, 1, 9, 0), x11::error::BAD_VALUE, 9),
+            (
+                sync_wait(SYNC_C2, 1, i64::MAX, 2, 0),
+                x11::error::BAD_VALUE,
+                0x7fff_ffff,
+            ),
+        ];
+        for (body, code, value) in cases {
+            f.b(s::AWAIT, &body);
+            assert!(!f.suspended(), "an erroring Await never suspends");
+            assert_eq!(
+                error_fields(&f.b_packets()[0]),
+                (code, value, u16::from(s::AWAIT), 142)
+            );
+        }
+        let mut peer_a = std::mem::replace(&mut f._peer_a, UnixStream::pair().unwrap().0);
+        let st = s::SERVERTIME_COUNTER;
+        let a_cases: [(u8, Vec<u8>, u8, u32); 5] = [
+            (
+                s::SET_COUNTER,
+                sync_counter_body(st, 1),
+                x11::error::BAD_ACCESS,
+                st,
+            ),
+            (
+                s::SET_COUNTER,
+                sync_counter_body(0x0bad_bad0, 1),
+                bad_counter,
+                0x0bad_bad0,
+            ),
+            (
+                s::CHANGE_COUNTER,
+                sync_counter_body(SYNC_C2, i64::MAX),
+                x11::error::BAD_VALUE,
+                0x7fff_ffff,
+            ),
+            (
+                s::DESTROY_COUNTER,
+                st.to_le_bytes().to_vec(),
+                x11::error::BAD_ACCESS,
+                st,
+            ),
+            (
+                s::DESTROY_COUNTER,
+                0x0bad_bad0u32.to_le_bytes().to_vec(),
+                bad_counter,
+                0x0bad_bad0,
+            ),
+        ];
+        for (minor, body, code, value) in a_cases {
+            f.a(minor, &body);
+            assert_eq!(
+                error_fields(&wire_packets(&mut peer_a)[0]),
+                (code, value, u16::from(minor), 142)
+            );
+        }
+        assert_eq!(
+            f.state.sync_counters[&SYNC_C2].value, 100,
+            "overflow left it alone"
+        );
+    }
+
+    /// Xvfb: AwaitFence on an untriggered fence suspends until TriggerFence
+    /// (no events); on a triggered fence it returns at once; destroying the
+    /// fence resumes with CounterNotify(counter = fence, 0, 0, destroyed).
+    /// Errors: empty → BadValue, None / unknown → BadFence; ResetFence of an
+    /// untriggered fence → BadMatch naming it.
+    #[test]
+    fn sync_await_fence_suspends_until_triggered() {
+        use yserver_protocol::x11::sync as s;
+        const F1: u32 = 0x0010_0010;
+        const F2: u32 = 0x0010_0011;
+        let mut f = sync_fixture();
+        let fence_body = |fence: u32, triggered: bool| {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&fence.to_le_bytes());
+            body.extend_from_slice(&[u8::from(triggered), 0, 0, 0]);
+            body
+        };
+        f.a(s::CREATE_FENCE, &fence_body(F1, false));
+        f.a(s::CREATE_FENCE, &fence_body(F2, true));
+
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        f.a(s::TRIGGER_FENCE, &F1.to_le_bytes());
+        assert!(!f.suspended());
+        assert!(
+            f.b_packets().is_empty(),
+            "fences send no events when triggered"
+        );
+
+        f.b(s::AWAIT_FENCE, &F2.to_le_bytes());
+        assert!(!f.suspended(), "already triggered");
+
+        f.a(s::RESET_FENCE, &F1.to_le_bytes());
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        f.a(s::DESTROY_FENCE, &F1.to_le_bytes());
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (F1, 0, 0, 0, true)
+        );
+
+        let bad_fence = crate::nested::SYNC_FIRST_ERROR + s::BAD_FENCE;
+        for (body, code, value) in [
+            (Vec::new(), x11::error::BAD_VALUE, 0),
+            (0u32.to_le_bytes().to_vec(), bad_fence, 0),
+            (
+                0x0bad_bad0u32.to_le_bytes().to_vec(),
+                bad_fence,
+                0x0bad_bad0,
+            ),
+        ] {
+            f.b(s::AWAIT_FENCE, &body);
+            assert!(!f.suspended());
+            assert_eq!(
+                error_fields(&f.b_packets()[0]),
+                (code, value, u16::from(s::AWAIT_FENCE), 142)
+            );
+        }
+        f.b(s::RESET_FENCE, &F2.to_le_bytes());
+        f.b(s::RESET_FENCE, &F2.to_le_bytes());
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_MATCH, F2, u16::from(s::RESET_FENCE), 142)
+        );
+    }
+
+    /// A Present idle fence triggered by the server wakes an AwaitFence on
+    /// it. A deliberate difference from Xorg: `present_fence_set_triggered`
+    /// only calls the fence's `SetTriggered`, not `miSyncTriggerFence`, so
+    /// on Xorg such an await is only re-checked by a TriggerFence request
+    /// or the fence's destruction and would otherwise stay suspended.
+    #[test]
+    fn sync_await_fence_wakes_on_server_side_trigger() {
+        use yserver_protocol::x11::sync as s;
+        const F1: u32 = 0x0010_0020;
+        let mut f = sync_fixture();
+        f.state.sync_fences.insert(
+            F1,
+            crate::server::SyncFence {
+                owner: ClientId(SYNC_A),
+                triggered: false,
+            },
+        );
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        crate::core_loop::sync_await::fence_triggered(&mut f.state, F1);
+        assert!(!f.suspended());
+        assert!(f.state.sync_fences[&F1].triggered);
+    }
+
+    /// A ChangeAlarm body: alarm, value mask, value list.
+    fn sync_alarm_body(alarm: u32, mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = alarm.to_le_bytes().to_vec();
+        body.extend_from_slice(&mask.to_le_bytes());
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    /// Xvfb: ChangeAlarm / QueryAlarm / DestroyAlarm on an alarm that
+    /// does not exist (unknown, None, or destroyed) answer BadAlarm (SYNC
+    /// error base + 1) naming it. Xorg's order: QueryAlarm and DestroyAlarm
+    /// check the exact request size first (BadLength), ChangeAlarm checks
+    /// the minimum size, then looks the alarm up, and only then matches the
+    /// value list against the mask (BadLength naming the alarm).
+    #[test]
+    fn sync_alarm_requests_on_a_missing_alarm_answer_bad_alarm() {
+        use yserver_protocol::x11::sync as s;
+        const ALARM: u32 = 0x0010_0030;
+        const GONE: u32 = 0x0010_0031;
+        const UNKNOWN: u32 = 0x0bad_bad0;
+        let bad_alarm = crate::nested::SYNC_FIRST_ERROR + s::BAD_ALARM;
+        let bad_length = x11::error::BAD_LENGTH;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(ALARM, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(GONE, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        f.a(s::DESTROY_ALARM, &GONE.to_le_bytes());
+        let _ = f.b_packets();
+        let long = sync_alarm_body(UNKNOWN, s::CA_EVENTS, &[]);
+        let cases: Vec<(u8, Vec<u8>, u8, u32)> = vec![
+            (
+                s::QUERY_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (s::QUERY_ALARM, 0u32.to_le_bytes().to_vec(), bad_alarm, 0),
+            (s::QUERY_ALARM, GONE.to_le_bytes().to_vec(), bad_alarm, GONE),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(UNKNOWN, 0, &[]),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(GONE, 0, &[]),
+                bad_alarm,
+                GONE,
+            ),
+            (s::CHANGE_ALARM, long.clone(), bad_alarm, UNKNOWN),
+            (
+                s::DESTROY_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (
+                s::DESTROY_ALARM,
+                GONE.to_le_bytes().to_vec(),
+                bad_alarm,
+                GONE,
+            ),
+            (s::QUERY_ALARM, long.clone(), bad_length, 0),
+            (s::DESTROY_ALARM, long, bad_length, 0),
+            (
+                s::CHANGE_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_length,
+                0,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(ALARM, s::CA_EVENTS, &[]),
+                bad_length,
+                ALARM,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(ALARM, s::CA_VALUE, &[0]),
+                bad_length,
+                ALARM,
+            ),
+        ];
+        for (minor, body, code, value) in cases {
+            f.b(minor, &body);
+            let packets = f.b_packets();
+            assert!(
+                !packets.is_empty(),
+                "minor {minor} body {body:x?}: no error"
+            );
+            assert_eq!(
+                error_fields(&packets[0]),
+                (code, value, u16::from(minor), 142),
+                "minor {minor} body {body:x?}"
+            );
+        }
+        assert!(f.state.sync_alarms.contains_key(&ALARM));
+    }
+
+    /// QueryAlarm → (counter, value type, wait value, test type, delta,
+    /// events, state), per `xSyncQueryAlarmReply`.
+    fn query_alarm_fields(f: &mut SyncFixture, alarm: u32) -> (u32, u32, i64, u32, i64, u8, u8) {
+        use yserver_protocol::x11::sync as s;
+        f.b(s::QUERY_ALARM, &alarm.to_le_bytes());
+        let r = read_all_available(&mut f.peer_b);
+        assert_eq!((r.len(), r[0]), (40, 1), "QueryAlarm reply");
+        let i64_at = |at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(&r, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(&r, at + 4))
+        };
+        (
+            le_u32(&r, 8),
+            le_u32(&r, 12),
+            i64_at(16),
+            le_u32(&r, 24),
+            i64_at(28),
+            r[36],
+            r[37],
+        )
+    }
+
+    /// Xvfb: QueryAlarm reports the alarm's test type (a fresh alarm's
+    /// default is PositiveComparison, 2) and, as Xorg's
+    /// `ProcSyncQueryAlarm`, always value type Absolute with the resolved
+    /// wait value.
+    #[test]
+    fn sync_query_alarm_reports_the_test_type() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_0080;
+        const AN: u32 = 0x0010_0081;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(AL, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C1, 0, 10]),
+        );
+        assert_eq!(
+            query_alarm_fields(&mut f, AL),
+            (
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_COMPARISON,
+                1,
+                1,
+                s::ALARM_STATE_ACTIVE
+            )
+        );
+        f.a(s::CREATE_ALARM, &sync_alarm_body(AN, s::CA_VALUE, &[0, 5]));
+        assert_eq!(
+            query_alarm_fields(&mut f, AN),
+            (
+                0,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                1,
+                1,
+                s::ALARM_STATE_INACTIVE
+            )
+        );
+    }
+
+    /// Xvfb ("CreateAlarm attribute errors"): Xorg's checks, in its order —
+    /// the value list in mask-bit order (`events` not True/False, unknown
+    /// bits naming the bits above), the delta sign against the test type
+    /// (the default delta 1 counts), then the trigger: unknown counter,
+    /// value type, Relative without a counter, INT64 overflow (naming the
+    /// value's high word), test type. BadMatch names the alarm. A failing
+    /// CreateAlarm creates nothing.
+    #[test]
+    fn sync_create_alarm_attribute_errors_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        let (value, matchh) = (x11::error::BAD_VALUE, x11::error::BAD_MATCH);
+        let c = SYNC_C1;
+        let unknown = 0x0bad_bad0;
+        // (mask, values, expected error (code, value; None = the alarm id)).
+        type Case = (u32, Vec<u32>, Option<(u8, Option<u32>)>);
+        let cases: Vec<Case> = vec![
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![c, 9],
+                Some((value, Some(9))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_VALUE_TYPE,
+                vec![c, 7],
+                Some((value, Some(7))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_EVENTS,
+                vec![c, 2],
+                Some((value, Some(2))),
+            ),
+            (
+                s::CA_COUNTER,
+                vec![unknown],
+                Some((bad_counter, Some(unknown))),
+            ),
+            (
+                s::CA_VALUE_TYPE,
+                vec![s::VALUE_TYPE_RELATIVE],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE | s::CA_DELTA,
+                vec![c, s::TEST_POSITIVE_COMPARISON, u32::MAX, u32::MAX],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![c, s::TEST_NEGATIVE_COMPARISON],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE | s::CA_DELTA,
+                vec![c, s::TEST_NEGATIVE_COMPARISON, 0, 0],
+                None,
+            ),
+            (
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE,
+                vec![c, s::VALUE_TYPE_RELATIVE, 0x7fff_ffff, u32::MAX],
+                Some((value, Some(0x7fff_ffff))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![unknown, 9],
+                Some((bad_counter, Some(unknown))),
+            ),
+            (
+                s::CA_VALUE_TYPE | s::CA_TEST_TYPE,
+                vec![7, 9],
+                Some((value, Some(7))),
+            ),
+            (1 << 6, vec![0], Some((value, Some(0)))),
+            (s::CA_EVENTS | 1 << 6, vec![2, 0], Some((value, Some(2)))),
+        ];
+        for (index, (mask, values, expect)) in cases.into_iter().enumerate() {
+            let alarm = 0x0020_0100 + u32::try_from(index).unwrap();
+            f.b(s::CREATE_ALARM, &sync_alarm_body(alarm, mask, &values));
+            let packets = f.b_packets();
+            match expect {
+                Some((code, bad)) => {
+                    assert_eq!(
+                        error_fields(&packets[0]),
+                        (code, bad.unwrap_or(alarm), u16::from(s::CREATE_ALARM), 142),
+                        "case {index}"
+                    );
+                    assert!(!f.state.sync_alarms.contains_key(&alarm), "case {index}");
+                }
+                None => {
+                    assert!(packets.is_empty(), "case {index}");
+                    assert!(f.state.sync_alarms.contains_key(&alarm), "case {index}");
+                }
+            }
+        }
+    }
+
+    /// Xvfb ("ChangeAlarm attribute errors: what sticks"): a failing
+    /// ChangeAlarm keeps what Xorg's `SyncChangeAlarmAttributes` stored
+    /// before `SyncInitTrigger` failed — delta, value type, value and the
+    /// test type — while the counter, the resolved wait value (except an
+    /// overflowing Relative sum, which is stored wrapped), the test the
+    /// trigger runs and the state stay. A stored bad value type makes a
+    /// later value-only change Relative; a stored bad test type is what
+    /// QueryAlarm reports, passes the delta-sign check, and the alarm keeps
+    /// firing on its old PositiveComparison.
+    #[test]
+    fn sync_change_alarm_failures_keep_what_xorg_keeps() {
+        use yserver_protocol::x11::sync as s;
+        const X: u32 = 0x0010_0090;
+        let mut f = sync_fixture();
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        let (value, matchh) = (x11::error::BAD_VALUE, x11::error::BAD_MATCH);
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 20));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(
+                X,
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE | s::CA_DELTA,
+                &[SYNC_C1, 0, 0, 30, s::TEST_POSITIVE_COMPARISON, 0, 1],
+            ),
+        );
+        let q = |f: &mut SyncFixture| query_alarm_fields(f, X);
+        let pc = s::TEST_POSITIVE_COMPARISON;
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 30, pc, 1, 1, 0));
+        let change = |f: &mut SyncFixture, mask: u32, values: &[u32]| {
+            f.a(s::CHANGE_ALARM, &sync_alarm_body(X, mask, values));
+            f.a_packets()
+                .first()
+                .map(error_fields)
+                .map(|(code, bad, minor, _)| {
+                    assert_eq!(minor, u16::from(s::CHANGE_ALARM));
+                    (code, bad)
+                })
+        };
+        let m = u32::MAX;
+        assert_eq!(
+            change(&mut f, s::CA_VALUE_TYPE | s::CA_VALUE, &[7, 0, 50]),
+            Some((value, 7))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 30, pc, 1, 1, 0));
+        assert_eq!(change(&mut f, s::CA_VALUE, &[0, 5]), None);
+        assert_eq!(
+            q(&mut f),
+            (SYNC_C1, 0, 25, pc, 1, 1, 0),
+            "stored type 7 acts Relative"
+        );
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_COUNTER | s::CA_VALUE | s::CA_DELTA,
+                &[0x0bad_bad0, 0, 70, 0, 3]
+            ),
+            Some((bad_counter, 0x0bad_bad0))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, pc, 3, 1, 0), "delta sticks");
+        assert_eq!(change(&mut f, s::CA_DELTA, &[m, m]), Some((matchh, X)));
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE,
+                &[0, 0, 100, s::TEST_NEGATIVE_TRANSITION]
+            ),
+            Some((matchh, X))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, pc, 3, 1, 0));
+        assert_eq!(change(&mut f, s::CA_TEST_TYPE, &[9]), Some((value, 9)));
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, 9, 3, 1, 0));
+        assert_eq!(
+            change(&mut f, s::CA_DELTA, &[m, m]),
+            None,
+            "no sign for test type 9"
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, 9, -1, 1, 0));
+        assert_eq!(change(&mut f, s::CA_DELTA, &[0, 1]), None);
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 25));
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 25, 25, s::ALARM_STATE_ACTIVE)]
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 21));
+        assert!(f.a_packets().is_empty());
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 26, 9, 1, 1, 0));
+        f.a(s::CHANGE_ALARM, &sync_alarm_body(X, s::CA_COUNTER, &[0]));
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 0, 26, s::ALARM_STATE_INACTIVE)]
+        );
+        assert_eq!(
+            change(&mut f, s::CA_VALUE_TYPE, &[s::VALUE_TYPE_RELATIVE]),
+            Some((matchh, X))
+        );
+        assert_eq!(q(&mut f), (0, 0, 26, 9, 1, 1, s::ALARM_STATE_INACTIVE));
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE,
+                &[SYNC_C1, s::VALUE_TYPE_RELATIVE, 0x7fff_ffff, m]
+            ),
+            Some((value, 0x7fff_ffff))
+        );
+        let wrapped = 21i64.wrapping_add(i64::MAX);
+        assert_eq!(q(&mut f), (0, 0, wrapped, 9, 1, 1, s::ALARM_STATE_INACTIVE));
+        assert_eq!(change(&mut f, 1 << 6, &[0]), Some((value, 0)));
+        f.a(s::DESTROY_ALARM, &X.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 0, wrapped, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// Xvfb (the "bad test type" line of "AlarmNotify selection"): B's
+    /// ChangeAlarm {test type 9, events True} on A's alarm is BadValue(9),
+    /// yet B is selected (the selection precedes the check) and the alarm,
+    /// still running PositiveComparison, notifies B when the counter
+    /// reaches it; QueryAlarm reports test type 9.
+    #[test]
+    fn sync_alarm_bad_test_type_still_selects_and_fires() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_00a0;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 13));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(
+                AL,
+                s::CA_COUNTER | s::CA_VALUE | s::CA_EVENTS,
+                &[SYNC_C1, 0, 14, 0],
+            ),
+        );
+        f.b(
+            s::CHANGE_ALARM,
+            &sync_alarm_body(AL, s::CA_TEST_TYPE | s::CA_EVENTS, &[9, 1]),
+        );
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_VALUE, 9, u16::from(s::CHANGE_ALARM), 142)
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AL, 14, 14, s::ALARM_STATE_ACTIVE)]
+        );
+        assert!(f.a_packets().is_empty());
+        assert_eq!(query_alarm_fields(&mut f, AL), (SYNC_C1, 0, 15, 9, 1, 0, 0));
+    }
+
+    /// Every AlarmNotify in `packets` → (alarm, counter value, alarm
+    /// value, state).
+    fn alarm_notifies(packets: &[[u8; 32]]) -> Vec<(u32, i64, i64, u8)> {
+        let i64_at = |p: &[u8; 32], at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(p, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(p, at + 4))
+        };
+        packets
+            .iter()
+            .filter(|p| p[0] == crate::nested::SYNC_FIRST_EVENT + 1)
+            .map(|p| {
+                assert_eq!(p[1], 1, "kind AlarmNotify");
+                (le_u32(p, 4), i64_at(p, 8), i64_at(p, 16), p[28])
+            })
+            .collect()
+    }
+
+    fn sync_events_body(alarm: u32, on: u32) -> Vec<u8> {
+        use yserver_protocol::x11::sync as s;
+        sync_alarm_body(alarm, s::CA_EVENTS, &[on])
+    }
+
+    /// Xvfb (tools/sync-await-probe.c, "AlarmNotify selection"): an alarm
+    /// owned by A (c >= 10, delta 1, events). B and D select AlarmNotify
+    /// with ChangeAlarm(events=True) — any client may — and every firing
+    /// reaches the owner (while its own flag is set) and each selecting
+    /// client once. events=False by B removes B; by A clears only the
+    /// owner's flag (what QueryAlarm reports). A selecting client that
+    /// disconnects drops off the list. A non-owner may change other
+    /// attributes too. DestroyAlarm sends a Destroyed notify to the
+    /// selecting clients. An `events` value other than True/False is
+    /// BadValue naming it and selects nothing.
+    #[test]
+    fn sync_alarm_notify_reaches_every_client_that_selected_it() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_0040;
+        const D: u32 = 3;
+        let mut f = sync_fixture();
+        let mut peer_d = install_client(&mut f.state, D);
+        let d_req = |f: &mut SyncFixture, minor: u8, body: &[u8]| {
+            sync_req(&mut f.state, &mut f.backend, D, minor, body);
+        };
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        let mut create = AL.to_le_bytes().to_vec();
+        create.extend_from_slice(
+            &(s::CA_COUNTER
+                | s::CA_VALUE_TYPE
+                | s::CA_VALUE
+                | s::CA_TEST_TYPE
+                | s::CA_DELTA
+                | s::CA_EVENTS)
+                .to_le_bytes(),
+        );
+        for v in [
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            0,
+            10,
+            s::TEST_POSITIVE_COMPARISON,
+            0,
+            1,
+            1,
+        ] {
+            create.extend_from_slice(&v.to_le_bytes());
+        }
+        f.a(s::CREATE_ALARM, &create);
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        d_req(&mut f, s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        assert!(f.b_packets().is_empty(), "selecting sends nothing");
+        assert!(f.state.sync_alarms[&AL].events, "owner flag untouched");
+        assert!(f.a_packets().is_empty());
+
+        let set = |f: &mut SyncFixture, v: i64| f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, v));
+        set(&mut f, 10);
+        let fired = |v: i64| vec![(AL, v, v, s::ALARM_STATE_ACTIVE)];
+        assert_eq!(alarm_notifies(&f.a_packets()), fired(10));
+        assert_eq!(alarm_notifies(&f.b_packets()), fired(10), "B once");
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(10));
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 0));
+        set(&mut f, 11);
+        assert_eq!(alarm_notifies(&f.a_packets()), fired(11));
+        assert!(f.b_packets().is_empty(), "B deselected");
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(11));
+
+        f.a(s::CHANGE_ALARM, &sync_events_body(AL, 0));
+        set(&mut f, 12);
+        assert!(f.a_packets().is_empty(), "owner flag off");
+        assert!(!f.state.sync_alarms[&AL].events);
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(12));
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(D),
+        );
+        assert!(f.state.sync_alarms[&AL].event_clients.is_empty());
+        set(&mut f, 13);
+        assert!(f.a_packets().is_empty() && f.b_packets().is_empty());
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 9));
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_VALUE, 9, u16::from(s::CHANGE_ALARM), 142)
+        );
+        assert!(f.state.sync_alarms[&AL].event_clients.is_empty());
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        set(&mut f, 14);
+        assert_eq!(alarm_notifies(&f.b_packets()), fired(14));
+        f.b(
+            s::CHANGE_ALARM,
+            &sync_alarm_body(AL, s::CA_VALUE, &[0, 100]),
+        );
+        assert!(f.b_packets().is_empty(), "a non-owner may change the value");
+        assert_eq!(f.state.sync_alarms[&AL].wait_value, 100);
+
+        f.a(s::DESTROY_ALARM, &AL.to_le_bytes());
+        assert!(f.a_packets().is_empty());
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AL, 14, 100, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// Xvfb: a non-owner may DestroyAlarm (owner and selecting clients get
+    /// the Destroyed notify); the owner's disconnect destroys its alarms,
+    /// and the clients that selected them get the Destroyed notify with
+    /// the counter's value. A destroyed counter deactivates the alarm with
+    /// an Inactive notify to them as well.
+    #[test]
+    fn sync_alarm_destruction_notifies_every_selecting_client() {
+        use yserver_protocol::x11::sync as s;
+        const E: u32 = 3;
+        const CE: u32 = 0x0030_0001;
+        const AE1: u32 = 0x0030_0002;
+        const AE2: u32 = 0x0030_0003;
+        const A2: u32 = 0x0010_0050;
+        let mut f = sync_fixture();
+        let mut peer_e = install_client(&mut f.state, E);
+        let e_req = |f: &mut SyncFixture, minor: u8, body: &[u8]| {
+            sync_req(&mut f.state, &mut f.backend, E, minor, body);
+        };
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        e_req(&mut f, s::CREATE_COUNTER, &sync_counter_body(CE, 0));
+        e_req(
+            &mut f,
+            s::CREATE_ALARM,
+            &sync_alarm_body(AE1, s::CA_COUNTER | s::CA_VALUE, &[CE, 0, 50]),
+        );
+        e_req(
+            &mut f,
+            s::CREATE_ALARM,
+            &sync_alarm_body(AE2, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C1, 0, 50]),
+        );
+        f.b(s::CHANGE_ALARM, &sync_events_body(AE1, 1));
+        f.b(s::CHANGE_ALARM, &sync_events_body(AE2, 1));
+        f.b(s::DESTROY_ALARM, &AE1.to_le_bytes());
+        let destroyed = vec![(AE1, 0, 50, s::ALARM_STATE_DESTROYED)];
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_e)), destroyed);
+        assert_eq!(alarm_notifies(&f.b_packets()), destroyed);
+        assert!(!f.state.sync_alarms.contains_key(&AE1));
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(E),
+        );
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AE2, 14, 50, s::ALARM_STATE_DESTROYED)]
+        );
+        assert!(!f.state.sync_alarms.contains_key(&AE2));
+
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 3));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(A2, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C2, 0, 50]),
+        );
+        f.b(s::CHANGE_ALARM, &sync_events_body(A2, 1));
+        f.a(s::DESTROY_COUNTER, &SYNC_C2.to_le_bytes());
+        let inactive = vec![(A2, 3, 50, s::ALARM_STATE_INACTIVE)];
+        assert_eq!(alarm_notifies(&f.a_packets()), inactive);
+        assert_eq!(alarm_notifies(&f.b_packets()), inactive);
+        f.a(s::DESTROY_ALARM, &A2.to_le_bytes());
+        let destroyed = vec![(A2, 0, 50, s::ALARM_STATE_DESTROYED)];
+        assert_eq!(alarm_notifies(&f.a_packets()), destroyed);
+        assert_eq!(alarm_notifies(&f.b_packets()), destroyed);
+    }
+
+    /// Xvfb: CreateAlarm defaults are Xorg's (PositiveComparison, value 0,
+    /// delta 1, events): on a counter at 0 it fires at once and re-arms to
+    /// a wait value of 1. Without a counter the alarm starts Inactive and
+    /// silent; a ChangeAlarm on it then fires Inactive with counter value
+    /// 0 ("NULL counter WILL trigger in ChangeAlarm").
+    #[test]
+    fn sync_alarm_defaults_and_counterless_alarms_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        const GONE: u32 = 0x0010_0060;
+        const AN: u32 = 0x0020_0060;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(GONE, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(GONE, 0, 0, s::ALARM_STATE_ACTIVE)]
+        );
+        f.a(s::DESTROY_ALARM, &GONE.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(GONE, 0, 1, s::ALARM_STATE_DESTROYED)]
+        );
+
+        f.b(s::CREATE_ALARM, &sync_alarm_body(AN, s::CA_VALUE, &[0, 5]));
+        assert!(f.b_packets().is_empty());
+        assert_eq!(f.state.sync_alarms[&AN].state, s::ALARM_STATE_INACTIVE);
+        f.b(s::CHANGE_ALARM, &sync_events_body(AN, 1));
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AN, 0, 5, s::ALARM_STATE_INACTIVE)]
+        );
+        f.b(s::DESTROY_ALARM, &AN.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AN, 0, 5, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// A DRI3 FenceFromFD xshmfence keeps its state in memory the client
+    /// can trigger and reset itself (`xshmfence_trigger` /
+    /// `xshmfence_reset`). Xorg's shm fence (`misyncshm.c`) answers every
+    /// `CheckTriggered` from that memory — QueryFence, the AwaitFence
+    /// epilogue, ResetFence's BadMatch test, and `miSyncTriggerFence`'s
+    /// re-check — and never from the server's own bit; ResetFence resets
+    /// the memory and DestroyFence triggers it before unmapping. Nothing in
+    /// Xorg watches the memory, so an AwaitFence already suspended stays
+    /// suspended when the client triggers it in memory, until a
+    /// TriggerFence request or the fence's destruction. Xvfb has no DRI3,
+    /// so this follows the source (`miSyncShmFenceCheckTriggered`,
+    /// `miSyncShmFenceReset`, `miSyncShmScreenDestroyFence`,
+    /// `SyncAwaitEpilogue`, `miSyncTriggerFence`).
+    #[test]
+    fn sync_shm_fence_state_is_read_from_shared_memory() {
+        use yserver_protocol::x11::sync as s;
+        const F: u32 = 0x0010_0070;
+        const G: u32 = 0x0010_0071;
+        let mut f = sync_fixture();
+        for fence in [F, G] {
+            f.state.sync_fences.insert(
+                fence,
+                crate::server::SyncFence {
+                    owner: ClientId(SYNC_A),
+                    triggered: false,
+                },
+            );
+            f.backend.shm_fences.insert(fence, false);
+        }
+        let query = |f: &mut SyncFixture| {
+            f.b(s::QUERY_FENCE, &F.to_le_bytes());
+            let reply = f.b_packets();
+            assert_eq!(reply[0][0], 1, "QueryFence reply");
+            reply[0][8] != 0
+        };
+
+        // The client triggers it in memory: QueryFence sees it and an
+        // AwaitFence returns at once.
+        f.backend.shm_fences.insert(F, true);
+        assert!(query(&mut f));
+        f.b(s::AWAIT_FENCE, &F.to_le_bytes());
+        assert!(!f.suspended());
+
+        // The client resets it in memory after the server triggered it:
+        // the memory wins over the server's bit.
+        f.a(s::TRIGGER_FENCE, &F.to_le_bytes());
+        assert!(f.state.sync_fences[&F].triggered);
+        f.backend.shm_fences.insert(F, false);
+        assert!(!query(&mut f));
+        f.b(s::RESET_FENCE, &F.to_le_bytes());
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_MATCH, F, u16::from(s::RESET_FENCE), 142),
+            "untriggered in memory"
+        );
+        f.b(s::AWAIT_FENCE, &F.to_le_bytes());
+        assert!(f.suspended(), "untriggered in memory");
+
+        // A trigger in memory alone wakes nothing (Xorg never looks);
+        // a TriggerFence request does.
+        f.backend.shm_fences.insert(F, true);
+        assert!(f.suspended());
+        f.a(s::TRIGGER_FENCE, &F.to_le_bytes());
+        assert!(!f.suspended());
+
+        // ResetFence of a fence triggered in memory resets the memory.
+        f.b(s::RESET_FENCE, &F.to_le_bytes());
+        assert!(f.b_packets().is_empty());
+        assert_eq!(f.backend.shm_fences.get(&F), Some(&false));
+        assert!(!query(&mut f));
+
+        // DestroyFence triggers the memory (releasing client waiters) and
+        // unmaps it; so does the owner's disconnect.
+        f.a(s::DESTROY_FENCE, &F.to_le_bytes());
+        assert_eq!(f.backend.destroyed_shm_fences, vec![(F, true)]);
+        assert!(!f.backend.shm_fences.contains_key(&F));
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(SYNC_A),
+        );
+        assert_eq!(f.backend.destroyed_shm_fences, vec![(F, true), (G, true)]);
+        assert!(f.backend.shm_fences.is_empty());
+    }
+
+    /// SERVERTIME awaits wake when the clock reaches the value (Xvfb: an
+    /// absolute now+300 PositiveComparison blocked ~300 ms and reported
+    /// wait == value), and the loop gets a deadline for it.
+    #[test]
+    fn sync_await_on_servertime_fires_when_the_clock_gets_there() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        let now = i64::from(f.state.timestamp_now());
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::SERVERTIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                now + 300,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        let deadline = crate::core_loop::sync_await::system_counter_deadline(&f.state)
+            .expect("a SERVERTIME deadline");
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > std::time::Duration::from_millis(200)
+                && wait <= std::time::Duration::from_millis(300),
+            "deadline ~300 ms out, got {wait:?}"
+        );
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        assert!(f.suspended(), "not there yet");
+        // Let 400 ms of server time pass. Until the loop evaluates it, the
+        // passed value must read as due now — never as "no deadline", or
+        // an idle loop would block past it.
+        f.state.start_instant -= std::time::Duration::from_millis(400);
+        let due = crate::core_loop::sync_await::system_counter_deadline(&f.state)
+            .expect("still pending until evaluated");
+        assert!(due <= std::time::Instant::now());
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        assert!(!f.suspended());
+        let (counter, wait_value, value, count, destroyed) =
+            counter_notify_fields(&f.b_packets()[0]);
+        assert_eq!(
+            (counter, wait_value, count, destroyed),
+            (s::SERVERTIME_COUNTER, now + 300, 0, false)
+        );
+        assert!(value >= now + 300);
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_none());
+    }
+
+    /// SERVERTIME alarms fire too (Xvfb: an absolute now+200
+    /// PositiveComparison alarm with delta 0 sent AlarmNotify after ~200 ms
+    /// with state Inactive and counter >= alarm value).
+    #[test]
+    fn sync_alarm_on_servertime_fires_when_the_clock_gets_there() {
+        use yserver_protocol::x11::sync as s;
+        const ALARM: u32 = 0x0010_0030;
+        let mut f = sync_fixture();
+        let now = i64::from(f.state.timestamp_now());
+        let mut body = ALARM.to_le_bytes().to_vec();
+        let mask = s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE | s::CA_DELTA;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&s::SERVERTIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&s::VALUE_TYPE_ABSOLUTE.to_le_bytes());
+        body.extend_from_slice(&sync_i64(now + 200));
+        body.extend_from_slice(&s::TEST_POSITIVE_COMPARISON.to_le_bytes());
+        body.extend_from_slice(&sync_i64(0));
+        f.b(s::CREATE_ALARM, &body);
+        assert!(f.b_packets().is_empty(), "not due yet");
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_some());
+        f.state.start_instant -= std::time::Duration::from_millis(300);
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        let packets = f.b_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            packets[0][0],
+            crate::nested::SYNC_FIRST_EVENT + 1,
+            "AlarmNotify"
+        );
+        assert_eq!(packets[0][28], s::ALARM_STATE_INACTIVE);
+        assert_eq!(f.state.sync_alarms[&ALARM].state, s::ALARM_STATE_INACTIVE);
+    }
+
+    /// IDLETIME awaits: a positive test wakes when idle time reaches it; a
+    /// negative transition wakes on input (idle drops to 0).
+    #[test]
+    fn sync_await_on_idletime_fires_on_idle_and_on_input() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.state.dpms.last_activity = std::time::Instant::now();
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::IDLETIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                5_000,
+                s::TEST_POSITIVE_TRANSITION,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_some());
+        f.state.dpms.last_activity -= std::time::Duration::from_secs(6);
+        crate::core_loop::run::evaluate_idletime_alarms_post_poll(&mut f.state, &mut f.backend);
+        assert!(!f.suspended());
+        let (counter, wait_value, _, _, _) = counter_notify_fields(&f.b_packets()[0]);
+        assert_eq!((counter, wait_value), (s::IDLETIME_COUNTER, 5_000));
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::IDLETIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                1_000,
+                s::TEST_NEGATIVE_TRANSITION,
+                0,
+            ),
+        );
+        assert!(f.suspended(), "idle is ~6 s, no downward crossing yet");
+        evaluate_idletime_negative_alarms_on_input_wake(&mut f.state, 2, 6_000, 6_000);
+        assert!(!f.suspended());
+    }
+
+    /// The awaiting client's own disconnect drops its await.
+    #[test]
+    fn sync_await_dies_with_its_client() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(SYNC_B),
+        );
+        assert!(f.state.sync_awaits.is_empty());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 9));
+        assert!(f.state.sync_counters.contains_key(&SYNC_C1));
     }
 
     fn xfixes_create_barrier(
@@ -59581,6 +63981,8 @@ mod tests {
         body.extend_from_slice(&0x10u32.to_le_bytes());
         body.extend_from_slice(&0x11u32.to_le_bytes());
         body.extend_from_slice(&0x12u32.to_le_bytes());
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(1, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -60592,7 +64994,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         process_request(
@@ -61333,6 +65735,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&PICTURE_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61385,6 +65789,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&UNKNOWN_PIC.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61438,6 +65844,8 @@ mod tests {
         body.push(0); // kind = Bounding (valid)
         body.extend_from_slice(&[0u8; 3]);
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61516,6 +65924,8 @@ mod tests {
         body.push(INVALID_KIND);
         body.extend_from_slice(&[0u8; 3]);
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61586,6 +65996,8 @@ mod tests {
         let mut body = Vec::with_capacity(4);
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61723,6 +66135,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&GC_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61856,6 +66270,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&GC_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61916,6 +66332,8 @@ mod tests {
         body.extend_from_slice(&PRIMARY.to_le_bytes());
         body.extend_from_slice(&x11xfixes::SELECTION_MASK_SET_OWNER.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(CLIENT, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61989,6 +66407,8 @@ mod tests {
         body.extend_from_slice(&PRIMARY.to_le_bytes());
         body.extend_from_slice(&ILLEGAL_MASK.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(CLIENT, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -66166,9 +70586,13 @@ mod tests {
                 counter,
                 wait_value: 100,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 100,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
 
@@ -66208,9 +70632,13 @@ mod tests {
                 counter,
                 wait_value: 100,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_COMPARISON as u8,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 100,
+                check_type: x11sync::TEST_POSITIVE_COMPARISON,
             },
         );
 
@@ -66247,9 +70675,13 @@ mod tests {
                 counter,
                 wait_value: near_max,
                 delta: 100, // would overflow on first add
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: near_max,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
 
@@ -68559,6 +72991,668 @@ mod tests {
         );
     }
 
+    // ─── GLX 1.0 CreateGLXPixmap / DestroyGLXPixmap, QueryContext, IsDirect ───
+    //
+    // Expected wire behaviour is Xorg's, captured from Xvfb 21.1.24
+    // (llvmpipe GLX) with an xcb probe on 2026-09-26. Xvfb's GLX visual 0x21
+    // carries FBConfig 0x88; the yserver counterpart used below is
+    // ROOT_VISUAL 0x102 carrying FBConfig 0x101 (synthesise_glx_fb_configs).
+    // Error values, minors and the order in which the checks fire are
+    // Xvfb's, verbatim.
+
+    const GLX_TEST_XID_BASE: u32 = 0x0020_0000;
+    const GLX_TEST_XID_MASK: u32 = 0x001f_ffff;
+
+    /// A client whose XID range is `0x0020_0000 | 0x001f_ffff`, the range
+    /// Xvfb handed the capture probe, so `LEGAL_NEW_RESOURCE` is exercised.
+    fn glx_legacy_fixture() -> (ServerState, RecordingBackend, UnixStream) {
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        let client = state.clients.get_mut(&1).expect("test client");
+        client.resource_id_base = GLX_TEST_XID_BASE;
+        client.resource_id_mask = GLX_TEST_XID_MASK;
+        (state, RecordingBackend::new(), peer)
+    }
+
+    fn glx_legacy_x_pixmap(state: &mut ServerState, xid: u32, depth: u8, host: Option<u32>) {
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth,
+                pixmap: ResourceId(xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+        if let Some(host) = host {
+            assert!(state.resources.set_pixmap_host_xid(
+                ResourceId(xid),
+                crate::backend::PixmapHandle::from_raw(host).expect("non-zero host xid"),
+            ));
+        }
+    }
+
+    fn glx_legacy_words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Run one request for `client` and return every byte it wrote.
+    fn glx_legacy_send_major(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        client: u32,
+        (opcode, minor): (u8, u8),
+        body: &[u8],
+    ) -> Vec<u8> {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(7),
+            RequestHeader {
+                opcode,
+                data: minor,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+        read_all_or_buffered(state, client, peer)
+    }
+
+    /// Run one GLX request for `client` and return every byte it wrote.
+    fn glx_legacy_send(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        glx_legacy_send_major(
+            state,
+            backend,
+            peer,
+            client,
+            (crate::nested::GLX_MAJOR_OPCODE, minor),
+            body,
+        )
+    }
+
+    /// Assert `bytes` is exactly one X error with this code, bad value and
+    /// minor opcode on the GLX major opcode.
+    fn assert_glx_legacy_error(what: &str, bytes: &[u8], code: u8, value: u32, minor: u8) {
+        assert_eq!(bytes.len(), 32, "{what}: expected exactly one error packet");
+        assert_eq!(bytes[0], 0, "{what}: expected an X error");
+        assert_eq!(bytes[1], code, "{what}: error code");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            value,
+            "{what}: bad value"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            u16::from(minor),
+            "{what}: minor opcode"
+        );
+        assert_eq!(
+            bytes[10],
+            crate::nested::GLX_MAJOR_OPCODE,
+            "{what}: major opcode"
+        );
+    }
+
+    fn create_glx_pixmap_body(screen: u32, visual: u32, pixmap: u32, glx_pixmap: u32) -> Vec<u8> {
+        glx_legacy_words(&[screen, visual, pixmap, glx_pixmap])
+    }
+
+    /// Decode the (attribute, value) pairs of a GetDrawableAttributes /
+    /// QueryContext reply, checking the header's length and count agree.
+    fn glx_legacy_reply_pairs(bytes: &[u8]) -> Vec<(u32, u32)> {
+        assert_eq!(bytes[0], 1, "expected a reply, got {bytes:02x?}");
+        let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        assert_eq!(length, 2 * n, "reply length must be 2 * n");
+        assert_eq!(bytes.len(), 32 + 8 * n, "reply size");
+        (0..n)
+            .map(|i| {
+                let at = 32 + 8 * i;
+                (
+                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    /// GLX 1.0 `glXCreateGLXPixmap` (minor 13) used to hit the
+    /// `GLXBadRenderRequest` catch-all, so Xlib's default handler killed the
+    /// app. It must create the same GLXPixmap record GLX 1.3 `CreatePixmap`
+    /// does (config = the visual's FBConfig), hold the export ref, report
+    /// Xorg's drawable attributes, and `DestroyGLXPixmap` (15) must release
+    /// the ref — also after the X pixmap was freed first (Xorg bumps the
+    /// pixmap refcount, glxcmds.c `DoCreateGLXPixmap`).
+    #[test]
+    fn glx10_create_glx_pixmap_records_pixmap_and_destroy_releases_it() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let glx_pixmap = GLX_TEST_XID_BASE | 0x02;
+        let host = 0xdead_0001;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, Some(host));
+
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &create_glx_pixmap_body(0, crate::resources::ROOT_VISUAL.0, pixmap, glx_pixmap),
+        );
+        assert!(
+            out.is_empty(),
+            "CreateGLXPixmap succeeds silently, got {out:02x?}"
+        );
+        let record = state
+            .glx_drawables
+            .get(&glx_pixmap)
+            .expect("GLXPixmap recorded");
+        assert_eq!(record.kind, crate::server::GlxDrawableKind::Pixmap);
+        assert_eq!(record.x_drawable, pixmap);
+        assert_eq!(record.fbconfig, 0x101, "the visual's FBConfig");
+        assert_eq!(record.glx_export_host_xid, Some(host));
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::AcquireGlxPixmapExport(host))
+        );
+
+        // Xvfb: 0x20d4=0 0x801d=64 0x801e=32 0x800c=0 0x20d6=0x20dd
+        //       0x801f=0 0x8013=<fbconfig> 0x8010=GLX_PIXMAP_BIT
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::GET_DRAWABLE_ATTRIBUTES,
+            &glx_pixmap.to_le_bytes(),
+        );
+        assert_eq!(
+            glx_legacy_reply_pairs(&out),
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_RECTANGLE_EXT),
+                (g::GLX_EVENT_MASK, 0),
+                (g::GLX_FBCONFIG_ID, 0x101),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_PIXMAP_BIT),
+            ]
+        );
+
+        // FreePixmap first, then DestroyGLXPixmap: both Success on Xvfb.
+        let out = glx_legacy_send_major(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            (54, 0),
+            &pixmap.to_le_bytes(),
+        );
+        assert!(out.is_empty(), "FreePixmap: got {out:02x?}");
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::DESTROY_GLX_PIXMAP,
+            &glx_pixmap.to_le_bytes(),
+        );
+        assert!(
+            out.is_empty(),
+            "DestroyGLXPixmap succeeds silently, got {out:02x?}"
+        );
+        assert!(!state.glx_drawables.contains_key(&glx_pixmap));
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::ReleaseGlxPixmapExport(host))
+        );
+    }
+
+    /// Every CreateGLXPixmap failure Xvfb produced, with its error code,
+    /// bad value and the precedence between checks: size, then the new
+    /// XID (`LEGAL_NEW_RESOURCE`), then the screen (GLXVND: BadMatch), then
+    /// the visual (BadValue), then the pixmap (core BadDrawable, or core
+    /// BadPixmap for a window). A failed request creates nothing.
+    #[test]
+    fn glx10_create_glx_pixmap_errors_match_xorg() {
+        use yserver_protocol::x11::{error, glx as g};
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let other_pixmap = GLX_TEST_XID_BASE | 0x03;
+        let existing_glx = GLX_TEST_XID_BASE | 0x04;
+        let fresh = GLX_TEST_XID_BASE | 0x05;
+        let vis = crate::resources::ROOT_VISUAL.0;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        glx_legacy_x_pixmap(&mut state, other_pixmap, 32, None);
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &create_glx_pixmap_body(0, vis, pixmap, existing_glx),
+        );
+        assert!(out.is_empty());
+
+        let bad_id = error::BAD_ID_CHOICE;
+        let unknown = 0x5a_5a5a;
+        let root = ROOT_WINDOW.0;
+        let cases: &[(&str, [u32; 4], u8, u32)] = &[
+            (
+                "glx id in use",
+                [0, vis, pixmap, existing_glx],
+                bad_id,
+                existing_glx,
+            ),
+            (
+                "glx id = X pixmap",
+                [0, vis, pixmap, other_pixmap],
+                bad_id,
+                other_pixmap,
+            ),
+            (
+                "glx id out of range",
+                [0, vis, pixmap, 0x07f0_0001],
+                bad_id,
+                0x07f0_0001,
+            ),
+            ("screen 1", [1, vis, pixmap, fresh], error::BAD_MATCH, 1),
+            (
+                "unknown visual",
+                [0, 0xdead, pixmap, fresh],
+                error::BAD_VALUE,
+                0xdead,
+            ),
+            // An FBConfig ID is not a GLX visual (Xvfb: its visual-less
+            // FBConfig 0x41 → BadValue 0x41).
+            (
+                "visual-less fbconfig id",
+                [0, 0x104, pixmap, fresh],
+                error::BAD_VALUE,
+                0x104,
+            ),
+            (
+                "fbconfig id of a visual",
+                [0, 0x101, pixmap, fresh],
+                error::BAD_VALUE,
+                0x101,
+            ),
+            (
+                "screen 1 + bad visual",
+                [1, 0xdead, pixmap, fresh],
+                error::BAD_MATCH,
+                1,
+            ),
+            (
+                "root window as pixmap",
+                [0, vis, root, fresh],
+                error::BAD_PIXMAP,
+                root,
+            ),
+            (
+                "unknown pixmap",
+                [0, vis, unknown, fresh],
+                error::BAD_DRAWABLE,
+                unknown,
+            ),
+            (
+                "bad visual + bad pixmap",
+                [0, 0xdead, unknown, fresh],
+                error::BAD_VALUE,
+                0xdead,
+            ),
+            (
+                "bad pixmap + glx id in use",
+                [0, vis, unknown, existing_glx],
+                bad_id,
+                existing_glx,
+            ),
+        ];
+        for (what, [screen, visual, pix, glx], code, value) in cases {
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::CREATE_GLX_PIXMAP,
+                &create_glx_pixmap_body(*screen, *visual, *pix, *glx),
+            );
+            assert_glx_legacy_error(what, &out, *code, *value, g::CREATE_GLX_PIXMAP);
+        }
+        assert!(!state.glx_drawables.contains_key(&fresh));
+        assert!(!state.glx_drawables.contains_key(&other_pixmap));
+        assert_eq!(state.glx_drawables.len(), 1);
+    }
+
+    /// Xorg does not compare the pixmap depth with the visual: Xvfb accepted
+    /// depth-32, depth-8 and depth-1 pixmaps for its depth-24 visual.
+    #[test]
+    fn glx10_create_glx_pixmap_accepts_any_pixmap_depth() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        for (i, depth) in (0_u32..).zip([32_u8, 8, 1]) {
+            let pixmap = GLX_TEST_XID_BASE | (0x10 + i);
+            let glx_pixmap = GLX_TEST_XID_BASE | (0x20 + i);
+            glx_legacy_x_pixmap(&mut state, pixmap, depth, None);
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::CREATE_GLX_PIXMAP,
+                &create_glx_pixmap_body(0, crate::resources::ROOT_VISUAL.0, pixmap, glx_pixmap),
+            );
+            assert!(out.is_empty(), "depth {depth}: got {out:02x?}");
+            assert!(state.glx_drawables.contains_key(&glx_pixmap));
+        }
+    }
+
+    /// DestroyGLXPixmap takes only a live GLX *pixmap*: anything else is
+    /// `GLXBadPixmap` with the XID as bad value (GLXVND's XID map, then
+    /// `validGlxDrawable`'s type check). GLX 1.0 and GLX 1.3 pixmaps are the
+    /// same resource type, so either destroy request frees either.
+    #[test]
+    fn glx10_destroy_glx_pixmap_errors_and_cross_version_destroy_match_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let bad_pixmap = crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_PIXMAP;
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let legacy = GLX_TEST_XID_BASE | 0x02;
+        let modern = GLX_TEST_XID_BASE | 0x03;
+        let glx_window = GLX_TEST_XID_BASE | 0x04;
+        let pbuffer = GLX_TEST_XID_BASE | 0x05;
+        let vis = crate::resources::ROOT_VISUAL.0;
+
+        let mut send = |state: &mut ServerState, minor: u8, body: &[u8]| {
+            glx_legacy_send(state, &mut backend, &mut peer, 1, minor, body)
+        };
+        let window_body = glx_legacy_words(&[0, 0x101, ROOT_WINDOW.0, glx_window]);
+        assert!(send(&mut state, g::CREATE_WINDOW, &window_body).is_empty());
+        let pbuffer_body = glx_legacy_words(&[0, 0x101, pbuffer, 0]);
+        assert!(send(&mut state, g::CREATE_PBUFFER, &pbuffer_body).is_empty());
+
+        for (what, xid) in [
+            ("unknown xid", 0x5a_5a5a),
+            ("X pixmap", pixmap),
+            ("GLX window", glx_window),
+            ("GLX pbuffer", pbuffer),
+        ] {
+            let out = send(&mut state, g::DESTROY_GLX_PIXMAP, &xid.to_le_bytes());
+            assert_glx_legacy_error(what, &out, bad_pixmap, xid, g::DESTROY_GLX_PIXMAP);
+        }
+        assert!(state.glx_drawables.contains_key(&glx_window));
+        assert!(state.glx_drawables.contains_key(&pbuffer));
+
+        // GLX 1.0 pixmap destroyed by GLX 1.3 DestroyPixmap; a second
+        // destroy through DestroyGLXPixmap is GLXBadPixmap.
+        let body = create_glx_pixmap_body(0, vis, pixmap, legacy);
+        assert!(send(&mut state, g::CREATE_GLX_PIXMAP, &body).is_empty());
+        assert!(send(&mut state, g::DESTROY_PIXMAP, &legacy.to_le_bytes()).is_empty());
+        assert!(!state.glx_drawables.contains_key(&legacy));
+        let out = send(&mut state, g::DESTROY_GLX_PIXMAP, &legacy.to_le_bytes());
+        assert_glx_legacy_error(
+            "destroyed twice",
+            &out,
+            bad_pixmap,
+            legacy,
+            g::DESTROY_GLX_PIXMAP,
+        );
+
+        // GLX 1.3 pixmap destroyed by GLX 1.0 DestroyGLXPixmap.
+        let body = glx_legacy_words(&[0, 0x101, pixmap, modern, 0]);
+        assert!(send(&mut state, g::CREATE_PIXMAP, &body).is_empty());
+        assert!(send(&mut state, g::DESTROY_GLX_PIXMAP, &modern.to_le_bytes()).is_empty());
+        assert!(!state.glx_drawables.contains_key(&modern));
+    }
+
+    /// CreateGLXPixmap, DestroyGLXPixmap, QueryContext and IsDirect are all
+    /// `REQUEST_SIZE_MATCH` in Xorg's GLXVND stubs: a short or long request
+    /// is core `BadLength`, and nothing is created.
+    #[test]
+    fn glx10_fixed_size_requests_reject_wrong_length() {
+        use yserver_protocol::x11::{error, glx as g};
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let mut long_create = create_glx_pixmap_body(
+            0,
+            crate::resources::ROOT_VISUAL.0,
+            pixmap,
+            GLX_TEST_XID_BASE | 0x02,
+        );
+        long_create.extend_from_slice(&[0; 4]);
+        let short_create = &long_create[..12];
+        for (what, minor, body) in [
+            (
+                "CreateGLXPixmap long",
+                g::CREATE_GLX_PIXMAP,
+                long_create.as_slice(),
+            ),
+            ("CreateGLXPixmap short", g::CREATE_GLX_PIXMAP, short_create),
+            ("DestroyGLXPixmap long", g::DESTROY_GLX_PIXMAP, &[0; 8][..]),
+            ("DestroyGLXPixmap empty", g::DESTROY_GLX_PIXMAP, &[][..]),
+            ("QueryContext long", g::QUERY_CONTEXT, &[0; 8][..]),
+            ("QueryContext empty", g::QUERY_CONTEXT, &[][..]),
+            ("IsDirect long", g::IS_DIRECT, &[0; 8][..]),
+            ("IsDirect empty", g::IS_DIRECT, &[][..]),
+        ] {
+            let out = glx_legacy_send(&mut state, &mut backend, &mut peer, 1, minor, body);
+            assert_glx_legacy_error(what, &out, error::BAD_LENGTH, 0, minor);
+        }
+        assert!(state.glx_drawables.is_empty());
+    }
+
+    /// `QueryContext` (GLX_EXT_import_context) answers Xorg's five
+    /// attributes in Xorg's order (glxcmds.c `DoQueryContext`) for every
+    /// creation request, to any client, and `GLXBadContext` for an XID that
+    /// is not a live context. `IsDirect` reports the creation request's
+    /// `isDirect` and shares the `GLXBadContext` rule.
+    #[test]
+    fn glx_query_context_and_is_direct_match_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let mut peer2 = install_client(&mut state, 2);
+        let bad_context = crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_CONTEXT;
+        let root_visual = crate::resources::ROOT_VISUAL.0;
+        let ctx1 = GLX_TEST_XID_BASE | 0x11;
+        let ctx2 = GLX_TEST_XID_BASE | 0x12;
+        let ctx3 = GLX_TEST_XID_BASE | 0x13;
+        let ctx4 = GLX_TEST_XID_BASE | 0x14;
+        let ctx5 = GLX_TEST_XID_BASE | 0x15;
+
+        let creates: [(u8, Vec<u32>); 5] = [
+            // CreateContext: context visual screen share isDirect
+            (g::CREATE_CONTEXT, vec![ctx1, root_visual, 0, 0, 1]),
+            // CreateNewContext (visual-less FBConfig, share ctx1):
+            // context fbconfig screen renderType share isDirect
+            (
+                g::CREATE_NEW_CONTEXT,
+                vec![ctx2, 0x104, 0, g::GLX_RGBA_TYPE, ctx1, 1],
+            ),
+            // CreateContextAttribsARB (share ctx1, GL 3.0):
+            // context fbconfig screen share isDirect numAttribs attribs
+            (
+                g::CREATE_CONTEXT_ATTRIBS_ARB,
+                vec![ctx3, 0x101, 0, ctx1, 1, 2, 0x2091, 3, 0x2092, 0],
+            ),
+            // CreateContextAttribsARB with GLX_RENDER_TYPE = GLX_RGBA_TYPE.
+            (
+                g::CREATE_CONTEXT_ATTRIBS_ARB,
+                vec![
+                    ctx4,
+                    0x101,
+                    0,
+                    0,
+                    1,
+                    1,
+                    g::GLX_RENDER_TYPE,
+                    g::GLX_RGBA_TYPE,
+                ],
+            ),
+            // CreateContext asking for an indirect context (isDirect 0).
+            (g::CREATE_CONTEXT, vec![ctx5, root_visual, 0, 0, 0]),
+        ];
+        for (minor, words) in &creates {
+            let body = glx_legacy_words(words);
+            let out = glx_legacy_send(&mut state, &mut backend, &mut peer, 1, *minor, &body);
+            assert!(out.is_empty(), "create minor {minor}: got {out:02x?}");
+        }
+
+        let expect = |share: u32, visual: u32, fbconfig: u32| {
+            vec![
+                (g::GLX_SHARE_CONTEXT_EXT, share),
+                (g::GLX_VISUAL_ID, visual),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_FBCONFIG_ID, fbconfig),
+                (g::GLX_RENDER_TYPE, g::GLX_RGBA_TYPE),
+            ]
+        };
+        for (ctx, share, visual, fbconfig) in [
+            // Xvfb: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx1, 0, root_visual, 0x101),
+            // Xvfb: 0x800a=ctx1 0x800b=0 0x800c=0 0x8013=0x41 0x8011=0x8014
+            (ctx2, ctx1, 0, 0x104),
+            // Xvfb: 0x800a=ctx1 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx3, ctx1, root_visual, 0x101),
+            // Xvfb: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx4, 0, root_visual, 0x101),
+            // Xvfb +iglx: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx5, 0, root_visual, 0x101),
+        ] {
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::QUERY_CONTEXT,
+                &ctx.to_le_bytes(),
+            );
+            assert_eq!(
+                glx_legacy_reply_pairs(&out),
+                expect(share, visual, fbconfig),
+                "QueryContext(0x{ctx:x})"
+            );
+        }
+
+        // Another client may query and IsDirect it: that is what
+        // import_context is for.
+        let ctx1_body = ctx1.to_le_bytes();
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer2,
+            2,
+            g::QUERY_CONTEXT,
+            &ctx1_body,
+        );
+        assert_eq!(glx_legacy_reply_pairs(&out), expect(0, root_visual, 0x101));
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer2,
+            2,
+            g::IS_DIRECT,
+            &ctx1_body,
+        );
+        assert_eq!(out.len(), 32, "IsDirect reply is 32 bytes");
+        assert_eq!(out[0], 1, "IsDirect reply");
+        assert_eq!(&out[4..8], &[0; 4], "IsDirect reply length 0");
+        assert_eq!(out[8], 1, "IsDirect(ctx1) = True");
+        // Xvfb +iglx: IsDirect of a context created with isDirect 0 is 0.
+        // (Without +iglx Xorg refuses that CreateContext with BadValue.)
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::IS_DIRECT,
+            &ctx5.to_le_bytes(),
+        );
+        assert_eq!((out.len(), out[0], out[8]), (32, 1, 0), "IsDirect(ctx5)");
+
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let glx_pixmap = GLX_TEST_XID_BASE | 0x02;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let body = create_glx_pixmap_body(0, root_visual, pixmap, glx_pixmap);
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &body,
+        );
+        assert!(out.is_empty());
+        for (what, xid) in [
+            ("unknown", 0x5a_5a5a),
+            ("GLX pixmap", glx_pixmap),
+            ("None", 0),
+        ] {
+            for minor in [g::QUERY_CONTEXT, g::IS_DIRECT] {
+                let out = glx_legacy_send(
+                    &mut state,
+                    &mut backend,
+                    &mut peer,
+                    1,
+                    minor,
+                    &xid.to_le_bytes(),
+                );
+                assert_glx_legacy_error(what, &out, bad_context, xid, minor);
+            }
+        }
+
+        let ctx2_body = ctx2.to_le_bytes();
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::DESTROY_CONTEXT,
+            &ctx2_body,
+        );
+        assert!(out.is_empty());
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::QUERY_CONTEXT,
+            &ctx2_body,
+        );
+        assert_glx_legacy_error(
+            "destroyed context",
+            &out,
+            bad_context,
+            ctx2,
+            g::QUERY_CONTEXT,
+        );
+    }
+
     /// `GetDrawableAttributes` on a GLXPixmap/GLXWindow must report the
     /// geometry of the *backing* X drawable. The GLX XID is a fresh
     /// client-allocated id with no X resource behind it, so resolving the
@@ -68703,6 +73797,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -68758,6 +73853,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -68801,6 +73897,7 @@ mod tests {
                 height: 32,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -72440,6 +77537,97 @@ mod tests {
             body,
         )
         .expect("XKB request");
+    }
+
+    /// Xvfb 21.1.24, XkbUseExtension(1, 0) at sequence 2 from a
+    /// little-endian client: `01010200 00000000 01000000 00…`
+    /// (supported, server 1.0).
+    #[test]
+    fn xkb_use_extension_replies_like_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 136,
+                data: 0,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+        )
+        .expect("XkbUseExtension");
+        let reply = read_all_available(&mut peer);
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 1, 2, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(reply, expected);
+        assert!(crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+    }
+
+    /// yserver's XKB request parsers and reply encoders are little-endian
+    /// only, so a big-endian client is refused the way Xorg refuses a
+    /// client it can't serve: XkbUseExtension answers supported=False
+    /// (the bytes are Xvfb's big-endian answer to an unsupported version,
+    /// `01000002 00000000 00010000 00…`), and every other XKB request is
+    /// then BadAccess, as Xorg answers an uninitialised client (Xvfb:
+    /// GetState → BadAccess, value 0, minor 4). All of it in the client's
+    /// byte order.
+    #[test]
+    fn xkb_refuses_big_endian_clients_cleanly() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        // XKB request bodies are not swapped: wantedMajor=1, wantedMinor=0
+        // as a big-endian client sends them.
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 136,
+                data: 0,
+                length_units: 2,
+            },
+            &[0, 1, 0, 0],
+        )
+        .expect("XkbUseExtension");
+        let reply = read_all_available(&mut peer);
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 0, 0, 2, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(reply, expected);
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 136,
+                data: 4,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+        )
+        .expect("XkbGetState");
+        let err = read_all_available(&mut peer);
+        assert_eq!(err.len(), 32);
+        assert_eq!((err[0], err[1]), (0, x11::error::BAD_ACCESS));
+        assert_eq!(&err[2..4], &[0, 3], "big-endian sequence");
+        assert_eq!(&err[8..10], &[0, 4], "big-endian minor opcode");
     }
 
     /// Golden (`xorg-xkb-setmap-errors.txt`, Xvfb 21.1.24: `access`,

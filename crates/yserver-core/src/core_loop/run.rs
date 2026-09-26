@@ -719,14 +719,20 @@ impl FairRequestQueue {
         self.pop_front_if(|_| true)
     }
 
-    fn has_runnable(&self, pending: &PendingBackendRequests) -> bool {
+    /// Whether some queued client may run: not waiting on backend work and
+    /// not suspended by a SYNC await.
+    fn has_runnable(&self, pending: &PendingBackendRequests, state: &ServerState) -> bool {
         self.ready
             .iter()
-            .any(|client| !pending.client_is_blocked(*client))
+            .any(|client| client_runnable(pending, state, *client))
     }
 
-    fn pop_front_unblocked(&mut self, pending: &PendingBackendRequests) -> Option<DeferredRequest> {
-        self.pop_front_if(|client| !pending.client_is_blocked(client))
+    fn pop_front_unblocked(
+        &mut self,
+        pending: &PendingBackendRequests,
+        state: &ServerState,
+    ) -> Option<DeferredRequest> {
+        self.pop_front_if(|client| client_runnable(pending, state, client))
     }
 
     fn pop_front_if(
@@ -783,6 +789,19 @@ pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
         body: Vec::new(),
         attached_fd: None,
     }
+}
+
+/// A client's queued requests may be dispatched unless it waits on
+/// asynchronous backend work or a SYNC `Await` / `AwaitFence` suspended it
+/// (Xorg `IgnoreClient`). Either way its requests keep their order and
+/// every other client keeps running.
+fn client_runnable(
+    pending: &PendingBackendRequests,
+    state: &ServerState,
+    client: yserver_protocol::x11::ClientId,
+) -> bool {
+    !pending.client_is_blocked(client)
+        && !crate::core_loop::sync_await::client_is_suspended(state, client)
 }
 
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
@@ -976,7 +995,7 @@ fn drain_pending_requests(
     drain_start: Instant,
 ) {
     while !budget_exhausted(*request_budget, drain_start.elapsed()) {
-        let Some(req) = deferred_requests.pop_front_unblocked(pending) else {
+        let Some(req) = deferred_requests.pop_front_unblocked(pending, state) else {
             break;
         };
         telemetry.record_deferred_pop(req.id);
@@ -1069,6 +1088,10 @@ fn process_request_inline(
         }
         backend.mark_dirty();
     }
+    // A request that changed the displayed cursor (DefineCursor, a grab,
+    // XFIXES ChangeCursor, a map under the pointer) reports it before the
+    // client's next request runs, as Xorg does from DisplayCursor.
+    crate::core_loop::process_request::emit_xfixes_cursor_notify(state, backend);
     outcome
 }
 
@@ -1287,7 +1310,7 @@ pub fn run_core(
         // to do right now. Without this, an idle moment where the
         // channel is briefly empty would let `poll.poll` block until
         // a fresh fd event, leaving the backlog stranded.
-        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests)
+        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests, state)
             || listener_readiness.has_pending()
         {
             Some(Duration::ZERO)
@@ -1303,6 +1326,8 @@ pub fn run_core(
             let ss_idle_deadline = state.screensaver_idle_deadline();
             let ss_cycle_deadline = state.screensaver_cycle_deadline();
             let idletime_alarm_deadline = state.idletime_alarm_deadline();
+            let sync_counter_deadline =
+                crate::core_loop::sync_await::system_counter_deadline(state);
             // The XDMCP retransmission/dormancy deadline joins the existing
             // computation rather than bringing a thread of its own — the
             // state machine belongs on this loop, where it can see the
@@ -1317,6 +1342,7 @@ pub fn run_core(
                 .chain(ss_idle_deadline)
                 .chain(ss_cycle_deadline)
                 .chain(idletime_alarm_deadline)
+                .chain(sync_counter_deadline)
                 .chain(xdmcp_deadline)
                 .min()
                 .map(|deadline| {
@@ -1773,6 +1799,7 @@ pub fn run_core(
         // SS: evaluate idle activation and Cycle re-fire.
         evaluate_screen_saver_post_poll(state, backend);
         evaluate_idletime_alarms_post_poll(state, backend);
+        crate::core_loop::sync_await::evaluate_servertime(state);
 
         // F2: if a `wait_for_reply` (called by `process_request`
         // mid-handler) saw the host close, propagate it as a clean
@@ -1932,6 +1959,9 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
     backend.poll_deferred_input(state);
+
+    // Pointer motion and other input-driven sprite changes.
+    crate::core_loop::process_request::emit_xfixes_cursor_notify(state, backend);
 
     // Drain-before-compose (spec "Loop-order and clock contract" item 1):
     // an entry executed here must be visible to THIS iteration's
@@ -3213,12 +3243,12 @@ pub(crate) fn evaluate_idletime_alarms_post_poll(
     ];
     let now = Instant::now();
     for &counter in IDLETIME_COUNTERS {
-        // Skip if no alarms reference this counter.
+        // Skip if no alarm or await references this counter.
         let has_alarm = state
             .sync_alarms
             .values()
             .any(|a| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE);
-        if !has_alarm {
+        if !has_alarm && !crate::core_loop::sync_await::idletime_awaited(state, counter) {
             continue;
         }
         let baseline = state.idletime_baseline(counter);
@@ -3235,13 +3265,10 @@ pub(crate) fn evaluate_idletime_alarms_post_poll(
         // Run the existing evaluator helper — it walks Active alarms,
         // calls trigger_fires, applies the Task 2 state-transition fix,
         // emits AlarmNotify, and updates wait_value.
-        crate::core_loop::process_request::evaluate_alarms_for_counter(
-            state,
-            counter,
-            old_idle,
-            current_idle,
-        );
+        // Record the new value first: firing an await can re-enter the
+        // IDLETIME bookkeeping through a fresh await's baseline.
         state.idletime_last_evaluated.insert(counter, current_idle);
+        crate::core_loop::sync_await::counter_changed(state, counter, old_idle, current_idle);
     }
 }
 
@@ -4024,25 +4051,56 @@ mod tests {
             })
             .unwrap();
 
+        let state = ServerState::new();
         let mut queue = FairRequestQueue::default();
         queue.push_back(deferred_request(blocked.0, 2));
         queue.push_back(deferred_request(other.0, 10));
         queue.push_back(deferred_request(blocked.0, 3));
 
-        let runnable = queue.pop_front_unblocked(&pending).unwrap();
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
         assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
         assert!(
-            queue.pop_front_unblocked(&pending).is_none(),
+            queue.pop_front_unblocked(&pending, &state).is_none(),
             "later requests from the pending client must stay parked"
         );
         assert!(
-            !queue.has_runnable(&pending),
+            !queue.has_runnable(&pending, &state),
             "a blocked-only queue must not force a zero-timeout poll spin"
         );
 
         pending.take_crtc(token).unwrap();
-        let first = queue.pop_front_unblocked(&pending).unwrap();
-        let second = queue.pop_front_unblocked(&pending).unwrap();
+        let first = queue.pop_front_unblocked(&pending, &state).unwrap();
+        let second = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
+    }
+
+    /// A client suspended by SYNC Await (Xorg `IgnoreClient`) keeps its
+    /// later requests queued in order while other clients run, the queue
+    /// does not spin the poll on it, and resuming releases them in order.
+    #[test]
+    fn sync_await_suspends_only_the_awaiting_client() {
+        let awaiting = yserver_protocol::x11::ClientId(57);
+        let other = yserver_protocol::x11::ClientId(12);
+        let pending = PendingBackendRequests::default();
+        let mut state = ServerState::new();
+        state
+            .sync_awaits
+            .insert(awaiting.0, crate::server::SyncAwait::default());
+
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(awaiting.0, 2));
+        queue.push_back(deferred_request(other.0, 10));
+        queue.push_back(deferred_request(awaiting.0, 3));
+
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+        assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+        assert!(!queue.has_runnable(&pending, &state));
+
+        state.sync_awaits.remove(&awaiting.0);
+        assert!(queue.has_runnable(&pending, &state));
+        let first = queue.pop_front_unblocked(&pending, &state).unwrap();
+        let second = queue.pop_front_unblocked(&pending, &state).unwrap();
         assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
     }
 
@@ -5343,9 +5401,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: false, // skip wire delivery; assert state mutation only
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         let mut backend = RecordingBackend::default();

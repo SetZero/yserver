@@ -2920,10 +2920,32 @@ pub fn write_ge_query_version_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    // GEQueryVersion reply: major=1, minor=0, rest padding
+    // GEQueryVersion reply: major=1, minor=0 in the client's byte order
+    // (Xorg SProcGEQueryVersion swaps both), rest padding.
     let mut reply = fixed_reply(byte_order, sequence, 0, 0);
-    reply.extend_from_slice(&[1, 0]); // major_version = 1
-    reply.extend_from_slice(&[0, 0]); // minor_version = 0
+    write_u16(byte_order, &mut reply, 1); // major_version
+    write_u16(byte_order, &mut reply, 0); // minor_version
+    reply.extend_from_slice(&[0; 20]);
+    writer.write_all(&reply)
+}
+
+/// XKEYBOARD protocol version the server implements (Xorg
+/// `SERVER_XKB_MAJOR_VERSION` / `SERVER_XKB_MINOR_VERSION`).
+pub const XKB_SERVER_MAJOR_VERSION: u16 = 1;
+pub const XKB_SERVER_MINOR_VERSION: u16 = 0;
+
+/// `xkbUseExtensionReply` as Xorg's `ProcXkbUseExtension` writes it:
+/// `supported` in the data byte, then the server version, with the
+/// sequence number and version in the client's byte order.
+pub fn write_xkb_use_extension_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    supported: bool,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(byte_order, sequence, u8::from(supported), 0);
+    write_u16(byte_order, &mut reply, XKB_SERVER_MAJOR_VERSION);
+    write_u16(byte_order, &mut reply, XKB_SERVER_MINOR_VERSION);
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
@@ -4271,6 +4293,29 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ge_query_version_reply_uses_the_client_byte_order() {
+        // Xvfb 21.1.24, GE QueryVersion(1, 0), sequence 2:
+        //   LE 01000200 00000000 01000000 00…
+        //   BE 01000002 00000000 00010000 00…
+        for (order, expected_head) in [
+            (
+                ClientByteOrder::LittleEndian,
+                [1u8, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            ),
+            (
+                ClientByteOrder::BigEndian,
+                [1u8, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0],
+            ),
+        ] {
+            let mut reply = Vec::new();
+            write_ge_query_version_reply(&mut reply, order, SequenceNumber(2)).unwrap();
+            assert_eq!(reply.len(), 32);
+            assert_eq!(&reply[..12], &expected_head, "{order:?}");
+            assert!(reply[12..].iter().all(|&b| b == 0), "{order:?}");
+        }
+    }
 
     fn create_window_body(value_mask: u32, values: &[u32]) -> Vec<u8> {
         let mut body = Vec::with_capacity(28 + values.len() * 4);

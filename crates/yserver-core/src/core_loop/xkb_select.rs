@@ -62,12 +62,40 @@ pub fn xkb_ancient(state: &ServerState, client: ClientId) -> bool {
 /// Port of `ProcXkbUseExtension`'s bookkeeping: whether the requested
 /// version is supported (1.x, or the pre-release 0.65), and if so the client
 /// becomes XKB-initialised (the first time only). Body: wantedMajor(2)
-/// wantedMinor(2).
+/// wantedMinor(2), in the client's byte order (XKB requests aren't swapped).
+///
+/// yserver's XKB request parsers and reply encoders are little-endian only,
+/// so a big-endian client is never supported: it gets Xorg's refusal
+/// (supported=False), after which every other XKB request it sends is
+/// BadAccess, as Xorg answers a client that isn't XKB-initialised. Clients
+/// fall back to the core keyboard protocol on supported=False (Xlib's
+/// `XkbUseExtension`, xkbcommon-x11's setup check).
 pub fn use_extension(state: &mut ServerState, client: ClientId, body: &[u8]) -> bool {
+    use yserver_protocol::x11::ClientByteOrder;
+    let byte_order = state
+        .clients
+        .get(&client.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let b = |i: usize| body.get(i).copied().unwrap_or(0);
-    let major = u16::from_le_bytes([b(0), b(1)]);
-    let minor = u16::from_le_bytes([b(2), b(3)]);
-    let supported = major == 1 || (major == 0 && minor == 65);
+    let (major, minor) = match byte_order {
+        ClientByteOrder::LittleEndian => (
+            u16::from_le_bytes([b(0), b(1)]),
+            u16::from_le_bytes([b(2), b(3)]),
+        ),
+        ClientByteOrder::BigEndian => (
+            u16::from_be_bytes([b(0), b(1)]),
+            u16::from_be_bytes([b(2), b(3)]),
+        ),
+    };
+    let version_supported = major == 1 || (major == 0 && minor == 65);
+    let supported = version_supported && byte_order == ClientByteOrder::LittleEndian;
+    if version_supported && !supported {
+        log::debug!(
+            "client {}: XkbUseExtension {major}.{minor} refused — XKB is not served to \
+             big-endian clients",
+            client.0
+        );
+    }
     let c = state.xkb_clients.entry(client.0).or_default();
     if supported && !c.initialized {
         c.initialized = true;

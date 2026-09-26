@@ -628,10 +628,10 @@ pub struct ActivePointerGrab {
     /// this is the event window's MERGED xi2 selection captured at
     /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
     /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
-    /// sets `u32::MAX` — its wire mask is not parsed (pre-existing
+    /// sets `u64::MAX` — its wire mask is not parsed (pre-existing
     /// permissive delivery); core GrabPointer sets 0 (never consulted:
     /// the XI2 redirect delivers nothing for via_xi2=false grabs).
-    pub xi2_mask: u32,
+    pub xi2_mask: u64,
 }
 
 /// XComposite redirect mode. Both wire constants are accepted —
@@ -1179,6 +1179,13 @@ pub struct ServerState {
     pub xfixes_selection_masks: HashMap<(u32, ResourceId, AtomId), u32>,
     /// XFIXES cursor event masks: (client, window) -> mask.
     pub xfixes_cursor_masks: HashMap<(u32, ResourceId), u32>,
+    /// XFIXES major version each client negotiated (Xorg
+    /// `XFixesClientRec.major_version`). It gates which requests the
+    /// client may send; a client with no entry has not sent `QueryVersion`.
+    pub xfixes_client_major: HashMap<u32, u32>,
+    /// XFIXES `HideCursor` counts per client (Xorg `CursorHideCountRec`,
+    /// one screen). The sprite is hidden while this map is non-empty.
+    pub xfixes_cursor_hide_counts: HashMap<u32, u32>,
     /// SHAPE state per window. Missing entries mean the default window rectangle.
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
     /// SHAPE select-input state: (client, window) -> enabled.
@@ -1355,17 +1362,15 @@ pub struct ServerState {
     /// `ServerState` gives it the right lifetime under `-noreset` — as
     /// long as the server, which is as long as the orphaned overlay.
     pub cow_teardown_failed: bool,
-    /// Outstanding `XSync::AwaitFence` requests waiting on at least
-    /// one fence in the list to transition to triggered. Per the
-    /// spec the server must defer further processing of the
-    /// blocked client's requests until *any* of the listed fences
-    /// triggers; **we don't suspend the client's request stream**
-    /// (that requires deeper core-loop integration), so this map
-    /// only records the await for telemetry + a corresponding
-    /// `TriggerFence`-time `AwaitSatisfied` debug log. Real
-    /// blocking is left as a known gap — see followup §5 in
-    /// `docs/superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md`.
-    pub sync_pending_awaits: Vec<SyncPendingAwait>,
+    /// SYNC `Await` / `AwaitFence` in progress, keyed by client id. A client
+    /// with an entry is suspended (Xorg `IgnoreClient`): the core loop's
+    /// fair request queue keeps its later requests queued until the entry
+    /// is removed — the await fired, or the client left.
+    pub sync_awaits: HashMap<u32, SyncAwait>,
+    /// SERVERTIME value last evaluated against alarms and awaits; the
+    /// post-poll pass feeds `(last, now)` through the trigger tests the way
+    /// Xorg's `ServertimeWakeupHandler` calls `SyncChangeCounter`.
+    pub sync_servertime_last: Option<i64>,
     /// Cumulative XI2 scroll-axis values for the master pointer.
     /// `[0]` is valuator number 2 (vertical scroll), `[1]` is
     /// valuator number 3 (horizontal scroll). Increments by 1 per
@@ -1409,24 +1414,61 @@ pub struct KeyRepeatState {
     pub next_fire: std::time::Instant,
 }
 
-/// One outstanding `XSync::AwaitFence` request that hasn't been
-/// satisfied yet. Stored on `ServerState` until any fence in
-/// `fences` triggers.
-#[derive(Clone, Debug)]
-pub struct SyncPendingAwait {
-    pub client: ClientId,
-    pub sequence: SequenceNumber,
-    pub fences: Vec<u32>,
+/// One wait condition of a pending SYNC await (Xorg `SyncAwait`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncAwaitCondition {
+    /// `Await` on a counter: `test_value` is already resolved (a relative
+    /// wait was added to the counter's value when the request arrived).
+    Counter {
+        counter: u32,
+        test_type: u32,
+        test_value: i64,
+        event_threshold: i64,
+    },
+    /// `AwaitFence` on a fence.
+    Fence { fence: u32 },
+}
+
+impl SyncAwaitCondition {
+    /// The counter or fence this condition waits on.
+    #[must_use]
+    pub fn object(&self) -> u32 {
+        match *self {
+            Self::Counter { counter, .. } => counter,
+            Self::Fence { fence } => fence,
+        }
+    }
+}
+
+/// A suspended client's `Await` / `AwaitFence` (Xorg `SyncAwaitUnion`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SyncAwait {
+    pub conditions: Vec<SyncAwaitCondition>,
 }
 
 /// GLX context resource. We never run server-side GL — direct-
 /// rendering clients use the tag we assign at MakeCurrent to label
 /// rendering requests, but no actual GL state is tracked here.
+///
+/// The remaining fields are what Xorg's `__GLXcontext` answers
+/// `QueryContext` (`GLX_EXT_import_context`) and `IsDirect` from
+/// (glxcmds.c `DoQueryContext` / `__glXDisp_IsDirect`): the share list,
+/// the config's visual and FBConfig IDs, the screen, the render type and
+/// the client's `isDirect` flag, all recorded at creation.
 #[derive(Clone, Debug)]
 pub struct GlxContext {
     pub owner: ClientId,
+    pub screen: u32,
+    /// X visual of the context's config; 0 for a visual-less FBConfig
+    /// (Xorg `ctx->config->visualID`).
+    pub visual_id: u32,
+    /// FBConfig ID of the context's config; 0 when a GLX 1.0 visual has
+    /// no synthesised FBConfig.
     pub fbconfig: u32,
     pub render_type: u32,
+    /// `shareList` from the creation request (Xorg `ctx->share_id`).
+    pub share_list: u32,
+    pub is_direct: bool,
 }
 
 /// Which kind of drawable a `GlxDrawable` record wraps. Drives the
@@ -1467,6 +1509,17 @@ pub struct GlxDrawable {
     /// re-resolve `x_drawable → host_xid` (the resource is gone), leaking
     /// the export ref forever. `None` for the window/pbuffer cases.
     pub glx_export_host_xid: Option<u32>,
+    /// `GLX_TEXTURE_TARGET_EXT` value `GetDrawableAttributes` reports.
+    /// Xorg answers `GLX_TEXTURE_2D_EXT` only when `pGlxDraw->target` is
+    /// `GL_TEXTURE_2D`, else `GLX_TEXTURE_RECTANGLE_EXT`
+    /// (glxcmds.c:1896-1897). A GLX 1.0 `CreateGLXPixmap` never runs
+    /// `determineTextureTarget`, so its target stays 0 and Xorg reports
+    /// RECTANGLE; Mesa adopts the reported target for a GLX 1.0 pixmap
+    /// (glx_pbuffer.c `__glXGetDrawableAttribute`), because
+    /// `glXCreateGLXPixmap` takes no attribute list. Every other creation
+    /// path records `GLX_TEXTURE_2D_EXT`, the value yserver has always
+    /// reported for them.
+    pub texture_target: u32,
 }
 
 impl ServerState {
@@ -1560,6 +1613,8 @@ impl ServerState {
             pointer_barriers: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
             xfixes_cursor_masks: HashMap::new(),
+            xfixes_client_major: HashMap::new(),
+            xfixes_cursor_hide_counts: HashMap::new(),
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
             present_pending_exec: BTreeMap::new(),
@@ -1590,7 +1645,8 @@ impl ServerState {
             xi2_client_versions: HashMap::new(),
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
-            sync_pending_awaits: Vec::new(),
+            sync_awaits: HashMap::new(),
+            sync_servertime_last: None,
             repeat_state: None,
             dpms: DpmsState::new(false),
             screensaver: ScreenSaverState::new(),
@@ -1783,7 +1839,7 @@ impl ServerState {
             ) {
                 continue;
             }
-            let test_type = u32::from(alarm.test_type);
+            let test_type = alarm.check_type;
             if !matches!(
                 test_type,
                 x11sync::TEST_POSITIVE_TRANSITION | x11sync::TEST_POSITIVE_COMPARISON
@@ -2110,15 +2166,36 @@ pub struct SyncFence {
 pub struct SyncAlarm {
     pub owner: ClientId,
     pub counter: u32,
-    /// Absolute counter value the trigger tests against. For a Relative
-    /// alarm this is resolved at create/change time (counter + value).
+    /// Absolute counter value the trigger tests against (Xorg's
+    /// `trigger.test_value`). For a Relative alarm this is resolved at
+    /// create/change time (counter + value).
     pub wait_value: i64,
+    /// The `value-type` last given (Xorg `trigger.value_type`): anything
+    /// but Absolute (0) resolves `raw_wait` relative to the counter when a
+    /// later ChangeAlarm sets the value or value type.
+    pub value_type: u32,
+    /// The `value` last given (Xorg `trigger.wait_value`), before
+    /// resolution.
+    pub raw_wait: i64,
     pub delta: i64,
-    /// `XSyncTestType` (PositiveTransition=0 … NegativeComparison=3).
-    pub test_type: u8,
+    /// The `test-type` last given (Xorg `trigger.test_type`): what
+    /// QueryAlarm reports and what the delta-sign check and "delta 0 on a
+    /// comparison goes Inactive" read. A ChangeAlarm that fails on an
+    /// invalid test type still stores it, as Xorg does.
+    pub test_type: u32,
+    /// The test the trigger actually runs (Xorg's `trigger.CheckTrigger`):
+    /// set only when a test type validates, so it can differ from
+    /// `test_type` after such a failed ChangeAlarm.
+    pub check_type: u32,
+    /// Whether the owner receives this alarm's `AlarmNotify` events
+    /// (Xorg `pAlarm->events`; what QueryAlarm reports).
     pub events: bool,
     /// `XSyncAlarmState` (Active=0, Inactive=1, Destroyed=2).
     pub state: u8,
+    /// Clients other than the owner that selected `AlarmNotify` with the
+    /// `events` attribute of a ChangeAlarm, newest first (Xorg
+    /// `pAlarm->pEventClients`; `SyncEventSelectForAlarm` prepends).
+    pub event_clients: Vec<ClientId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2304,10 +2381,14 @@ impl Default for SyncAlarm {
             owner: ClientId(0),
             counter: 0,
             wait_value: 0,
+            value_type: 0,
+            raw_wait: 0,
             delta: 0,
             test_type: 0,
+            check_type: 0,
             events: false,
             state: 0,
+            event_clients: Vec::new(),
         }
     }
 }
@@ -2349,8 +2430,10 @@ pub struct ClientState {
     /// (X11 ChangeSaveSet semantics).
     pub save_set: HashSet<ResourceId>,
     pub big_requests_enabled: bool,
-    /// XI2 event masks: (window_id, device_id) -> mask
-    pub xi2_masks: HashMap<(ResourceId, u16), u32>,
+    /// XI2 event masks: (window_id, device_id) -> mask. Bit n selects
+    /// XI2 event type n; XI 2.4 defines types up to 32
+    /// (`XI_GestureSwipeEnd`), so the mask needs more than 32 bits.
+    pub xi2_masks: HashMap<(ResourceId, u16), u64>,
     /// XI1 `XEventClass` values the client has selected via
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
@@ -2838,6 +2921,10 @@ impl ServerState {
                 .retain(|(window, _), _| !windows.contains(window));
             client.rebuild_xi1_global_event_classes();
         }
+        // Xorg `CursorFreeWindow`: a destroyed window takes every
+        // client's XFIXES cursor selection on it along.
+        self.xfixes_cursor_masks
+            .retain(|(_, window), _| !windows.contains(window));
     }
 
     pub fn find_passive_grab(
@@ -2970,7 +3057,7 @@ pub(crate) fn xi2_mask_for_client(
     target: ResourceId,
     fallback: ResourceId,
     device_candidates: &[u16],
-) -> u32 {
+) -> u64 {
     // Per window, OR the masks a client stored under the concrete device
     // AND the `XIAllMasterDevices(1)` / `XIAllDevices(0)` wildcards —
     // mirroring Xorg's `dix/events.c::EventMaskForClient`. A client may
@@ -3242,7 +3329,11 @@ fn pointer_event_fanout_inner(
                         via_xi2: grab.via_xi2,
                         implicit: false,
                         passive: true,
-                        xi2_mask: if grab.via_xi2 { grab.event_mask } else { 0 },
+                        xi2_mask: if grab.via_xi2 {
+                            u64::from(grab.event_mask)
+                        } else {
+                            0
+                        },
                     });
                     target
                 }
@@ -3903,9 +3994,9 @@ mod tests {
             big_requests_enabled: false,
             xi2_masks: HashMap::from([
                 // XIAllMasterDevices(1): motion/enter/touch/gesture, NO buttons.
-                ((win, 1u16), 0x381c_00c0u32),
+                ((win, 1u16), 0x381c_00c0u64),
                 // XIAllDevices(0): includes ButtonPress(4)/ButtonRelease(5).
-                ((win, 0u16), 0x19f2u32),
+                ((win, 0u16), 0x19f2u64),
             ]),
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
@@ -4499,7 +4590,7 @@ mod tests {
                 via_xi2: true,
                 implicit: false,
                 passive: true,
-                xi2_mask: u32::MAX,
+                xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
@@ -4663,7 +4754,7 @@ mod tests {
                 via_xi2: true,
                 implicit: false,
                 passive: true,
-                xi2_mask: u32::MAX,
+                xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
@@ -6050,9 +6141,13 @@ mod tests {
                     counter: x11sync::IDLETIME_COUNTER,
                     wait_value: *wait,
                     delta: 0,
-                    test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                    test_type: x11sync::TEST_POSITIVE_TRANSITION,
                     events: true,
                     state: x11sync::ALARM_STATE_ACTIVE,
+                    event_clients: Vec::new(),
+                    value_type: 0,
+                    raw_wait: *wait,
+                    check_type: x11sync::TEST_POSITIVE_TRANSITION,
                 },
             );
         }
@@ -6085,9 +6180,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6104,9 +6203,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_INACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6132,9 +6235,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(
@@ -6159,9 +6266,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6376,8 +6487,12 @@ mod tests {
             id_glx_ctx,
             GlxContext {
                 owner,
+                screen: 0,
+                visual_id: 0,
                 fbconfig: 0,
                 render_type: 0,
+                share_list: 0,
+                is_direct: true,
             },
         );
         expect.push(id_glx_ctx);
@@ -6395,6 +6510,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
         expect.push(id_glx_draw);

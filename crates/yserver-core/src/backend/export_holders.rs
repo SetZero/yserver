@@ -189,6 +189,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: Some(BACKING),
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
         state

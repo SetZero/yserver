@@ -240,6 +240,12 @@ pub struct ResourceTable {
     gcs: HashMap<u32, Gc>,
     fonts: HashMap<u32, Font>,
     cursors: HashMap<u32, Cursor>,
+    /// XFIXES cursor names keyed by host cursor handle. In Xorg the name
+    /// lives on the cursor object, so it outlives the client's cursor XID
+    /// while a window still displays the cursor (`XFreeCursor` right after
+    /// `XDefineCursor` is the common Xlib idiom) — `CursorNotify` and
+    /// `ChangeCursorByName` must still see it.
+    cursor_host_names: HashMap<u32, yserver_protocol::x11::AtomId>,
     pub pictures: HashMap<u32, PictureState>,
     pub glyphsets: HashMap<u32, GlyphSetState>,
     host_glyphset_refcounts: HashMap<u32, usize>,
@@ -377,6 +383,7 @@ impl Default for ResourceTable {
             gcs: HashMap::new(),
             fonts: HashMap::new(),
             cursors: HashMap::new(),
+            cursor_host_names: HashMap::new(),
             pictures: HashMap::new(),
             glyphsets: HashMap::new(),
             host_glyphset_refcounts: HashMap::new(),
@@ -2837,10 +2844,23 @@ impl ResourceTable {
         self.cursors.contains_key(&id.0)
     }
 
+    /// XFIXES `SetCursorName`. The name belongs to the cursor object, so
+    /// every XID aliasing the same host cursor (after `ChangeCursor`) sees
+    /// it, and it stays recorded against the host handle.
     pub fn set_cursor_name_atom(&mut self, id: ResourceId, atom: yserver_protocol::x11::AtomId) {
-        if let Some(c) = self.cursors.get_mut(&id.0) {
-            c.name_atom = Some(atom);
+        let Some(cursor) = self.cursors.get_mut(&id.0) else {
+            return;
+        };
+        cursor.name_atom = Some(atom);
+        let Some(host) = cursor.host_xid.map(|h| h.as_raw()) else {
+            return;
+        };
+        for c in self.cursors.values_mut() {
+            if c.host_xid.map(|h| h.as_raw()) == Some(host) {
+                c.name_atom = Some(atom);
+            }
         }
+        self.cursor_host_names.insert(host, atom);
     }
 
     #[must_use]
@@ -2848,14 +2868,70 @@ impl ResourceTable {
         self.cursors.get(&id.0)?.name_atom
     }
 
-    /// Remove a cursor from the table and return the host XID (if any)
-    /// so the caller can free it on the host. Caller's responsibility to
+    /// XFIXES name of the cursor behind host handle `host`, whether or not
+    /// a client XID still refers to it. `None` when it was never named.
+    #[must_use]
+    pub fn cursor_name_for_host(&self, host: u32) -> Option<yserver_protocol::x11::AtomId> {
+        self.cursor_host_names.get(&host).copied()
+    }
+
+    /// Host handles of every cursor named `atom` (XFIXES
+    /// `ChangeCursorByName`'s match set), sorted for a stable order.
+    #[must_use]
+    pub fn cursor_hosts_named(&self, atom: yserver_protocol::x11::AtomId) -> Vec<u32> {
+        let mut hosts: Vec<u32> = self
+            .cursor_host_names
+            .iter()
+            .filter_map(|(host, name)| (*name == atom).then_some(*host))
+            .collect();
+        hosts.sort_unstable();
+        hosts
+    }
+
+    /// XFIXES `ChangeCursor` on the resource database (Xorg
+    /// `ReplaceCursorLookup` → `ChangeResourceValue`): every cursor XID
+    /// that refers to host cursor `old_host` now refers to `source`'s
+    /// cursor object — its handle, name and animation flag. Returns
+    /// whether any XID was retargeted. The old host handle's name is
+    /// dropped: nothing displays it after the backend's replace.
+    pub fn retarget_cursor_host(&mut self, old_host: u32, source: ResourceId) -> bool {
+        let Some(src) = self.cursors.get(&source.0).cloned() else {
+            return false;
+        };
+        let mut changed = false;
+        for c in self.cursors.values_mut() {
+            if c.host_xid.map(|h| h.as_raw()) == Some(old_host) {
+                c.host_xid = src.host_xid;
+                c.name_atom = src.name_atom;
+                c.anim = src.anim;
+                changed = true;
+            }
+        }
+        self.cursor_host_names.remove(&old_host);
+        changed
+    }
+
+    /// True iff some cursor XID still refers to host cursor `host`.
+    #[must_use]
+    pub fn cursor_host_referenced(&self, host: u32) -> bool {
+        self.cursors
+            .values()
+            .any(|c| c.host_xid.map(|h| h.as_raw()) == Some(host))
+    }
+
+    /// Remove a cursor from the table and return its host XID when this
+    /// was the last XID referring to that host cursor, so the caller can
+    /// free it on the host. After XFIXES `ChangeCursor` several XIDs share
+    /// one host cursor; freeing it while another XID still names it would
+    /// release the host object under that XID. Caller's responsibility to
     /// dispatch `backend.free_cursor` — keeping the resource layer
     /// backend-agnostic.
     pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
-        host_xid.map(|h| h.as_raw())
+        host_xid
+            .map(|h| h.as_raw())
+            .filter(|host| !self.cursor_host_referenced(*host))
     }
 
     /// Mark a cursor as animated (RENDER CreateAnimCursor product).
@@ -2951,6 +3027,11 @@ impl ResourceTable {
                 true
             }
         });
+        // Host cursors shared with a surviving XID (XFIXES `ChangeCursor`
+        // aliases) stay alive; each shared handle is released once.
+        freed_cursors.sort_unstable();
+        freed_cursors.dedup();
+        freed_cursors.retain(|host| !self.cursor_host_referenced(*host));
         let mut closed_fonts = Vec::new();
         self.fonts.retain(|_, f| {
             if f.owner == client {

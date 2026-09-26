@@ -534,7 +534,7 @@ pub fn raw_key_event_to_state(
 /// the event is finally processed, as on Xorg.
 pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent) -> Vec<ClientId> {
     let evtype = event.evtype();
-    let bit = 1u32 << evtype;
+    let bit = 1u64 << evtype;
     let master_devices = [
         XI2_MASTER_KEYBOARD_DEVICE_ID,
         XI2_ALL_MASTER_DEVICES,
@@ -562,7 +562,7 @@ pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent
             && state.clients.get(&g.owner.0).is_some_and(|c| {
                 xi2_mask_for_client(c, ROOT_WINDOW, ROOT_WINDOW, &master_devices) & bit != 0
             });
-        if natural || g.xi2_mask & bit != 0 {
+        if natural || u64::from(g.xi2_mask) & bit != 0 {
             merge_dropped(
                 &mut dropped,
                 send_raw_key(state, &[g.owner], event, XI2_MASTER_KEYBOARD_DEVICE_ID),
@@ -1041,7 +1041,7 @@ mod tests {
         id: u32,
         window: ResourceId,
         core_mask: u32,
-        xi2_mask: u32,
+        xi2_mask: u64,
     ) -> UnixStream {
         let (server_side, peer) = UnixStream::pair().unwrap();
         let client = ClientState {
@@ -1443,9 +1443,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: false,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         let mut backend = crate::backend::recording::RecordingBackend::default();
@@ -1496,9 +1500,13 @@ mod tests {
                 counter: x11sync::IDLETIME_DEVICE_VCK,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: true, // load-bearing
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         let mut backend = crate::backend::recording::RecordingBackend::default();
@@ -1615,7 +1623,7 @@ mod tests {
             let client = state.clients.get_mut(&id).unwrap();
             client.xi2_masks.clear();
             for d in devices {
-                client.xi2_masks.insert((ROOT_WINDOW, *d), mask);
+                client.xi2_masks.insert((ROOT_WINDOW, *d), u64::from(mask));
             }
             if let Some(v) = xi_version {
                 state.xi2_client_versions.insert(ClientId(id), v);

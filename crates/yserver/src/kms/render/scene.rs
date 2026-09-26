@@ -1410,6 +1410,18 @@ impl SceneCompositor {
         }
     }
 
+    /// Drop the cursor entry (XFIXES `HideCursor`). `build_scene` then
+    /// assigns `CursorAssignment::Hidden` on every output, so the next
+    /// tick erases a SW sprite and detaches a bound HW plane on retire.
+    /// `register_cursor` restores it.
+    pub(crate) fn clear_cursor(&mut self) {
+        if let Some(inner) = self.inner.as_mut()
+            && inner.cursor.take().is_some()
+        {
+            self.scene_structure_dirty = true;
+        }
+    }
+
     /// Test fixture / Stage-1b-era stub. Construct via
     /// `SceneCompositor::stub()` so the `KmsBackend::for_tests`
     /// path doesn't need Vk.

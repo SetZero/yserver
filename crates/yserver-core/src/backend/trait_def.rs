@@ -136,6 +136,9 @@ pub use crate::host_x11::HostSocketStatus;
 /// encoder premultiplies + byte-swaps at the wire boundary.
 #[derive(Debug, Clone)]
 pub struct ActiveCursorImage {
+    /// Host handle of the displayed cursor (the core maps it to the
+    /// cursor's XFIXES name).
+    pub host_xid: u32,
     pub width: u16,
     pub height: u16,
     pub hot_x: u16,
@@ -147,6 +150,19 @@ pub struct ActiveCursorImage {
     /// changes. Backed by `Arc<CursorRecord>.version` in v2.
     pub serial: u32,
     pub bgra_bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// The cursor the backend's sprite now shows after a change, reported
+/// through `Backend::take_displayed_cursor_change` so the core can send
+/// XFIXES `CursorNotify`. This is the cursor the pointer *should* show —
+/// an XFIXES `HideCursor` does not change it (Xorg `CursorDisplayCursor`
+/// compares the requested cursor, not the blanked one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayedCursor {
+    /// Host handle of the cursor, as stored in the core's cursor table.
+    pub host_xid: u32,
+    /// Same serial `get_active_cursor_image` reports for this cursor.
+    pub serial: u32,
 }
 
 /// Present capability surface. Phase 4.2 design §4. Per-window
@@ -2473,6 +2489,25 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Xorg `miSyncShmFenceCheckTriggered`: for a fence whose state lives
+    /// in memory shared with the client (a DRI3 `FenceFromFD` xshmfence),
+    /// whether that memory says triggered — the client may trigger or
+    /// reset it itself, so this, not the server's bit, is the fence's
+    /// state. `None` for a fence without shared state.
+    fn dri3_fence_triggered(&self, _fence_xid: u32) -> Option<bool> {
+        None
+    }
+
+    /// Xorg `miSyncShmFenceReset`: SYNC `ResetFence` resets a
+    /// shared-memory fence's memory too (`xshmfence_reset`).
+    fn dri3_reset_fence(&mut self, _fence_xid: u32) {}
+
+    /// Xorg `miSyncShmScreenDestroyFence`: the fence resource is gone
+    /// (DestroyFence, owner disconnect). A shared-memory fence is
+    /// triggered — releasing anything the client waits on — and unmapped;
+    /// any other backing keyed by the xid is dropped.
+    fn dri3_destroy_fence(&mut self, _fence_xid: u32) {}
+
     /// Stage 5 Task 6.1: take an Arc clone of the xshmfence's
     /// underlying primitive, suitable for deferred completion paths
     /// that need to survive an intervening `XFixesDestroyFence`.
@@ -2708,12 +2743,33 @@ pub trait Backend {
         None
     }
 
-    fn xfixes_change_cursor_by_name(
+    /// XFIXES `ChangeCursor` / `ChangeCursorByName` (Xorg `ReplaceCursor`):
+    /// every place that displays host cursor `old_host_xid` — window cursor
+    /// attributes, the root's default, an active grab's cursor — now uses
+    /// `new_host_xid`, and the sprite refreshes if it showed the old one.
+    /// The core resolves names and cursor ids; the backend only ever sees
+    /// host handles.
+    fn replace_cursor(
         &mut self,
         origin: Option<OriginContext>,
-        host_cursor_xid: u32,
-        name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()>;
+
+    /// XFIXES `HideCursor` / `ShowCursor`: blank (`true`) or restore
+    /// (`false`) the sprite while leaving the effective cursor, and so
+    /// `GetCursorImage` and `CursorNotify`, unchanged. The core only calls
+    /// this on the edges: the first hide by any client and the last show.
+    /// Default no-op for backends that draw no sprite of their own.
+    fn set_cursor_hidden(&mut self, _hidden: bool) {}
+
+    /// Take the pending "the effective cursor changed" report, if the sprite
+    /// switched to a different cursor since the last call. Drained by the
+    /// core after every request and loop iteration to send XFIXES
+    /// `CursorNotify`. Default `None` for backends that track no sprite.
+    fn take_displayed_cursor_change(&mut self) -> Option<DisplayedCursor> {
+        None
+    }
 
     /// Stage 5 unblock — XFIXES `GetCursorImage` data source for the
     /// active on-screen cursor. Returns the straight-alpha BGRA
@@ -2774,6 +2830,15 @@ pub trait Backend {
     /// pressed buttons at the never-moved pointer position, missing
     /// its test window ("Expected event not received" en masse).
     fn warp_pointer_root(&mut self, _state: &mut ServerState, _x: i32, _y: i32) {}
+
+    /// After the server moved the pointer on its own (XTEST fake motion),
+    /// hand the new position to whatever tracks physical pointer input, so
+    /// the next real motion continues from there instead of jumping back.
+    /// The KMS backend's direct-mode input thread accumulates relative
+    /// deltas from its own copy of the position ([`Self::warp_pointer_root`]
+    /// resyncs it the same way). Default no-op: host-forwarding backends get
+    /// their position from the host.
+    fn resync_input_position(&mut self) {}
 
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;
 

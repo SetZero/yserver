@@ -618,14 +618,19 @@ mod tests {
                 height: 16,
                 event_mask: 0,
                 glx_export_host_xid: Some(host_pixmap),
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
         state.glx_contexts.insert(
             base | 0x04,
             GlxContext {
                 owner: client,
+                screen: 0,
+                visual_id: 0x21,
                 fbconfig: 0x21,
                 render_type: 0x8014,
+                share_list: 0,
+                is_direct: true,
             },
         );
 
