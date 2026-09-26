@@ -9607,16 +9607,13 @@ fn dispatch_fake_input_with_body(
             );
         }
         x11xtest::FAKE_MOTION_NOTIFY => {
-            // detail==0 means absolute coords; detail==1 means relative.
-            // We only support absolute for now — relative needs the
-            // backend's current cursor position which isn't on the trait
-            // surface. xts does most motion as absolute.
-            if fi.detail != 0 {
-                log::debug!("XTEST FakeInput: relative MotionNotify not supported, dropping");
-                return;
-            }
-            backend.on_host_input(
-                state,
+            // detail 0 = absolute, detail 1 = relative (Xorg xtest.c: rootX/
+            // rootY become the valuators, POINTER_ABSOLUTE only for 0). A
+            // relative fake moves the sprite by the delta from its current
+            // position, unaccelerated (XTEST doesn't set POINTER_ACCELERATE);
+            // the backend clips to the screen. The delta also rides as the
+            // raw relative motion, so XI2 RawMotion reports it.
+            let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
@@ -9624,8 +9621,20 @@ fn dispatch_fake_input_with_body(
                     relative: false,
                     dx: 0,
                     dy: 0,
-                },
-            );
+                }
+            } else {
+                let (x, y) = state.pointer_root;
+                let (dx, dy) = (i32::from(fi.root_x), i32::from(fi.root_y));
+                HostInputEvent::PointerMotion {
+                    x: i32::from(x) + dx,
+                    y: i32::from(y) + dy,
+                    time: fi.time,
+                    relative: true,
+                    dx,
+                    dy,
+                }
+            };
+            backend.on_host_input(state, motion);
         }
         other => {
             log::debug!("XTEST FakeInput: unknown event type {other}, dropping");

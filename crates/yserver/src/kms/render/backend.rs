@@ -50270,6 +50270,58 @@ mod tests {
     /// same MapNotify, core GetModifierMapping reads the change, a held
     /// modifier makes it MappingBusy, and the reply carries RepType and the
     /// status (Xi/setmmap.c).
+    /// XTEST FakeInput MotionNotify with detail = 1 is a relative move: Xorg
+    /// (Xext/xtest.c ProcXTestFakeInput) passes rootX/rootY as the valuators
+    /// without POINTER_ABSOLUTE, so GetPointerEvents adds them to the current
+    /// position (no acceleration: XTEST doesn't set POINTER_ACCELERATE) and
+    /// clips to the screen. yserver dropped relative fakes, so e.g.
+    /// `xdotool mousemove_relative` did nothing.
+    #[test]
+    fn xtest_relative_motion_moves_by_the_delta() {
+        const XTEST: u8 = 146;
+        const FAKE_INPUT: u8 = 2;
+        const MOTION_NOTIFY: u8 = 6;
+        let fake_motion = |detail: u8, x: i16, y: i16| {
+            let mut body = vec![0u8; 32];
+            body[0] = MOTION_NOTIFY;
+            body[1] = detail;
+            body[20..22].copy_from_slice(&x.to_le_bytes());
+            body[22..24].copy_from_slice(&y.to_le_bytes());
+            body
+        };
+        let mut backend = KmsBackend::for_tests();
+        let mut state = yserver_core::server::ServerState::new();
+        let _peer = kbd_map_client(&mut state);
+        kbd_map_request(
+            &mut state,
+            &mut backend,
+            XTEST,
+            FAKE_INPUT,
+            &fake_motion(0, 200, 200),
+        );
+        assert_eq!(state.pointer_root, (200, 200), "absolute fake motion");
+        kbd_map_request(
+            &mut state,
+            &mut backend,
+            XTEST,
+            FAKE_INPUT,
+            &fake_motion(1, 10, -5),
+        );
+        assert_eq!(state.pointer_root, (210, 195), "relative +10,-5");
+        kbd_map_request(
+            &mut state,
+            &mut backend,
+            XTEST,
+            FAKE_INPUT,
+            &fake_motion(1, -300, -300),
+        );
+        assert_eq!(
+            state.pointer_root,
+            (0, 0),
+            "relative move clipped to the screen"
+        );
+    }
+
     /// Xorg's XkbSendLegacyMapNotify only sends the core MappingNotify to a
     /// client whose current master keyboard changed (`XIShouldNotify`). An XI
     /// request on a slave reaches the master only when that slave is the
