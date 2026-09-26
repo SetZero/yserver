@@ -408,11 +408,15 @@ pub fn encode_list_system_counters_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> Vec<u8> {
+    // Newest first, as Xorg's list (SyncCreateSystemCounter prepends). It
+    // also keeps libxcb's systemcounter iterator in step: it assumes a
+    // 16-byte entry header (the wire has 14) and loses step after
+    // SERVERTIME, which is therefore last.
     const COUNTERS: &[(u32, i64, &[u8])] = &[
-        (SERVERTIME_COUNTER, 4, b"SERVERTIME"),
-        (IDLETIME_COUNTER, 4, b"IDLETIME"),
-        (IDLETIME_DEVICE_VCP, 4, b"DEVICEIDLETIME 2"),
         (IDLETIME_DEVICE_VCK, 4, b"DEVICEIDLETIME 3"),
+        (IDLETIME_DEVICE_VCP, 4, b"DEVICEIDLETIME 2"),
+        (IDLETIME_COUNTER, 4, b"IDLETIME"),
+        (SERVERTIME_COUNTER, 4, b"SERVERTIME"),
     ];
 
     let payload_len: usize = COUNTERS
@@ -521,50 +525,56 @@ mod tests {
         assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 5);
     }
 
+    /// Xorg lists system counters newest first (SyncCreateSystemCounter
+    /// prepends; Xvfb 21.1.24: DEVICEIDLETIME 7..2, IDLETIME, SERVERTIME).
+    /// The order matters beyond fidelity: libxcb's systemcounter iterator
+    /// assumes a 16-byte entry header where the wire has 14, so it loses
+    /// step after a name whose length is 2 mod 4 — SERVERTIME. Listed last,
+    /// as on Xorg, every xcb client still finds IDLETIME; listed first, it
+    /// read the following entries as counter 0.
     #[test]
-    fn list_system_counters_advertises_four_counters_with_device_idletime() {
+    fn list_system_counters_newest_first_like_xorg() {
         let reply =
             encode_list_system_counters_reply(ClientByteOrder::LittleEndian, SequenceNumber(0x88));
-        // header: tag(1B) data(1B) seq(2B) length(4B) counters_len(4B) pad(20B) = 32B
         assert_eq!(
-            u32::from_le_bytes([reply[32], reply[33], reply[34], reply[35]]),
-            SERVERTIME_COUNTER,
-            "first entry counter id"
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            4,
+            "counters_len"
         );
-        // Probe encoder correctness on SERVERTIME entry (offsets 36-45):
-        // write_i64 encodes as hi(INT32 LE) || lo(CARD32 LE).
-        // For value=4: hi=0 at [36..40], lo=4 at [40..44].
-        let resolution_hi = i32::from_le_bytes([reply[36], reply[37], reply[38], reply[39]]);
-        let resolution_lo = u32::from_le_bytes([reply[40], reply[41], reply[42], reply[43]]);
-        let resolution = (i64::from(resolution_hi) << 32) | i64::from(resolution_lo);
-        assert_eq!(resolution, 4, "SERVERTIME resolution_ms");
+        // Walk the wire layout: counter(4) resolution hi(4) lo(4) name_len(2)
+        // name, padded to 4.
+        let mut entries = Vec::new();
+        let mut at = 32;
+        while at < reply.len() {
+            let counter = u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+            let hi = i32::from_le_bytes(reply[at + 4..at + 8].try_into().unwrap());
+            let lo = u32::from_le_bytes(reply[at + 8..at + 12].try_into().unwrap());
+            let len = usize::from(u16::from_le_bytes([reply[at + 12], reply[at + 13]]));
+            let name = String::from_utf8(reply[at + 14..at + 14 + len].to_vec()).unwrap();
+            entries.push((counter, (i64::from(hi) << 32) | i64::from(lo), name));
+            at += (14 + len).next_multiple_of(4);
+        }
         assert_eq!(
-            u16::from_le_bytes([reply[44], reply[45]]),
-            10,
-            "SERVERTIME name length"
+            entries,
+            vec![
+                (IDLETIME_DEVICE_VCK, 4, "DEVICEIDLETIME 3".to_owned()),
+                (IDLETIME_DEVICE_VCP, 4, "DEVICEIDLETIME 2".to_owned()),
+                (IDLETIME_COUNTER, 4, "IDLETIME".to_owned()),
+                (SERVERTIME_COUNTER, 4, "SERVERTIME".to_owned()),
+            ]
         );
-        // each entry: counter(4) resolution(8) name_len(2) name(padded to 4)
-        // SERVERTIME entry: 14 + 10 = 24 bytes, padded to 24.
-        // IDLETIME entry starts at byte 32 + 24 = 56.
-        assert_eq!(
-            u32::from_le_bytes([reply[56], reply[57], reply[58], reply[59]]),
-            IDLETIME_COUNTER,
-            "second entry counter id"
-        );
-        // IDLETIME entry: 14 + 8 = 22, padded to 24. Next at 80.
-        assert_eq!(
-            u32::from_le_bytes([reply[80], reply[81], reply[82], reply[83]]),
-            IDLETIME_DEVICE_VCP,
-            "third entry: per-pointer IDLETIME"
-        );
-        assert_eq!(&reply[94..110], b"DEVICEIDLETIME 2");
-        // Per-VCP entry: 14 + 16 = 30, padded to 32. Next at 112.
-        assert_eq!(
-            u32::from_le_bytes([reply[112], reply[113], reply[114], reply[115]]),
-            IDLETIME_DEVICE_VCK,
-            "fourth entry: per-keyboard IDLETIME"
-        );
-        assert_eq!(&reply[126..142], b"DEVICEIDLETIME 3");
+        // libxcb's walk: header taken as 16 bytes, each entry padded to 4
+        // from there (xcb_sync_systemcounter_sizeof). It must land on every
+        // entry the real walk found.
+        let mut xcb_at = 32;
+        for (counter, _, name) in &entries {
+            assert_eq!(
+                u32::from_le_bytes(reply[xcb_at..xcb_at + 4].try_into().unwrap()),
+                *counter,
+                "xcb iterator in step at {name}"
+            );
+            xcb_at += (16 + name.len()).next_multiple_of(4);
+        }
     }
 
     // Reconstructs the exact CreateAlarm muffin sends under Cinnamon
