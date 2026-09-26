@@ -207,10 +207,15 @@ pub const VENDOR_NAMES: &str = "mesa";
 /// [`VENDOR_NAMES_EXT`]) instead of guessing a default vendor. Xorg
 /// advertises it; without it libglvnd's fallback returns no vendor on
 /// Asahi/ALARM → NULL `glXQueryExtensionsString` → Cinnamon/cogl SIGSEGV.
+///
+/// `GLX_EXT_import_context` is absent on purpose: Xorg lists it only with
+/// indirect GLX enabled (`+iglx`, glx/extension_string.c:183-184), and
+/// yserver has no indirect GLX. `QueryContext` is still answered, as Xorg
+/// answers it without the listing.
 pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_context_profile \
     GLX_EXT_create_context_es2_profile GLX_EXT_swap_control \
     GLX_ARB_fbconfig_float GLX_EXT_visual_info \
-    GLX_EXT_visual_rating GLX_EXT_import_context GLX_EXT_libglvnd";
+    GLX_EXT_visual_rating GLX_EXT_libglvnd";
 
 /// Extension token appended to the advertised extension string when the
 /// backend can allocate and export a BGRA8 dma-buf (probed once at init).
@@ -1353,6 +1358,16 @@ mod tests {
         assert_eq!(req.glx_pixmap, 0x5000_0001);
         // Too short → None
         assert_eq!(parse_create_glx_pixmap_with_config_sgix(&body[..16]), None);
+    }
+
+    /// Xorg lists `GLX_EXT_import_context` only when indirect GLX is enabled
+    /// (`+iglx`, glx/extension_string.c:183-184); Xvfb 21.1.24's default
+    /// server string lacks it (glxinfo, 2026-09-26). yserver has no
+    /// indirect GLX, and the extension only shares indirect contexts —
+    /// Mesa's glXImportContextEXT returns NULL for a direct one.
+    #[test]
+    fn import_context_not_advertised_without_indirect_glx() {
+        assert!(!SERVER_EXTENSIONS.contains("GLX_EXT_import_context"));
     }
 
     fn words(w: &[u32]) -> Vec<u8> {

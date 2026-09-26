@@ -15225,7 +15225,9 @@ fn handle_glx_request(
             );
         }
         x11glx::QUERY_CONTEXT => {
-            // GLX_EXT_import_context: Xorg's DoQueryContext reports five
+            // GLX 1.3 QueryContext, the request behind
+            // glXImportContextEXT (GLX_EXT_import_context, which, like Xorg
+            // without +iglx, we do not advertise). Xorg's DoQueryContext reports five
             // attributes, in this order, for a live context of ANY client
             // (glxcmds.c:1659-1708); an XID that is not a context is
             // GLXBadContext (glx/vnd_dispatch_stubs.c:492-508).

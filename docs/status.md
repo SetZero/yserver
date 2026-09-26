@@ -59,6 +59,28 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   instead of a press with `XIKeyRepeat`; `XIGrabDevice(keyboard)` sends the
   grabber unselected XI_FocusIn/Out; XIQueryVersion replies do not follow
   Xorg's stored version / BadValue.
+- **2026-09-26 GLX 1.0 pixmaps, QueryContext and IsDirect as Xorg answers
+  them (extension audit §6):** `CreateGLXPixmap` (13) and `DestroyGLXPixmap`
+  (15) used to fall into the `GLXBadRenderRequest` catch-all, so an app
+  calling `glXCreateGLXPixmap` (mesa sends 13 even for direct contexts) was
+  killed by Xlib's default error handler. Both now follow Xorg's GLXVND stub
+  and `DoCreateGLXPixmap` / `DoDestroyDrawable`: the same errors, bad values
+  and check order as Xvfb 21.1.24, and the same GLXPixmap record and export
+  ref as GLX 1.3 `CreatePixmap`, so TFP is untouched. A GLX 1.0 pixmap
+  reports `GLX_TEXTURE_RECTANGLE_EXT`, as on Xorg. `QueryContext` answers
+  Xorg's five attributes from a context record that now keeps the screen,
+  visual, FBConfig, render type, share list and isDirect (CreateNewContext
+  used to store the screen as the render type). `IsDirect` answers the
+  recorded flag, and both answer GLXBadContext for an XID that is not a
+  context. `GLX_EXT_import_context` is no longer advertised: Xorg lists it
+  only with `+iglx`, and yserver has no indirect GLX. Open, not changed
+  here: yserver accepts `isDirect=0` contexts, which Xorg refuses with
+  BadValue by default. It always reports `GLX_TEXTURE_2D_EXT` for windows,
+  pbuffers, SGIX pixmaps and NPOT GLX 1.3 pixmaps, where Xorg says
+  RECTANGLE; left alone because Compiz picks its TFP target from this
+  reply. A GLX pixmap whose X pixmap was freed reports 0×0, where Xorg
+  still reports the pixmap's size. GLX requests from big-endian clients are
+  not byte-swapped.
 
 - **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
   branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports
