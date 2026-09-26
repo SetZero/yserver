@@ -81,6 +81,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   reply. A GLX pixmap whose X pixmap was freed reports 0×0, where Xorg
   still reports the pixmap's size. GLX requests from big-endian clients are
   not byte-swapped.
+- **2026-09-26 reply byte order: GE, MIT-SHM, XKB (extension audit §7/§8):**
+  GE QueryVersion writes major/minor in the client's byte order (a big-endian
+  client read 256.0). MIT-SHM QueryVersion reports the server's euid/egid and
+  pixmapFormat 0 without shared pixmaps, as `ProcShmQueryVersion`. XKB stays
+  little-endian only (request parsers and reply encoders), so big-endian
+  clients are now refused the Xorg way instead of getting little-endian
+  replies with a mangled sequence number: XkbUseExtension answers
+  supported=False in the client's byte order (byte-for-byte Xvfb's
+  big-endian refusal), and every other XKB request is then BadAccess, as for
+  any client that isn't XKB-initialised; Xlib and xkbcommon-x11 fall back to
+  the core keyboard protocol. The UseExtension reply is built by the core
+  loop; backend XKB replies get their sequence number in the client's byte
+  order. Still little-endian only for big-endian clients: the XI
+  XIQueryDevice/DeviceChanged class blocks and the XTEST/DPMS/
+  MIT-SCREEN-SAVER/X-Resource request parsers (audit §8 project).
+
 - **2026-09-26 XI 2.0 XIWarpPointer / XISetFocus / XIChangeHierarchy (extension
   audit §1):** the three XI minors that fell into a silent catch-all now
   answer as Xorg does, and the catch-all is gone — every minor outside 1..=61

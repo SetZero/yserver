@@ -7754,7 +7754,18 @@ fn handle_mit_shm_request(
                 return Ok(RequestOutcome::Handled);
             };
             let byte_order = client.byte_order;
-            let reply = shm::encode_query_version_reply(byte_order, sequence, false);
+            // Xorg reports the server's effective uid/gid, stored in the
+            // 16-bit wire fields (truncating, as the C assignment does).
+            // SAFETY: geteuid/getegid take no arguments and cannot fail.
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            #[allow(clippy::cast_possible_truncation)]
+            let reply = shm::encode_query_version_reply(
+                byte_order,
+                sequence,
+                false,
+                euid as u16,
+                egid as u16,
+            );
             return Ok(write_to_client(client, client_id, &reply));
         }
         shm::ATTACH => {
@@ -21055,11 +21066,27 @@ fn handle_xkb_request(
             header.opcode,
         );
     }
-    let mut use_extension_supported = None;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(x11::ClientByteOrder::LittleEndian, |c| c.byte_order);
     if minor == X_KB_USE_EXTENSION {
-        use_extension_supported = Some(crate::core_loop::xkb_select::use_extension(
-            state, client_id, body,
-        ));
+        // Whether the client is supported is the core loop's decision (it
+        // tracks the client's XKB state), and so is the reply, which must
+        // be in the client's byte order. The backend still sees the request:
+        // a nested backend initialises XKB on its host connection with it.
+        let supported = crate::core_loop::xkb_select::use_extension(state, client_id, body);
+        let _backend_reply = {
+            let atoms = &mut state.atoms;
+            let mut intern = |name: &str| atoms.intern(name, false).0;
+            backend.xkb_proxy(origin, minor, body, &mut intern)
+        };
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        let mut buf = Vec::with_capacity(32);
+        x11::write_xkb_use_extension_reply(&mut buf, byte_order, sequence, supported)?;
+        return Ok(write_to_client(client, client_id, &buf));
     }
     // SelectEvents is applied here; on success the request still reaches
     // the backend (a nested backend forwards it to its host).
@@ -21154,9 +21181,7 @@ fn handle_xkb_request(
             backend.xkb_get_kbd_by_name(body, &mut intern)
         };
         if let Some((mut bytes, notify)) = kbn {
-            if bytes.len() >= 4 {
-                bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-            }
+            stamp_reply_sequence(&mut bytes, byte_order, sequence);
             // Broadcast NewKeyboardNotify on a successful load, BEFORE writing
             // the reply (Xorg order is reply-then-notify, but the notify fans
             // out to a different client set; ordering across clients is
@@ -21243,16 +21268,7 @@ fn handle_xkb_request(
             .flatten()
     };
     if let Some(mut bytes) = reply {
-        if bytes.len() >= 4 {
-            bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-        }
-        // UseExtension: whether the requested version is supported is the
-        // core loop's decision (it tracks the client's XKB state).
-        if let Some(supported) = use_extension_supported
-            && bytes.len() >= 2
-        {
-            bytes[1] = u8::from(supported);
-        }
+        stamp_reply_sequence(&mut bytes, byte_order, sequence);
         // GetControls: the per-key repeat is the core keyboard feedback's
         // (Xorg keeps XKB `per_key_repeat` and `autoRepeats` in sync), which
         // lives here, not in the backend.
@@ -21262,10 +21278,24 @@ fn handle_xkb_request(
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
         };
-        let _byte_order = client.byte_order;
         return Ok(write_to_client(client, client_id, &bytes));
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Write `sequence` into bytes 2..4 of a reply a backend built, in the
+/// client's byte order.
+fn stamp_reply_sequence(
+    bytes: &mut [u8],
+    byte_order: x11::ClientByteOrder,
+    sequence: SequenceNumber,
+) {
+    if let Some(field) = bytes.get_mut(2..4) {
+        field.copy_from_slice(&match byte_order {
+            x11::ClientByteOrder::LittleEndian => sequence.0.to_le_bytes(),
+            x11::ClientByteOrder::BigEndian => sequence.0.to_be_bytes(),
+        });
+    }
 }
 
 /// Send what an XKB Set* request did, in Xorg's order: each
@@ -74604,6 +74634,97 @@ mod tests {
             body,
         )
         .expect("XKB request");
+    }
+
+    /// Xvfb 21.1.24, XkbUseExtension(1, 0) at sequence 2 from a
+    /// little-endian client: `01010200 00000000 01000000 00…`
+    /// (supported, server 1.0).
+    #[test]
+    fn xkb_use_extension_replies_like_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 136,
+                data: 0,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+        )
+        .expect("XkbUseExtension");
+        let reply = read_all_available(&mut peer);
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 1, 2, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(reply, expected);
+        assert!(crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+    }
+
+    /// yserver's XKB request parsers and reply encoders are little-endian
+    /// only, so a big-endian client is refused the way Xorg refuses a
+    /// client it can't serve: XkbUseExtension answers supported=False
+    /// (the bytes are Xvfb's big-endian answer to an unsupported version,
+    /// `01000002 00000000 00010000 00…`), and every other XKB request is
+    /// then BadAccess, as Xorg answers an uninitialised client (Xvfb:
+    /// GetState → BadAccess, value 0, minor 4). All of it in the client's
+    /// byte order.
+    #[test]
+    fn xkb_refuses_big_endian_clients_cleanly() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        // XKB request bodies are not swapped: wantedMajor=1, wantedMinor=0
+        // as a big-endian client sends them.
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 136,
+                data: 0,
+                length_units: 2,
+            },
+            &[0, 1, 0, 0],
+        )
+        .expect("XkbUseExtension");
+        let reply = read_all_available(&mut peer);
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 0, 0, 2, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(reply, expected);
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 136,
+                data: 4,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+        )
+        .expect("XkbGetState");
+        let err = read_all_available(&mut peer);
+        assert_eq!(err.len(), 32);
+        assert_eq!((err[0], err[1]), (0, x11::error::BAD_ACCESS));
+        assert_eq!(&err[2..4], &[0, 3], "big-endian sequence");
+        assert_eq!(&err[8..10], &[0, 4], "big-endian minor opcode");
     }
 
     /// Golden (`xorg-xkb-setmap-errors.txt`, Xvfb 21.1.24: `access`,

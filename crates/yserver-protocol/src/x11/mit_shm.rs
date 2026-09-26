@@ -245,11 +245,17 @@ pub fn encode_create_segment_reply(
 /// created from a shm segment will reflect later writes into the
 /// segment. ynest answers `false` — see the design doc — because we
 /// snapshot the segment at `CreatePixmap` time.
+///
+/// As Xorg's `ProcShmQueryVersion` (Xext/shm.c): `uid`/`gid` are the
+/// server's effective ids (truncated to the 16-bit wire fields), and
+/// `pixmapFormat` is ZPixmap only when shared pixmaps are offered, else 0.
 #[must_use]
 pub fn encode_query_version_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     shared_pixmaps: bool,
+    uid: u16,
+    gid: u16,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     out.push(1); // reply
@@ -258,9 +264,13 @@ pub fn encode_query_version_reply(
     write_u32(byte_order, &mut out, 0); // length = 0
     write_u16(byte_order, &mut out, MAJOR_VERSION);
     write_u16(byte_order, &mut out, MINOR_VERSION);
-    write_u16(byte_order, &mut out, 0); // uid
-    write_u16(byte_order, &mut out, 0); // gid
-    out.push(PIXMAP_FORMAT_Z_PIXMAP);
+    write_u16(byte_order, &mut out, uid);
+    write_u16(byte_order, &mut out, gid);
+    out.push(if shared_pixmaps {
+        PIXMAP_FORMAT_Z_PIXMAP
+    } else {
+        0
+    });
     out.extend_from_slice(&[0u8; 15]);
     debug_assert_eq!(out.len(), 32);
     out
@@ -295,22 +305,48 @@ mod tests {
 
     #[test]
     fn query_version_reply_advertises_v1_2_with_shared_pixmaps_false() {
-        let reply =
-            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(7), false);
+        // Xorg ProcShmQueryVersion (Xext/shm.c): `.pixmapFormat =
+        // sharedPixmaps ? ZPixmap : 0`, uid/gid = geteuid()/getegid().
+        let reply = encode_query_version_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            false,
+            1000,
+            1000,
+        );
         assert_eq!(reply.len(), 32);
         assert_eq!(reply[0], 1, "reply byte");
         assert_eq!(reply[1], 0, "shared_pixmaps = false");
         assert_eq!(u16::from_le_bytes([reply[2], reply[3]]), 7);
         assert_eq!(u16::from_le_bytes([reply[8], reply[9]]), MAJOR_VERSION);
         assert_eq!(u16::from_le_bytes([reply[10], reply[11]]), MINOR_VERSION);
-        assert_eq!(reply[16], PIXMAP_FORMAT_Z_PIXMAP);
+        assert_eq!(&reply[12..16], &[0xe8, 0x03, 0xe8, 0x03], "uid, gid");
+        assert_eq!(reply[16], 0, "no pixmap format without shared pixmaps");
     }
 
     #[test]
-    fn query_version_reply_can_advertise_shared_pixmaps_true() {
-        let reply =
-            encode_query_version_reply(ClientByteOrder::LittleEndian, SequenceNumber(1), true);
-        assert_eq!(reply[1], 1);
+    fn query_version_reply_with_shared_pixmaps_matches_xvfb() {
+        // Xvfb 21.1.24 (sharedPixmaps=1, uid=gid=1000), sequence 2:
+        //   LE 01010200 00000000 01000200 e803e803 02 00…
+        //   BE 01010002 00000000 00010002 03e803e8 02 00…
+        for (order, expected_head) in [
+            (
+                ClientByteOrder::LittleEndian,
+                [
+                    1u8, 1, 2, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0xe8, 0x03, 0xe8, 0x03, 2,
+                ],
+            ),
+            (
+                ClientByteOrder::BigEndian,
+                [
+                    1u8, 1, 0, 2, 0, 0, 0, 0, 0, 1, 0, 2, 0x03, 0xe8, 0x03, 0xe8, 2,
+                ],
+            ),
+        ] {
+            let reply = encode_query_version_reply(order, SequenceNumber(2), true, 1000, 1000);
+            assert_eq!(&reply[..17], &expected_head, "{order:?}");
+            assert!(reply[17..].iter().all(|&b| b == 0), "{order:?}");
+        }
     }
 
     #[test]

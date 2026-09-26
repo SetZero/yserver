@@ -29143,6 +29143,72 @@ mod tests {
         );
     }
 
+    /// A big-endian client's XkbUseExtension through the real KMS backend
+    /// gets Xvfb's big-endian "unsupported" answer (supported=False,
+    /// sequence and server version 1.0 in big-endian:
+    /// `01000002 00000000 00010000 00…`) — yserver's XKB is
+    /// little-endian only, and Xorg's way to refuse a client is
+    /// supported=False. The backend's own reply is little-endian.
+    #[test]
+    fn xkb_use_extension_from_a_big_endian_client_is_refused_in_its_byte_order() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{core_loop::process_request, server::ClientState};
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+        let mut backend = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let (mut peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        state.clients.insert(
+            7,
+            ClientState {
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
+                byte_order: ClientByteOrder::BigEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: 0,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: yserver_core::resources::ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        let xkb_major = backend.xkb_opcode().expect("KMS advertises XKB");
+        process_request::process_request(
+            &mut state,
+            &mut backend as &mut dyn Backend,
+            ClientId(7),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: xkb_major,
+                data: 0,
+                length_units: 2,
+            },
+            // wantedMajor=1, wantedMinor=0 as a big-endian client sends it.
+            &[0, 1, 0, 0],
+            None,
+        )
+        .expect("XkbUseExtension");
+        let mut reply = [0u8; 32];
+        peer.read_exact(&mut reply).unwrap();
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 0, 0, 2, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(reply, expected);
+    }
+
     /// Routing regression guard: minor 13 is GetIndicatorMap (clients send
     /// it 8×), minor 22 is ListComponents. FU4 wired the 416-byte
     /// IndicatorMap reply to 22 by mistake and stubbed the real opcode 13.
