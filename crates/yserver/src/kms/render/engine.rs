@@ -735,30 +735,50 @@ pub(crate) struct StagingBuffer {
     /// `HOST_CACHED`-only readback type), CPU reads of `mapped` must be
     /// preceded by `invalidate_for_read` so they observe the GPU's writes.
     coherent: bool,
-    /// Which pool, if any, takes this buffer back at frame retire instead of
-    /// destroying it. Fresh `new*` buffers (readback, custom usage,
-    /// oversize uploads) are [`PoolOrigin::None`] and drop normally.
-    origin: PoolOrigin,
+    /// True if this buffer was handed out by [`StagingPool::acquire`] (the
+    /// `put_image` upload path) and should be RETURNED to the pool at retire
+    /// instead of destroyed. Fresh `new*` buffers (readback, custom usage,
+    /// upload arena blocks) are `false` and drop normally. Perf: avoids
+    /// per-upload vkCreateBuffer/vkAllocateMemory churn, which is costly on
+    /// NVIDIA.
+    from_pool: bool,
 }
 
-/// Where a [`StagingBuffer`] goes when the frame that used it retires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PoolOrigin {
-    /// Destroyed on drop.
-    None,
-    /// Returned to the exact-size `put_image` [`StagingPool`].
-    Staging,
-    /// Returned to the size-classed upload pool (#177), in this class.
-    SizeClass(usize),
-}
-
-/// Usage of every size-classed upload buffer: instance/vertex data for the
-/// glyph and trapezoid pipelines, and the source of glyph-atlas uploads. One
-/// pool serves both; both are core usages with no feature requirement, and
-/// the memory type is still chosen from this buffer's own requirements.
-const UPLOAD_POOL_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+/// Usage of every upload arena block (#177): instance/vertex data for the
+/// glyph and trapezoid pipelines, and the source of glyph-atlas uploads.
+/// One block serves both; both are core usages with no feature
+/// requirement, and the memory type is still chosen from the buffer's own
+/// requirements (`HOST_VISIBLE | HOST_COHERENT`, so CPU writes need no
+/// flush and `nonCoherentAtomSize` does not apply).
+const UPLOAD_ARENA_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::VERTEX_BUFFER.as_raw() | vk::BufferUsageFlags::TRANSFER_SRC.as_raw(),
 );
+
+/// Offset alignment of vertex/instance data in the upload arena. Every
+/// attribute of the glyph-instance and trapezoid vertex layouts has 32-bit
+/// components (`R32_*` / `R32G32_*`), and Vulkan requires each attribute's
+/// address to be a multiple of its component size ("Vertex Input Address
+/// Calculation"); `vkCmdBindVertexBuffers` itself adds no offset alignment
+/// rule. 16 covers that with room for a future 64-bit or vec4 attribute,
+/// for at most 15 bytes of padding per request.
+const UPLOAD_VERTEX_ALIGN: u64 = 16;
+
+/// Upper bound on the `optimalBufferCopyOffsetAlignment` honoured for
+/// glyph-atlas uploads. The limit is a performance hint; a driver
+/// reporting more than this would pad every few-hundred-byte glyph by
+/// more than the glyph itself.
+const UPLOAD_COPY_ALIGN_MAX: u64 = 256;
+
+/// Offset alignment for glyph-atlas upload sources in the upload arena.
+/// `vkCmdCopyBufferToImage` requires `bufferOffset` to be a multiple of 4
+/// and of the texel block size (1 byte for the R8 atlas);
+/// `optimal_copy_align` (`optimalBufferCopyOffsetAlignment`) is honoured
+/// on top, up to [`UPLOAD_COPY_ALIGN_MAX`].
+fn upload_copy_align(optimal_copy_align: u64) -> u64 {
+    optimal_copy_align
+        .clamp(4, UPLOAD_COPY_ALIGN_MAX)
+        .next_power_of_two()
+}
 
 impl std::fmt::Debug for StagingBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -895,7 +915,7 @@ impl StagingBuffer {
             mapped,
             size,
             coherent,
-            origin: PoolOrigin::None,
+            from_pool: false,
         })
     }
 
@@ -1000,7 +1020,7 @@ const STAGING_POOL_TOTAL_BYTES_CAP: u64 = 64 * 1024 * 1024;
 
 impl StagingPool {
     /// Reuse a same-size buffer, or allocate a fresh one. The returned buffer
-    /// is tagged [`PoolOrigin::Staging`] so retire routes it back here.
+    /// is flagged `from_pool` so retire routes it back here.
     fn acquire(&mut self, vk: &Arc<VkContext>, size: u64) -> Result<StagingBuffer, vk::Result> {
         if let Some(buf) = self.buckets.get_mut(&size).and_then(Vec::pop) {
             self.pooled_bytes = self.pooled_bytes.saturating_sub(buf.size);
@@ -1019,13 +1039,12 @@ impl StagingPool {
             size,
             crate::kms::vk::mem_accounting::ChurnClass::StagingPool,
         )?;
-        buf.origin = PoolOrigin::Staging;
+        buf.from_pool = true;
         Ok(buf)
     }
 
-    /// Return a retired pooled buffer for reuse, or drop it (destroy) if the
-    /// bucket/byte caps are exceeded. Caller guarantees
-    /// `buf.origin == PoolOrigin::Staging`.
+    /// Return a retired `from_pool` buffer for reuse, or drop it (destroy) if
+    /// the bucket/byte caps are exceeded. Caller guarantees `buf.from_pool`.
     fn release(&mut self, buf: StagingBuffer) {
         let bucket = self.buckets.entry(buf.size).or_default();
         if bucket.len() >= STAGING_POOL_BUCKET_CAP
@@ -1153,12 +1172,15 @@ struct RenderEngineInner {
     /// `put_image`, to avoid per-upload vkCreateBuffer/vkAllocateMemory churn
     /// (costly on NVIDIA). See [`StagingPool`].
     staging_pool: StagingPool,
-    /// #177: size-classed reuse of the small per-request upload buffers —
-    /// glyph-run / ImageText instance buffers, trapezoid/triangle vertex
-    /// buffers and glyph-atlas upload staging. Entries go back only from the
-    /// `pending_frames` retire walk, once the frame's fence has signalled.
-    /// See [`RenderEngineInner::acquire_upload_buffer`].
-    upload_pool: super::size_class_pool::SizeClassPool<StagingBuffer>,
+    /// #177: idle blocks of the per-frame upload arena that glyph-run /
+    /// ImageText instance data, trapezoid/triangle vertices and glyph-atlas
+    /// upload staging are bump-allocated from. A frame's blocks come back
+    /// only from the `pending_frames` retire walk, once the frame's fence
+    /// has signalled. See [`RenderEngineInner::upload_to_frame`].
+    upload_arena: super::upload_arena::UploadArena<StagingBuffer>,
+    /// Offset alignment of glyph-atlas upload sources in the upload arena,
+    /// from [`upload_copy_align`].
+    upload_copy_align: u64,
     /// Stage 3b: per-picture GPU-side state. Today only carries
     /// gradient `GradientPicture` instances built lazily by Stage
     /// 3c's first `render_composite`; Stage 3b just ensures
@@ -1345,44 +1367,76 @@ struct RenderEngineInner {
 }
 
 impl RenderEngineInner {
-    /// #177: a host-visible, host-coherent, mapped buffer of at least `size`
-    /// bytes with [`UPLOAD_POOL_USAGE`], for one request's instance/vertex
-    /// data or glyph upload. Served from the size-classed upload pool when
-    /// an idle buffer of the class exists, else freshly allocated at the
-    /// class size. Pin it in the open frame: the frame-retire walk in
-    /// [`RenderEngine::poll_retired`] returns it to the pool once the frame's
-    /// fence has signalled. Requests above
-    /// [`super::size_class_pool::MAX_CLASS_BYTES`] get a dedicated buffer
-    /// that is destroyed at retire.
-    fn acquire_upload_buffer(
+    /// #177: copy one request's upload data into the open frame's upload
+    /// arena and pin it, returning the pin its recorded op replays from.
+    /// `align` is the offset alignment the data's use needs
+    /// ([`UPLOAD_VERTEX_ALIGN`] for instance/vertex data,
+    /// `self.upload_copy_align` for a buffer→image copy source).
+    ///
+    /// The bytes land in a block the open frame owns: the frame's current
+    /// block, or a block chained onto it (from the arena's idle list, else
+    /// freshly allocated). A request larger than a block gets a dedicated
+    /// allocation, counted under `churn`. The blocks travel with the
+    /// frame's pin set and return to the arena only once its fence has
+    /// signalled (the retire walk in [`RenderEngine::poll_retired`]), so
+    /// the slice's bytes stay untouched until the GPU has read them.
+    ///
+    /// Must be called with a frame open, and the returned pin belongs to
+    /// that frame: the frame must not close between this call and
+    /// recording the op that uses the pin.
+    ///
+    /// # Errors
+    ///
+    /// The `vk::Result` of a failed block allocation. The frame's pins and
+    /// blocks are then unchanged.
+    fn upload_to_frame(
         &mut self,
-        size: u64,
+        data: &[u8],
+        align: u64,
         churn: crate::kms::vk::mem_accounting::ChurnClass,
-    ) -> Result<StagingBuffer, vk::Result> {
-        use super::size_class_pool::{class_bytes, class_for};
-        // `churn` names the requesting site for the churn telemetry. It
-        // only matters when memory is actually allocated (a pool miss or
-        // an oversize request); a pool hit allocates nothing.
-        let Some(class) = class_for(size) else {
-            self.upload_pool.note_oversize();
-            return StagingBuffer::new_with_usage(
-                Arc::clone(&self.vk),
-                size,
-                UPLOAD_POOL_USAGE,
-                churn,
+    ) -> Result<super::frame_builder::PinnedUploadIdx, vk::Result> {
+        use super::upload_arena::{BlockKind, Placement};
+        let vk = Arc::clone(&self.vk);
+        let open = self
+            .frame_builder
+            .open
+            .as_mut()
+            .expect("upload_to_frame: no open frame");
+        let size = data.len() as u64;
+        let sub = self
+            .upload_arena
+            .alloc(&mut open.pins.uploads, size, align, |bytes, kind| {
+                let class = match kind {
+                    BlockKind::Shared => crate::kms::vk::mem_accounting::ChurnClass::UploadArena,
+                    BlockKind::Dedicated => churn,
+                };
+                StagingBuffer::new_with_usage(vk, bytes, UPLOAD_ARENA_USAGE, class)
+            })?;
+        crate::kms::vk::mem_accounting::note_upload_arena_request(
+            size,
+            matches!(sub.placement, Placement::Dedicated(_)),
+        );
+        crate::kms::vk::mem_accounting::set_upload_arena_idle_blocks(self.upload_arena.idle_len());
+        let block = open.pins.uploads.block(sub.placement);
+        debug_assert!(sub.offset + size <= block.size);
+        let offset = usize::try_from(sub.offset).expect("block offset fits usize");
+        // SAFETY: `block` is mapped HOST_COHERENT for `block.size` bytes and
+        // `[sub.offset, sub.offset + size)` lies inside it; the arena hands
+        // each byte range of a frame's blocks out once, and no submitted
+        // work reads this block (it is new, or came off the idle list after
+        // its previous frame retired).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                block.mapped.as_ptr().add(offset),
+                data.len(),
             );
-        };
-        if let Some(buf) = self.upload_pool.take(class) {
-            return Ok(buf);
         }
-        let mut buf = StagingBuffer::new_with_usage(
-            Arc::clone(&self.vk),
-            class_bytes(class),
-            UPLOAD_POOL_USAGE,
-            churn,
-        )?;
-        buf.origin = PoolOrigin::SizeClass(class);
-        Ok(buf)
+        let slice = super::frame_builder::UploadSlice {
+            buffer: block.buffer,
+            offset: sub.offset,
+        };
+        Ok(open.pins.pin_upload(slice))
     }
 
     /// Look up or lazily build the text pipeline for
@@ -1858,6 +1912,13 @@ impl RenderEngine {
     /// (no Vk). Production paths always have Vk.
     pub(crate) fn new(platform: &PlatformBackend) -> Result<Self, RenderError> {
         let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+        // SAFETY: `physical_device` belongs to `instance`.
+        let limits = unsafe {
+            vk.instance
+                .get_physical_device_properties(vk.physical_device)
+                .limits
+        };
+        let upload_copy_align = upload_copy_align(limits.optimal_buffer_copy_offset_alignment);
         let descriptor_pool_ring =
             super::descriptor_pool_ring::DescriptorPoolRing::new(Arc::clone(&vk));
         Ok(Self {
@@ -1865,7 +1926,8 @@ impl RenderEngine {
                 vk,
                 submitted: VecDeque::new(),
                 staging_pool: StagingPool::default(),
-                upload_pool: super::size_class_pool::SizeClassPool::default(),
+                upload_arena: super::upload_arena::UploadArena::default(),
+                upload_copy_align,
                 picture_paint: HashMap::new(),
                 glyph_atlas: None,
                 text_pipelines: HashMap::new(),
@@ -1979,34 +2041,37 @@ impl RenderEngine {
             for r in record.pins.retired_resources.drain(..) {
                 r.release(&inner.vk);
             }
-            // Reclaim pooled buffers for reuse instead of destroying them
-            // (#nvidia perf for put_image staging; #177 for the per-request
-            // instance/vertex/glyph-upload buffers). This is the ONLY place
-            // either pool gets a buffer back, and it runs only after this
-            // frame's ticket has signalled, so a pooled buffer is never in
-            // flight. The pin holds the sole Arc at retire (the recording
-            // site's local dropped after recording; recorded ops keep only an
-            // index), so try_unwrap succeeds; a buffer still shared elsewhere
-            // just drops (destroyed) when its last holder does.
-            let retired_at = std::time::Instant::now();
+            // #177: hand the frame's upload arena blocks back for the next
+            // frames. This is the ONLY place the arena gets a block back, and
+            // it runs only after this frame's ticket has signalled, so a
+            // block handed out again is never read by submitted work.
+            inner.upload_arena.retire(
+                std::mem::take(&mut record.pins.uploads),
+                std::time::Instant::now(),
+            );
+            // #nvidia perf: reclaim pooled put_image staging for reuse
+            // instead of destroying it (avoids per-upload vkCreateBuffer/
+            // vkAllocateMemory churn, costly on NVIDIA). Same fence argument.
+            // The pin holds the sole staging Arc at retire (put_image's local
+            // dropped after recording; RecordedPutImage keeps only an index),
+            // so try_unwrap succeeds; from_pool buffers go back to the pool,
+            // others drop.
             for arc in record.pins.staging_buffers.drain(..) {
-                if let Ok(buf) = Arc::try_unwrap(arc) {
-                    match buf.origin {
-                        PoolOrigin::None => {}
-                        PoolOrigin::Staging => inner.staging_pool.release(buf),
-                        PoolOrigin::SizeClass(class) => {
-                            inner.upload_pool.put(class, buf, retired_at);
-                        }
-                    }
+                if let Ok(buf) = Arc::try_unwrap(arc)
+                    && buf.from_pool
+                {
+                    inner.staging_pool.release(buf);
                 }
             }
             // The Arcs inside the record drop here, releasing pinned resources.
             drop(record);
         }
-        // #177: destroy upload buffers idle past the eviction age, so a burst
+        // #177: destroy upload blocks idle past the eviction age, so a burst
         // doesn't leave live VA ranges parked (each one makes every other
-        // free on amdgpu dearer). Bounded per class even when this doesn't run.
-        inner.upload_pool.trim(std::time::Instant::now());
+        // allocation and free on amdgpu dearer). Bounded by the idle cap even
+        // when this doesn't run.
+        inner.upload_arena.trim(std::time::Instant::now());
+        crate::kms::vk::mem_accounting::set_upload_arena_idle_blocks(inner.upload_arena.idle_len());
         // GLX-TFP (Task 1.2): free old promotion-displaced images whose
         // guarding fence has signaled. No ordering relationship to the
         // queues above (each rides its own ticket), so retain-filter
@@ -2310,20 +2375,22 @@ impl RenderEngine {
         // #nvidia perf: destroy pooled upload staging buffers (all submitted
         // work above is waited out, so none is in flight).
         inner.staging_pool.drain();
-        let upload_stats = inner.upload_pool.stats();
+        let arena = inner.upload_arena.stats();
         log::info!(
-            "upload pool: hits={} misses={} oversize={} returned={} rejected={} evicted={} \
-             idle={} idle_bytes={}",
-            upload_stats.hits,
-            upload_stats.misses,
-            upload_stats.oversize,
-            upload_stats.returned,
-            upload_stats.rejected,
-            upload_stats.evicted,
-            inner.upload_pool.idle_total(),
-            inner.upload_pool.idle_bytes(),
+            "upload arena: suballocs={} suballoc_bytes={} dedicated={} block_allocs={} \
+             block_reuses={} returned={} rejected={} evicted={} idle={}",
+            arena.suballocs,
+            arena.suballoc_bytes,
+            arena.dedicated,
+            arena.block_allocs,
+            arena.block_reuses,
+            arena.returned,
+            arena.rejected,
+            arena.evicted,
+            inner.upload_arena.idle_len(),
         );
-        inner.upload_pool.drain();
+        inner.upload_arena.drain();
+        crate::kms::vk::mem_accounting::set_upload_arena_idle_blocks(0);
         // Phase B.1: drain in-flight frame pins. wait() ensures Vk-side
         // completion before the Arc<StagingBuffer> drops would otherwise
         // race with GPU reads. Off-hot-path; one wait per pending frame
@@ -6103,8 +6170,8 @@ impl RenderEngine {
             }
         }
 
-        // (8) Per-glyph walk: lookup → on miss, pack + allocate staging
-        //     buffer + pin via open.pins.pin_staging + push
+        // (8) Per-glyph walk: lookup → on miss, pack + upload the pixels
+        //     into the frame's upload arena (upload_to_frame pins) + push
         //     RecordedOp::GlyphUpload (NOT push_op_and_set_layouts because
         //     GlyphUpload.dst_id() is None — no layout updates).
         let ceiling = inner.frame_builder.max_pinned_resources_per_frame();
@@ -6117,7 +6184,8 @@ impl RenderEngine {
 
         let mut glyphs_to_draw: Vec<super::frame_builder::RecordedTextGlyph> =
             Vec::with_capacity(rendered.len());
-        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, Arc<StagingBuffer>)> = Vec::new();
+        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, super::frame_builder::PinnedUploadIdx)> =
+            Vec::new();
         let mut new_zero_inserts: Vec<(GlyphKey, AtlasEntry)> = Vec::new();
         let mut damage_min_x = i32::MAX;
         let mut damage_min_y = i32::MAX;
@@ -6200,21 +6268,13 @@ impl RenderEngine {
                     continue;
                 };
                 stats.atlas_interns += 1;
-                let upload_bytes = u64::from(w_u) * u64::from(h_u);
-                let staging = Arc::new(inner.acquire_upload_buffer(
-                    upload_bytes,
+                // Pinned into the open frame here; the GlyphUpload op that
+                // replays it is recorded below, in the same frame.
+                let upload_pin = inner.upload_to_frame(
+                    &g.pixels[..copy_len],
+                    inner.upload_copy_align,
                     crate::kms::vk::mem_accounting::ChurnClass::GlyphUpload,
-                )?);
-                let src_slice = &g.pixels[..copy_len];
-                // SAFETY: staging is HOST_COHERENT, mapped for at least
-                // `upload_bytes` bytes; `src_slice.len() == copy_len`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src_slice.as_ptr(),
-                        staging.mapped.as_ptr(),
-                        copy_len,
-                    );
-                }
+                )?;
                 let new_entry = AtlasEntry {
                     atlas_x,
                     atlas_y,
@@ -6225,7 +6285,7 @@ impl RenderEngine {
                     pen_top: 0,
                     layout: GlyphLayout::A8,
                 };
-                new_uploads.push((key, new_entry, staging));
+                new_uploads.push((key, new_entry, upload_pin));
                 stats.glyph_uploads += 1;
                 new_entry
             };
@@ -6271,11 +6331,10 @@ impl RenderEngine {
         // Commit new uploads + zero-inserts into the open frame.
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
-            for (key, entry, staging) in new_uploads.drain(..) {
-                let staging_pin_idx = open.pins.pin_staging(Arc::clone(&staging));
+            for (key, entry, upload_pin) in new_uploads.drain(..) {
                 open.ops.push(super::frame_builder::RecordedOp::GlyphUpload(
                     super::frame_builder::RecordedGlyphUpload {
-                        staging_pin_idx,
+                        upload_pin,
                         atlas_x: entry.atlas_x,
                         atlas_y: entry.atlas_y,
                         packed_w: entry.packed_w,
@@ -6351,24 +6410,13 @@ impl RenderEngine {
         if instance_count == 0 {
             return Ok(stats);
         }
-        let instance_buf = {
-            let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
-            let buf = inner.acquire_upload_buffer(
-                needed,
-                crate::kms::vk::mem_accounting::ChurnClass::ImageText,
-            )?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    instance_data.as_ptr(),
-                    buf.mapped.as_ptr(),
-                    instance_data.len(),
-                );
-            }
-            buf
-        };
+        let instance_pin = inner.upload_to_frame(
+            &instance_data,
+            UPLOAD_VERTEX_ALIGN,
+            crate::kms::vk::mem_accounting::ChurnClass::ImageText,
+        )?;
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
-            let instance_pin = open.pins.pin_staging(Arc::new(instance_buf));
             open.push_op_and_set_layouts(
                 super::frame_builder::RecordedOp::ImageText(Box::new(
                     super::frame_builder::RecordedImageText {
@@ -6768,14 +6816,15 @@ impl RenderEngine {
             .map(|o| o.pins.len())
             .unwrap_or(0);
 
-        // (6b) Per-glyph walk — actually allocate staging + pack atlas
+        // (6b) Per-glyph walk — actually upload the pixels + pack atlas
         //      slots for each miss. Deduplicate against (a) committed
         //      atlas, (b) pending_glyph_inserts in the open frame,
         //      (c) new_uploads already collected in this walk. Stop
         //      allocating once the ceiling is hit (drop excess glyphs).
         let mut glyphs_to_draw: Vec<super::frame_builder::RecordedTextGlyph> =
             Vec::with_capacity(glyphs.len());
-        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, Arc<StagingBuffer>)> = Vec::new();
+        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, super::frame_builder::PinnedUploadIdx)> =
+            Vec::new();
         let mut new_zero_inserts: Vec<(GlyphKey, AtlasEntry)> = Vec::new();
         let mut damage_min_x = i32::MAX;
         let mut damage_min_y = i32::MAX;
@@ -6884,22 +6933,13 @@ impl RenderEngine {
                     continue;
                 };
                 stats.atlas_interns += 1;
-                let upload_bytes = copy_len as u64;
-                let staging = Arc::new(inner.acquire_upload_buffer(
-                    upload_bytes,
+                // Pinned into the open frame here; the GlyphUpload op that
+                // replays it is recorded in (6c) below, in the same frame.
+                let upload_pin = inner.upload_to_frame(
+                    &atlas_bytes[..copy_len],
+                    inner.upload_copy_align,
                     crate::kms::vk::mem_accounting::ChurnClass::GlyphUpload,
-                )?);
-                let src_slice: &[u8] = &atlas_bytes;
-                // SAFETY: staging is HOST_COHERENT, mapped for at
-                // least `upload_bytes` bytes (clamped to 1 below);
-                // `src_slice.len() == copy_len == upload_bytes`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src_slice.as_ptr(),
-                        staging.mapped.as_ptr(),
-                        copy_len,
-                    );
-                }
+                )?;
                 debug_assert_eq!(
                     copy_len,
                     (packed_w as usize) * (g.h as usize),
@@ -6915,7 +6955,7 @@ impl RenderEngine {
                     pen_top: 0,
                     layout,
                 };
-                new_uploads.push((key, new_entry, staging));
+                new_uploads.push((key, new_entry, upload_pin));
                 stats.glyph_uploads += 1;
                 new_entry
             };
@@ -6955,11 +6995,10 @@ impl RenderEngine {
         //      new_uploads.len() ≤ ceiling - pending.
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
-            for (key, entry, staging) in new_uploads.drain(..) {
-                let staging_pin_idx = open.pins.pin_staging(Arc::clone(&staging));
+            for (key, entry, upload_pin) in new_uploads.drain(..) {
                 open.ops.push(super::frame_builder::RecordedOp::GlyphUpload(
                     super::frame_builder::RecordedGlyphUpload {
-                        staging_pin_idx,
+                        upload_pin,
                         atlas_x: entry.atlas_x,
                         atlas_y: entry.atlas_y,
                         packed_w: entry.packed_w,
@@ -7297,25 +7336,14 @@ impl RenderEngine {
             return Ok(0);
         }
 
-        let instance_buf = {
-            let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
-            let buf = inner.acquire_upload_buffer(
-                needed,
-                crate::kms::vk::mem_accounting::ChurnClass::GlyphRun,
-            )?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    instance_data.as_ptr(),
-                    buf.mapped.as_ptr(),
-                    instance_data.len(),
-                );
-            }
-            buf
-        };
-        let open = inner.frame_builder.open.as_mut().expect("open");
         // Exactly one pin for the whole request — the pin the ceiling
         // reserved.
-        let instance_pin = open.pins.pin_staging(Arc::new(instance_buf));
+        let instance_pin = inner.upload_to_frame(
+            &instance_data,
+            UPLOAD_VERTEX_ALIGN,
+            crate::kms::vk::mem_accounting::ChurnClass::GlyphRun,
+        )?;
+        let open = inner.frame_builder.open.as_mut().expect("open");
 
         // No damage_rect carried on any run: damage is mutated at
         // append time by the caller, once for the whole request.
@@ -8371,24 +8399,6 @@ impl RenderEngine {
             return Ok(stats);
         }
 
-        // Step 5 (N8-style ordering): allocate vertex StagingBuffer FIRST,
-        // before any open-frame state mutation. Allocation failure leaves
-        // the frame untouched.
-        let instance_buf = {
-            let inner = self.inner.as_mut().expect("inner");
-            let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
-            let buf = inner
-                .acquire_upload_buffer(needed, crate::kms::vk::mem_accounting::ChurnClass::Traps)?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    instance_data.as_ptr(),
-                    buf.mapped.as_ptr(),
-                    instance_data.len(),
-                );
-            }
-            buf
-        };
-
         // Step 6 (Phase 9A for mask_scratch): peek + close-before-grow + grow
         // + adopt. Mirrors render_composite_via_frame_builder at engine.rs:6539-6557.
         let need_grow_mask = {
@@ -8643,12 +8653,17 @@ impl RenderEngine {
                 .clone()
         };
 
-        // Step 10: pin vertex StagingBuffer.
-        let vertex_pool_pin = {
-            let inner = self.inner.as_mut().expect("inner");
-            let open = inner.frame_builder.open.as_mut().expect("just opened");
-            open.pins.pin_staging(Arc::new(instance_buf))
-        };
+        // Step 10: upload + pin the vertex data into the frame just
+        // opened (#177 upload arena). Done here, after the last point the
+        // frame can close (the scratch-grow close above), because the pin
+        // belongs to the frame whose blocks hold the bytes. Before any
+        // other open-frame state mutation, so an allocation failure leaves
+        // the frame with no half-recorded op.
+        let vertex_pin = self.inner.as_mut().expect("inner").upload_to_frame(
+            instance_data,
+            UPLOAD_VERTEX_ALIGN,
+            crate::kms::vk::mem_accounting::ChurnClass::Traps,
+        )?;
 
         // Step 11 (codex round-9 CRITICAL): prelude state for ALL TOUCHED DRAWABLES.
         // dst: first_touch + first_touch_drawable + touch_render_fence.
@@ -8725,7 +8740,7 @@ impl RenderEngine {
             bbox_h,
             instance_count,
             clip_scissors,
-            vertex_pool_pin,
+            vertex_pin,
         });
         {
             let inner = self.inner.as_mut().expect("inner");
@@ -9632,10 +9647,11 @@ fn emit_recorded_op_into_cb(
     match op {
         Op::GlyphUpload(up) => {
             let atlas = inner.glyph_atlas.as_mut().ok_or(RenderError::NoVk)?;
-            let staging_buffer = pins.staging_buffers[up.staging_pin_idx.0 as usize].buffer;
+            let src = pins.upload_slices[up.upload_pin.0 as usize];
             atlas.record_upload(
                 cb,
-                staging_buffer,
+                src.buffer,
+                src.offset,
                 up.atlas_x,
                 up.atlas_y,
                 up.packed_w,
@@ -9654,7 +9670,7 @@ fn emit_recorded_op_into_cb(
             // alias the pipeline cache against `&inner.vk`.
             let vk = inner.vk.clone();
             // Per-glyph instance vertex buffer pinned at record time (#1).
-            let instance_buf = pins.staging_buffers[cg.instance_pin.0 as usize].buffer;
+            let instance = pins.upload_slices[cg.instance_pin.0 as usize];
             let drawable = store
                 .get_mut(cg.dst_id)
                 .ok_or(RenderError::UnknownDrawable(cg.dst_id))?;
@@ -9683,7 +9699,8 @@ fn emit_recorded_op_into_cb(
                 &mut adapter,
                 atlas_extent,
                 pipeline,
-                instance_buf,
+                instance.buffer,
+                instance.offset,
                 cg.first_instance,
                 cg.instance_count,
                 cg.foreground_rgba,
@@ -11107,7 +11124,7 @@ fn emit_recorded_image_text_into_cb(
     // the pipeline cache against `&inner.vk`.
     let vk = inner.vk.clone();
     // Per-glyph instance vertex buffer pinned at record time (#1).
-    let instance_buf = pins.staging_buffers[it.instance_pin.0 as usize].buffer;
+    let instance = pins.upload_slices[it.instance_pin.0 as usize];
     let drawable = store
         .get_mut(it.dst_id)
         .ok_or(RenderError::UnknownDrawable(it.dst_id))?;
@@ -11145,7 +11162,8 @@ fn emit_recorded_image_text_into_cb(
             &mut adapter,
             atlas_extent,
             pipeline,
-            instance_buf,
+            instance.buffer,
+            instance.offset,
             // Core text records one run per call; no split, no offset.
             0,
             it.instance_count,
@@ -11159,7 +11177,8 @@ fn emit_recorded_image_text_into_cb(
             &mut adapter,
             atlas_extent,
             pipeline,
-            instance_buf,
+            instance.buffer,
+            instance.offset,
             it.instance_count,
             it.foreground_rgba,
         )?;
@@ -11429,8 +11448,8 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         .layer_count(1)
         .color_attachments(&color_attachment);
 
-    // Bind vertex buffer from the pinned StagingBuffer (N5 / B.1 N2 pattern).
-    let vertex_buf = pins.staging_buffers[rt.vertex_pool_pin.0 as usize].buffer;
+    // Bind the vertex data pinned in the frame's upload arena (#177).
+    let vertex = pins.upload_slices[rt.vertex_pin.0 as usize];
     #[allow(clippy::cast_precision_loss)]
     let trap_pc = TrapDrawPushConsts {
         mask_extent: [mask_extent.width as f32, mask_extent.height as f32],
@@ -11450,7 +11469,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
     unsafe {
         device.cmd_begin_rendering(cb, &rendering_info);
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, prim_pipeline);
-        device.cmd_bind_vertex_buffers(cb, 0, &[vertex_buf], &[0]);
+        device.cmd_bind_vertex_buffers(cb, 0, &[vertex.buffer], &[vertex.offset]);
         device.cmd_push_constants(
             cb,
             prim_layout,
@@ -17358,15 +17377,16 @@ mod tests {
         engine.drain_all(&mut platform);
     }
 
-    /// #177: a pooled upload buffer must never be handed out again while
-    /// the GPU can still read it. Buffers pinned in the open frame, and in a
-    /// closed frame whose fence has not signalled (recorded into the submit
-    /// group but not yet submitted), stay out of the pool; only the retire
-    /// walk after the fence signals returns them, and the next request then
-    /// reuses one without allocating.
+    /// #177: an upload arena block must never be handed out again while
+    /// the GPU can still read it. A frame's blocks stay with the frame
+    /// while it is open and while it is closed but its fence has not
+    /// signalled (recorded into the submit group, not yet submitted); a
+    /// frame opened meanwhile gets a block of its own. Only the retire walk
+    /// after the fence signals returns the blocks, and later frames then
+    /// reuse them without allocating.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn upload_buffers_return_to_pool_only_after_frame_fence_signals() {
+    fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
         use crate::kms::vk::mem_accounting::thread_alloc_calls;
         let Some(mut platform) = live_platform() else {
             eprintln!("no Vk — skipping");
@@ -17401,101 +17421,211 @@ mod tests {
                 )
                 .expect("composite_glyphs");
         };
+        let settle = |engine: &mut RenderEngine,
+                      store: &mut DrawableStore,
+                      platform: &mut PlatformBackend| {
+            engine
+                .flush_submit_group(
+                    store,
+                    platform,
+                    super::super::submit_group::FlushReason::SyncBoundary,
+                )
+                .expect("flush");
+            platform.wait_idle_bounded();
+            engine.poll_retired(platform);
+        };
         let idle = |engine: &RenderEngine| {
             engine
                 .inner
                 .as_ref()
                 .expect("inner")
-                .upload_pool
-                .idle_total()
+                .upload_arena
+                .idle_len()
+        };
+        // The upload slices of the open frame.
+        let open_slices = |engine: &RenderEngine| {
+            engine
+                .inner
+                .as_ref()
+                .expect("inner")
+                .frame_builder
+                .open
+                .as_ref()
+                .expect("open frame")
+                .pins
+                .upload_slices
+                .clone()
         };
 
-        // Frame 1: the first request uploads the glyph (1 buffer) and its
-        // instance data (1 buffer); the second, in the SAME open frame,
-        // must get a fresh instance buffer — the first is still pinned.
+        // Warm-up: atlas, pipelines, the glyph's upload and one block, which
+        // the retire walk leaves on the idle list.
+        draw(&mut engine, &mut store, &mut platform);
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close warm-up frame");
+        settle(&mut engine, &mut store, &mut platform);
+        assert_eq!(idle(&engine), 1);
+
+        // Frame A: two requests share the idle block; nothing is allocated.
         let before = thread_alloc_calls();
         draw(&mut engine, &mut store, &mut platform);
         draw(&mut engine, &mut store, &mut platform);
-        assert_eq!(idle(&engine), 0);
-        let frame1_allocs = thread_alloc_calls() - before;
-        assert!(
-            frame1_allocs >= 3,
-            "glyph upload + two instance buffers: {frame1_allocs} allocations"
+        assert_eq!(
+            thread_alloc_calls() - before,
+            0,
+            "frame A reuses the idle block"
         );
+        let a = open_slices(&engine);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].buffer, a[1].buffer, "one block for the frame");
+        assert_eq!(a[0].offset, 0);
+        assert!(
+            a[1].offset > 0 && a[1].offset % UPLOAD_VERTEX_ALIGN == 0,
+            "{a:?}"
+        );
+        assert_eq!(idle(&engine), 0);
 
         // Closed but not submitted: the fence cannot have signalled.
         engine
             .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
-            .expect("close frame");
+            .expect("close frame A");
         engine.poll_retired(&platform);
         assert_eq!(
             idle(&engine),
             0,
-            "a frame whose fence has not signalled must not return its buffers"
+            "a frame whose fence has not signalled must not return its blocks"
         );
 
-        // Submitted and complete: the retire walk returns all three.
-        engine
-            .flush_submit_group(
-                &mut store,
-                &mut platform,
-                super::super::submit_group::FlushReason::SyncBoundary,
-            )
-            .expect("flush");
-        platform.wait_idle_bounded();
-        engine.poll_retired(&platform);
-        assert_eq!(idle(&engine), 3);
+        // Frame B, opened while A is in flight: a block of its own.
+        let before = thread_alloc_calls();
+        draw(&mut engine, &mut store, &mut platform);
+        assert_eq!(
+            thread_alloc_calls() - before,
+            1,
+            "frame B allocates a block"
+        );
+        let b = open_slices(&engine);
+        assert_eq!(b.len(), 1);
+        assert_ne!(
+            b[0].buffer, a[0].buffer,
+            "frame B was handed frame A's block while A was in flight"
+        );
 
-        // Frame 2: the glyph is cached; the instance buffer is reused.
+        // Both frames submitted and complete: both blocks go idle.
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close frame B");
+        settle(&mut engine, &mut store, &mut platform);
+        assert_eq!(idle(&engine), 2);
+
+        // Frame C reuses one of them without allocating.
         let before = thread_alloc_calls();
         draw(&mut engine, &mut store, &mut platform);
         assert_eq!(thread_alloc_calls() - before, 0, "reused, not allocated");
-        assert_eq!(idle(&engine), 2);
+        let c = open_slices(&engine);
+        assert!(c[0].buffer == a[0].buffer || c[0].buffer == b[0].buffer);
+        assert_eq!(c[0].offset, 0);
+        assert_eq!(idle(&engine), 1);
 
         engine.drain_all(&mut platform);
     }
 
-    /// #177: upload buffers come from their power-of-two class; a request
-    /// above the largest class gets a dedicated buffer that retire destroys
-    /// instead of pooling.
+    /// #177: requests in one frame are bump-allocated from one block at
+    /// offsets aligned for their use, and their bytes land at those
+    /// offsets; a request larger than a block gets a dedicated buffer.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn upload_buffer_classes_and_oversize_fallback() {
-        use super::super::size_class_pool::{MAX_CLASS_BYTES, class_bytes};
-        let Some(platform) = live_platform() else {
+    fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize() {
+        use super::super::upload_arena::{BLOCK_BYTES, Placement};
+        use crate::kms::vk::mem_accounting::{ChurnClass, thread_alloc_calls};
+        let Some(mut platform) = live_platform() else {
             eprintln!("no Vk — skipping");
             return;
         };
         let mut engine = RenderEngine::new(&platform).expect("engine");
+        let ticket = platform.submit_group_ticket_or_open().expect("ticket");
         let inner = engine.inner.as_mut().expect("inner");
+        inner.frame_builder.open_for_paint(ticket, 1);
 
-        let small = inner
-            .acquire_upload_buffer(100, crate::kms::vk::mem_accounting::ChurnClass::Other)
-            .expect("small");
-        assert_eq!(small.origin, PoolOrigin::SizeClass(0));
-        assert_eq!(small.size, class_bytes(0));
-        let mid = inner
-            .acquire_upload_buffer(10 * 1024, crate::kms::vk::mem_accounting::ChurnClass::Other)
-            .expect("mid");
-        assert_eq!(mid.origin, PoolOrigin::SizeClass(2));
-        assert_eq!(mid.size, 16 * 1024);
-        let big = inner
-            .acquire_upload_buffer(
-                MAX_CLASS_BYTES,
-                crate::kms::vk::mem_accounting::ChurnClass::Other,
-            )
-            .expect("largest class");
-        assert_eq!(big.origin, PoolOrigin::SizeClass(6));
+        let copy_align = inner.upload_copy_align;
+        assert!(
+            copy_align.is_power_of_two() && copy_align >= 4,
+            "{copy_align}"
+        );
+        assert!(copy_align <= UPLOAD_COPY_ALIGN_MAX);
 
-        let oversize = inner
-            .acquire_upload_buffer(
-                MAX_CLASS_BYTES + 1,
-                crate::kms::vk::mem_accounting::ChurnClass::Other,
-            )
-            .expect("oversize");
-        assert_eq!(oversize.origin, PoolOrigin::None, "not pooled");
-        assert_eq!(oversize.size, MAX_CLASS_BYTES + 1, "exact size");
-        assert_eq!(inner.upload_pool.stats().oversize, 1);
+        let before = thread_alloc_calls();
+        let v1: Vec<u8> = (0..36).collect();
+        let g: Vec<u8> = vec![0xA5; 3];
+        let v2: Vec<u8> = (100..140).collect();
+        let p1 = inner
+            .upload_to_frame(&v1, UPLOAD_VERTEX_ALIGN, ChurnClass::GlyphRun)
+            .expect("v1");
+        let pg = inner
+            .upload_to_frame(&g, copy_align, ChurnClass::GlyphUpload)
+            .expect("g");
+        let p2 = inner
+            .upload_to_frame(&v2, UPLOAD_VERTEX_ALIGN, ChurnClass::Traps)
+            .expect("v2");
+        assert_eq!(
+            thread_alloc_calls() - before,
+            1,
+            "three requests, one block"
+        );
+
+        let open = inner.frame_builder.open.as_ref().expect("open");
+        let slice =
+            |i: super::super::frame_builder::PinnedUploadIdx| open.pins.upload_slices[i.0 as usize];
+        let (s1, sg, s2) = (slice(p1), slice(pg), slice(p2));
+        assert_eq!(s1.buffer, sg.buffer);
+        assert_eq!(s1.buffer, s2.buffer);
+        assert_eq!(s1.offset, 0);
+        assert_eq!(sg.offset % copy_align, 0);
+        assert!(sg.offset >= 36);
+        assert_eq!(s2.offset % UPLOAD_VERTEX_ALIGN, 0);
+        assert!(s2.offset >= sg.offset + 3);
+        assert_eq!(open.pins.uploads.shared_len(), 1);
+        // The bytes are where the slices say.
+        let block = open.pins.uploads.block(Placement::Shared(0));
+        assert_eq!(block.buffer, s1.buffer);
+        assert_eq!(block.size, BLOCK_BYTES);
+        for (off, want) in [(s1.offset, &v1), (sg.offset, &g), (s2.offset, &v2)] {
+            let off = usize::try_from(off).expect("offset");
+            // SAFETY: the block is mapped for BLOCK_BYTES and the slice lies
+            // inside it; nothing else writes it.
+            let got =
+                unsafe { std::slice::from_raw_parts(block.mapped.as_ptr().add(off), want.len()) };
+            assert_eq!(got, want.as_slice());
+        }
+
+        // Oversize: a dedicated buffer at offset 0, the shared head untouched.
+        let big = vec![7u8; usize::try_from(BLOCK_BYTES).expect("size") + 1];
+        let before = thread_alloc_calls();
+        let pb = inner
+            .upload_to_frame(&big, UPLOAD_VERTEX_ALIGN, ChurnClass::Traps)
+            .expect("big");
+        let p3 = inner
+            .upload_to_frame(&v1, UPLOAD_VERTEX_ALIGN, ChurnClass::GlyphRun)
+            .expect("v3");
+        assert_eq!(
+            thread_alloc_calls() - before,
+            1,
+            "only the dedicated buffer"
+        );
+        let open = inner.frame_builder.open.as_ref().expect("open");
+        let sb = open.pins.upload_slices[pb.0 as usize];
+        let s3 = open.pins.upload_slices[p3.0 as usize];
+        assert_ne!(sb.buffer, s1.buffer);
+        assert_eq!(sb.offset, 0);
+        assert_eq!(open.pins.uploads.dedicated_len(), 1);
+        assert_eq!(s3.buffer, s1.buffer, "the shared block keeps filling");
+        assert!(s3.offset > s2.offset);
+        assert_eq!(open.pins.len(), 5, "one pin per request");
+
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut DrawableStore::new(), &mut platform)
+            .expect("close");
+        engine.drain_all(&mut platform);
     }
 
     /// `image_text`'s identical hole (`render/engine.rs:5954`'s
@@ -17672,15 +17802,17 @@ mod tests {
     /// first glyph and the right-hand quad never appears, so the two
     /// destinations differ. The two "must be painted" assertions keep
     /// the comparison from passing on two blank images.
-    /// #177: a glyph run's instance buffer is allocated and freed within
-    /// one telemetry period, so the live ledger (`vram by use`) never sees
-    /// it. The churn counters must: `glyph_run` gains an allocation and a
-    /// free sized for the run, and the formatted line shows a non-zero
-    /// rate. Other tests run in parallel against the same process-wide
-    /// ledger, so this asserts lower bounds only.
+    /// #177: a glyph run's instance data lives in an upload arena block
+    /// that is allocated and freed within one telemetry period here
+    /// (`drain_all` empties the idle list), so the live ledger (`vram by
+    /// use`) never sees it. The churn counters must: `upload_arena` gains a
+    /// block allocation and free, the arena counts a sub-allocation sized
+    /// for the run, and the formatted line shows non-zero rates. Other
+    /// tests run in parallel against the same process-wide counters, so
+    /// this asserts lower bounds only.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn a_glyph_run_instance_buffer_shows_in_churn_rates() {
+    fn a_glyph_run_upload_shows_in_churn_rates() {
         use crate::kms::vk::mem_accounting::{ChurnClass, churn_snapshot, format_churn_line};
         let Some(mut platform) = live_platform() else {
             eprintln!("no Vk — skipping");
@@ -17713,8 +17845,8 @@ mod tests {
                     None,
                 )
                 .expect("composite_glyphs");
-            // Closes the frame; `drain_all` then retires it, dropping the
-            // pinned instance buffer.
+            // Closes the frame; `drain_all` then retires it and frees its
+            // upload block.
             engine
                 .get_image(store, platform, Src::server_internal(target), full, 32)
                 .expect("get_image");
@@ -17729,30 +17861,42 @@ mod tests {
         let after = churn_snapshot();
 
         let (b, a) = (
-            before.class(ChurnClass::GlyphRun),
-            after.class(ChurnClass::GlyphRun),
+            before.class(ChurnClass::UploadArena),
+            after.class(ChurnClass::UploadArena),
         );
         let instance = std::mem::size_of::<crate::kms::vk::text_pipeline::GlyphInstanceData>();
-        assert!(a.allocs > b.allocs, "glyph run allocation not counted");
-        assert!(a.frees > b.frees, "glyph run free not counted");
+        assert!(a.allocs > b.allocs, "upload block allocation not counted");
+        assert!(a.frees > b.frees, "upload block free not counted");
+        let (br, ar) = (before.upload_arena, after.upload_arena);
         assert!(
-            a.alloc_bytes - b.alloc_bytes >= 2 * instance as u64,
+            ar.suballocs > br.suballocs,
+            "glyph run sub-allocation not counted"
+        );
+        assert!(
+            ar.suballoc_bytes - br.suballoc_bytes >= 2 * instance as u64,
             "glyph run bytes: {} < 2 instances",
-            a.alloc_bytes - b.alloc_bytes
+            ar.suballoc_bytes - br.suballoc_bytes
         );
         assert!(
             after.class(ChurnClass::Readback).frees > before.class(ChurnClass::Readback).frees,
             "get_image readback staging not counted"
         );
         let line = format_churn_line(&before, &after, 1.0, None);
-        let seg = line
-            .split(" glyph_run[")
-            .nth(1)
-            .and_then(|s| s.split(']').next())
-            .unwrap_or_else(|| panic!("no glyph_run segment: {line}"));
+        let seg = |name: &str| {
+            line.split(&format!(" {name}["))
+                .nth(1)
+                .and_then(|s| s.split(']').next())
+                .unwrap_or_else(|| panic!("no {name} segment: {line}"))
+                .to_owned()
+        };
+        let blocks = seg("upload_arena");
         assert!(
-            !seg.starts_with("alloc=0/s") && !seg.contains(" free=0/s"),
-            "rate line misses the churn: {line}"
+            !blocks.starts_with("alloc=0/s") && !blocks.contains(" free=0/s"),
+            "rate line misses the block churn: {line}"
+        );
+        assert!(
+            !seg("arena").contains(" sub=0/s"),
+            "rate line misses the sub-allocation: {line}"
         );
     }
 
@@ -18085,6 +18229,7 @@ mod tests {
                     atlas_extent,
                     pipeline,
                     buf.buffer,
+                    0,
                     // Range [1, 2): the SECOND instance only.
                     1,
                     1,

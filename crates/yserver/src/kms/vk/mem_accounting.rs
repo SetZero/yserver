@@ -114,6 +114,9 @@ pub enum ChurnClass {
     Traps,
     /// Glyph pixel upload staging on first use of a glyph.
     GlyphUpload,
+    /// Shared blocks of the per-frame upload arena. The four classes
+    /// above now only allocate for a request too large for a block.
+    UploadArena,
     /// PutImage upload staging allocated on a `StagingPool` miss.
     StagingPool,
     /// GetImage readback staging.
@@ -147,11 +150,12 @@ pub enum ChurnClass {
 
 impl ChurnClass {
     /// Every class, in log order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::GlyphRun,
         Self::ImageText,
         Self::Traps,
         Self::GlyphUpload,
+        Self::UploadArena,
         Self::StagingPool,
         Self::Readback,
         Self::StagingOther,
@@ -176,6 +180,7 @@ impl ChurnClass {
             Self::ImageText => "image_text",
             Self::Traps => "traps",
             Self::GlyphUpload => "glyph_upload",
+            Self::UploadArena => "upload_arena",
             Self::StagingPool => "staging_pool",
             Self::Readback => "readback",
             Self::StagingOther => "staging_other",
@@ -260,6 +265,22 @@ impl PoolCounters {
     }
 }
 
+/// Per-frame upload arena counters (#177). Block allocations and frees
+/// are ledger events under [`ChurnClass::UploadArena`]; these count what
+/// the ledger cannot see: sub-allocations, which allocate nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArenaCounters {
+    /// Requests served from a shared block, cumulative.
+    pub suballocs: u64,
+    /// Bytes of those requests, cumulative.
+    pub suballoc_bytes: u64,
+    /// Requests too large for a block, served by a dedicated allocation,
+    /// cumulative.
+    pub dedicated: u64,
+    /// Blocks on the idle list right now (a gauge, not a counter).
+    pub idle_blocks: u64,
+}
+
 /// Cumulative churn counters, indexed by [`ChurnClass::ALL`] order.
 /// Diff two with [`format_churn_line`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +288,8 @@ pub struct ChurnSnapshot {
     pub classes: [ChurnTally; ChurnClass::ALL.len()],
     /// The engine's PutImage `StagingPool`.
     pub staging_pool: PoolCounters,
+    /// The engine's per-frame upload arena.
+    pub upload_arena: ArenaCounters,
 }
 
 impl ChurnSnapshot {
@@ -462,6 +485,38 @@ fn staging_pool_counters() -> PoolCounters {
         misses: STAGING_POOL_MISSES.load(Ordering::Relaxed),
         kept: STAGING_POOL_KEPT.load(Ordering::Relaxed),
         dropped: STAGING_POOL_DROPPED.load(Ordering::Relaxed),
+    }
+}
+
+/// Per-frame upload arena counters (#177). Atomics for the same reason as
+/// the `StagingPool` ones: the arena is engine state.
+static ARENA_SUBALLOCS: AtomicU64 = AtomicU64::new(0);
+static ARENA_SUBALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static ARENA_DEDICATED: AtomicU64 = AtomicU64::new(0);
+static ARENA_IDLE_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one upload-arena request of `bytes` for `vram churn`:
+/// `dedicated` when it was too large for a block.
+pub fn note_upload_arena_request(bytes: u64, dedicated: bool) {
+    if dedicated {
+        ARENA_DEDICATED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ARENA_SUBALLOCS.fetch_add(1, Ordering::Relaxed);
+        ARENA_SUBALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Publish how many blocks sit on the upload arena's idle list.
+pub fn set_upload_arena_idle_blocks(blocks: usize) {
+    ARENA_IDLE_BLOCKS.store(blocks as u64, Ordering::Relaxed);
+}
+
+fn upload_arena_counters() -> ArenaCounters {
+    ArenaCounters {
+        suballocs: ARENA_SUBALLOCS.load(Ordering::Relaxed),
+        suballoc_bytes: ARENA_SUBALLOC_BYTES.load(Ordering::Relaxed),
+        dedicated: ARENA_DEDICATED.load(Ordering::Relaxed),
+        idle_blocks: ARENA_IDLE_BLOCKS.load(Ordering::Relaxed),
     }
 }
 
@@ -688,6 +743,7 @@ pub fn churn_snapshot() -> ChurnSnapshot {
     ChurnSnapshot {
         classes,
         staging_pool: staging_pool_counters(),
+        upload_arena: upload_arena_counters(),
     }
 }
 
@@ -695,8 +751,12 @@ pub fn churn_snapshot() -> ChurnSnapshot {
 /// class between `prev` and `cur` (taken `elapsed_secs` apart), each
 /// class's live count/bytes at `cur`, the total live `VkDeviceMemory`
 /// count (what libdrm's VA free-list cost scales with), and the reuse
-/// pools' hit/miss/keep/drop rates. `pixmap_pool` is the pixmap pool's
-/// counter delta over the same interval, when the pool exists.
+/// section: the `StagingPool`'s hit/miss/keep/drop rates, the upload
+/// arena's blocks (live, idle, allocated and freed per second) and the
+/// requests it served (sub-allocations per second and their bytes, and
+/// oversize requests that fell back to a dedicated allocation), and the
+/// pixmap pool's rates. `pixmap_pool` is the pixmap pool's counter delta
+/// over the same interval, when the pool exists.
 #[must_use]
 pub fn format_churn_line(
     prev: &ChurnSnapshot,
@@ -753,7 +813,7 @@ pub fn format_churn_line(
     );
     s.push_str(&body);
     s.push_str(" | reuse");
-    let mut pool = |name: &str, d: PoolCounters| {
+    let pool = |s: &mut String, name: &str, d: PoolCounters| {
         let _ = write!(
             s,
             " {name}[hit={:.0}/s miss={:.0}/s kept={:.0}/s dropped={:.0}/s]",
@@ -763,9 +823,30 @@ pub fn format_churn_line(
             per_s(d.dropped),
         );
     };
-    pool("staging", cur.staging_pool.since(&prev.staging_pool));
+    pool(
+        &mut s,
+        "staging",
+        cur.staging_pool.since(&prev.staging_pool),
+    );
+    let (pa, ca) = (
+        prev.class(ChurnClass::UploadArena),
+        cur.class(ChurnClass::UploadArena),
+    );
+    let (pr, cr) = (prev.upload_arena, cur.upload_arena);
+    let _ = write!(
+        s,
+        " arena[blocks={} idle={} block_alloc={:.0}/s block_free={:.0}/s sub={:.0}/s \
+         sub_in={:.2}MiB/s dedicated={:.0}/s]",
+        ca.live.count,
+        cr.idle_blocks,
+        per_s(ca.allocs.saturating_sub(pa.allocs)),
+        per_s(ca.frees.saturating_sub(pa.frees)),
+        per_s(cr.suballocs.saturating_sub(pr.suballocs)),
+        mib_s(cr.suballoc_bytes.saturating_sub(pr.suballoc_bytes)),
+        per_s(cr.dedicated.saturating_sub(pr.dedicated)),
+    );
     if let Some(d) = pixmap_pool {
-        pool("pixmap", d);
+        pool(&mut s, "pixmap", d);
     }
     s
 }
@@ -828,7 +909,7 @@ mod tests {
     fn churn_of(l: &Ledger) -> ChurnSnapshot {
         ChurnSnapshot {
             classes: l.churn,
-            staging_pool: PoolCounters::default(),
+            ..ChurnSnapshot::default()
         }
     }
 
@@ -941,6 +1022,52 @@ mod tests {
             prev.staging_pool.since(&cur.staging_pool),
             PoolCounters::default()
         );
+    }
+
+    #[test]
+    fn churn_line_reports_the_upload_arena() {
+        // Over 2 s: two blocks allocated, two freed, two live; 2 MiB
+        // served as 512 sub-allocations, and two oversize requests.
+        let mut l = Ledger::default();
+        for k in 0..2 {
+            l.alloc(
+                k,
+                ec(256 * 1024, MemCategory::Staging, ChurnClass::UploadArena),
+            );
+        }
+        let mut prev = churn_of(&l);
+        prev.upload_arena = ArenaCounters {
+            suballocs: 100,
+            suballoc_bytes: 4096,
+            dedicated: 7,
+            idle_blocks: 9,
+        };
+        for k in 2..4 {
+            l.alloc(
+                k,
+                ec(256 * 1024, MemCategory::Staging, ChurnClass::UploadArena),
+            );
+        }
+        l.free(0);
+        l.free(1);
+        let mut cur = churn_of(&l);
+        cur.upload_arena = ArenaCounters {
+            suballocs: 612,
+            suballoc_bytes: 4096 + 2 * 1024 * 1024,
+            dedicated: 9,
+            idle_blocks: 1,
+        };
+        let line = format_churn_line(&prev, &cur, 2.0, Some(PoolCounters::default()));
+        assert!(
+            line.contains(
+                " staging[hit=0/s miss=0/s kept=0/s dropped=0/s] arena[blocks=2 idle=1 \
+                 block_alloc=1/s block_free=1/s sub=256/s sub_in=1.00MiB/s dedicated=1/s] \
+                 pixmap["
+            ),
+            "{line}"
+        );
+        // The blocks are also an ordinary churn class.
+        assert!(line.contains(" upload_arena[alloc=1/s free=1/s "), "{line}");
     }
 
     #[test]

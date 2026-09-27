@@ -40124,13 +40124,16 @@ mod tests {
 
     /// #177: every glyph run and every trapezoid/triangle request used to
     /// `vkAllocateMemory` + `vkFreeMemory` its own 1–10 KiB instance/vertex
-    /// buffer — 85–96% of all alloc/free calls, and on RADV each free walks
-    /// libdrm's VA hole list. Once the retired buffers are back in the
-    /// size-classed pool, N requests across N frames must cost O(classes)
-    /// allocations, not O(N).
+    /// buffer — 85–96% of all alloc/free calls, and on RADV each allocation
+    /// and free walks libdrm's VA hole list. A text-heavy client issues many
+    /// such requests per frame (the reporter: glyph_run at 317/s average,
+    /// peaks of 3654/s, the size-classed pool pinned at its 64-entry cap).
+    /// With per-frame upload blocks, N requests per frame across many
+    /// frames must cost O(blocks) allocations — none in the steady state —
+    /// not O(requests).
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn glyph_and_trap_requests_reuse_upload_buffers_across_frames() {
+    fn glyph_and_trap_requests_share_upload_blocks_across_frames() {
         use crate::kms::vk::mem_accounting;
         use yserver_core::backend::{AnyHandle, Backend};
         let mut b = match KmsBackend::for_tests_with_vk() {
@@ -40203,7 +40206,7 @@ mod tests {
             b.platform.wait_idle_bounded();
             b.for_tests_poll_retired();
         }
-        let draw = |b: &mut KmsBackend| {
+        let draw_one = |b: &mut KmsBackend| {
             b.render_composite_glyphs(
                 None,
                 23,
@@ -40223,27 +40226,42 @@ mod tests {
                 .expect("render_trapezoids");
         };
 
+        // A text-heavy frame: more glyph runs and trapezoid requests than
+        // the old pool kept idle per size class (64).
+        const REQUESTS_PER_FRAME: usize = 100;
+        let draw = |b: &mut KmsBackend| {
+            for _ in 0..REQUESTS_PER_FRAME {
+                draw_one(b);
+            }
+        };
+
         // Warm-up: atlas, glyph upload, mask scratch, pipelines, and the
-        // first buffer of each size class.
+        // first upload block.
         for _ in 0..2 {
             draw(&mut b);
             settle(&mut b);
         }
 
-        const FRAMES: u64 = 32;
+        const FRAMES: u64 = 16;
         let before = mem_accounting::thread_alloc_calls();
         for _ in 0..FRAMES {
             draw(&mut b);
             settle(&mut b);
         }
         let allocs = mem_accounting::thread_alloc_calls() - before;
-        eprintln!("{FRAMES} frames × (1 glyph run + 1 trapezoid request): {allocs} allocations");
-        // Two requests per frame; the steady state reuses the buffers the
-        // warm-up returned. Pre-fix this is 2 × FRAMES.
+        eprintln!(
+            "{FRAMES} frames × {REQUESTS_PER_FRAME} × (glyph run + trapezoid request): \
+             {allocs} allocations"
+        );
+        // 200 small requests per frame fit one upload block, and each frame
+        // retires before the next opens, so the steady state reuses the
+        // warm-up's block. Per-request buffers make this O(requests): the
+        // size-classed pool, capped at 64 idle entries, reallocates the
+        // other 136 of every frame's 200.
         assert!(
             allocs <= 2,
-            "{allocs} vkAllocateMemory calls for {FRAMES} frames of glyph + trapezoid \
-             requests: per-request buffers are not being reused",
+            "{allocs} vkAllocateMemory calls for {FRAMES} frames of {REQUESTS_PER_FRAME} glyph \
+             runs + {REQUESTS_PER_FRAME} trapezoid requests: upload data is not sharing blocks",
         );
     }
 
