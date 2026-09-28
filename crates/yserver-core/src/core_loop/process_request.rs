@@ -1086,6 +1086,122 @@ pub fn redirect_subwindows_for_server(
     true
 }
 
+/// Resize a window for the server itself, as a window manager's
+/// `ConfigureWindow` would: the window, its backing and its children follow,
+/// and its client gets the `ConfigureNotify`. A client holding
+/// `SubstructureRedirect` on the window's parent gets a `ConfigureRequest`
+/// instead, as it would from any other client.
+///
+/// A rootless server uses it when the display system that shows its
+/// top-levels gives one a size: a Wayland compositor's
+/// `xdg_toplevel.configure`, for yserver's Wayland backend. A size of zero,
+/// which X refuses, does nothing.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn configure_window_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    // CWWidth | CWHeight, and their values in that order.
+    const CW_WIDTH_HEIGHT: u16 = 0x0004 | 0x0008;
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&CW_WIDTH_HEIGHT.to_le_bytes());
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(&u32::from(width).to_le_bytes());
+    body.extend_from_slice(&u32::from(height).to_le_bytes());
+    handle_configure_window(
+        state,
+        backend,
+        None,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
+/// Ask a window's client to close it, as a window manager does: a
+/// `WM_DELETE_WINDOW` `ClientMessage` when the window lists that protocol
+/// in `WM_PROTOCOLS` (ICCCM 4.2.8.1), and `KillClient` on the window's
+/// owner otherwise, which is what a window manager falls back to for a
+/// client that cannot be asked.
+///
+/// A rootless server uses it when the display system that shows its
+/// top-levels closes one: a Wayland compositor's `xdg_toplevel.close`, for
+/// yserver's Wayland backend.
+///
+/// # Errors
+///
+/// As the requests' handlers.
+pub fn close_window_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+) -> io::Result<()> {
+    let delete = state.atoms.id_for("WM_DELETE_WINDOW");
+    let asks = state
+        .atoms
+        .id_for("WM_PROTOCOLS")
+        .zip(delete)
+        .filter(|(protocols, delete)| {
+            state
+                .resources
+                .window(window)
+                .and_then(|w| w.properties.get(protocols))
+                .is_some_and(|value| {
+                    value
+                        .data
+                        .chunks_exact(4)
+                        .any(|atom| atom == delete.0.to_le_bytes())
+                })
+        });
+    if let Some((protocols, delete)) = asks {
+        // SendEvent(propagate = false, destination = the window, no event
+        // mask: to the window's creator), carrying a ClientMessage of
+        // format 32: WM_PROTOCOLS, then WM_DELETE_WINDOW and CurrentTime.
+        let mut body = Vec::with_capacity(40);
+        body.extend_from_slice(&window.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let mut event = [0u8; 32];
+        event[0] = 33; // ClientMessage
+        event[1] = 32; // format
+        event[4..8].copy_from_slice(&window.0.to_le_bytes());
+        event[8..12].copy_from_slice(&protocols.0.to_le_bytes());
+        event[12..16].copy_from_slice(&delete.0.to_le_bytes());
+        body.extend_from_slice(&event);
+        let header = RequestHeader {
+            opcode: 25,
+            data: 0,
+            length_units: 11,
+        };
+        return handle_send_event(
+            state,
+            crate::resources::SERVER_OWNER,
+            SequenceNumber(0),
+            header,
+            &body,
+        )
+        .map(drop);
+    }
+    handle_kill_client(
+        state,
+        backend,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &window.0.to_le_bytes(),
+    )
+    .map(drop)
+}
+
 /// Stage 4b.8: same-owner mode-flip handler. When a client
 /// re-issues `Redirect{Window,Subwindows}(W, new_mode)` while it
 /// already owns a record at the same key with a different mode,
@@ -51953,6 +52069,109 @@ mod tests {
             vec![(0, 178, 178, 122)]
         );
         assert!(exposed_by_grow((485, 726), (178, 178)).is_empty());
+    }
+
+    /// A root child of client 1, 100x50, with a host xid.
+    fn server_helper_window(state: &mut ServerState) -> ResourceId {
+        const WINDOW_XID: u32 = 0x0010_0030;
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                width: 100,
+                height: 50,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x0040_0030));
+        }
+        ResourceId(WINDOW_XID)
+    }
+
+    /// A compositor's size for a top-level reaches the window and its
+    /// client, as a window manager's `ConfigureWindow` would.
+    #[test]
+    fn configure_window_for_server_resizes_and_tells_the_client() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = server_helper_window(&mut state);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client 1")
+            .event_masks
+            .insert(window, 0x0002_0000); // StructureNotify
+        let _ = read_all_available(&mut peer);
+
+        configure_window_for_server(&mut state, &mut backend, window, 640, 480).expect("configure");
+        let size = state.resources.window(window).map(|w| (w.width, w.height));
+        assert_eq!(size, Some((640, 480)));
+        let out = read_all_available(&mut peer);
+        assert!(
+            out.chunks(32).any(|event| event[0] & 0x7f == 22),
+            "the client is sent a ConfigureNotify"
+        );
+
+        // Zero, which X refuses, changes nothing.
+        configure_window_for_server(&mut state, &mut backend, window, 0, 480).expect("configure");
+        let size = state.resources.window(window).map(|w| (w.width, w.height));
+        assert_eq!(size, Some((640, 480)));
+    }
+
+    /// Closing a window that speaks `WM_DELETE_WINDOW` asks its client.
+    #[test]
+    fn close_window_for_server_sends_wm_delete_window() {
+        use crate::properties::{PropertyFormat, PropertyValue};
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = server_helper_window(&mut state);
+        let protocols = state.atoms.intern("WM_PROTOCOLS", false);
+        let delete = state.atoms.intern("WM_DELETE_WINDOW", false);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.properties.insert(
+                protocols,
+                PropertyValue {
+                    r#type: AtomId(4), // ATOM
+                    format: PropertyFormat::F32,
+                    data: delete.0.to_le_bytes().to_vec(),
+                },
+            );
+        }
+        let _ = read_all_available(&mut peer);
+
+        close_window_for_server(&mut state, &mut backend, window).expect("close");
+        let out = read_all_available(&mut peer);
+        let message = out
+            .chunks(32)
+            .find(|event| event[0] & 0x7f == 33)
+            .expect("a ClientMessage");
+        assert_eq!(&message[4..8], &window.0.to_le_bytes());
+        assert_eq!(&message[8..12], &protocols.0.to_le_bytes());
+        assert_eq!(&message[12..16], &delete.0.to_le_bytes());
+        assert!(
+            state.clients.contains_key(&1),
+            "the client is asked, not killed"
+        );
+    }
+
+    /// Closing a window whose client cannot be asked disconnects it.
+    #[test]
+    fn close_window_for_server_kills_a_client_that_cannot_be_asked() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = server_helper_window(&mut state);
+
+        close_window_for_server(&mut state, &mut backend, window).expect("close");
+        assert!(!state.clients.contains_key(&1), "the client is gone");
     }
 
     /// A compositor subscribes to DAMAGE on the `NameWindowPixmap`

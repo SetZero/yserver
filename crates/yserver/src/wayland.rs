@@ -78,7 +78,29 @@ use yserver_core::{
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, ROOT_WINDOW, Window, WindowClass},
     server::ServerState,
 };
-use yserver_protocol::x11::AtomId;
+use yserver_protocol::x11::{AtomId, ResourceId};
+
+/// What the compositor asked of an X window, which the server carries out
+/// with its state in hand (`KmsBackend::sync_wayland`, through
+/// `yserver_core`'s `configure_window_for_server` and
+/// `close_window_for_server`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// `xdg_toplevel.configure` with a size the window does not have.
+    Resize {
+        /// The X window.
+        window: ResourceId,
+        /// Its new width.
+        width: u16,
+        /// Its new height.
+        height: u16,
+    },
+    /// `xdg_toplevel.close`.
+    Close {
+        /// The X window.
+        window: ResourceId,
+    },
+}
 
 mod input;
 pub use input::CursorSource;
@@ -111,6 +133,14 @@ struct Toplevel {
     shown: Option<u64>,
     /// The compositor configured it since it was last drawn.
     configured: bool,
+    /// The size the compositor's last configure gave, not yet asked of the
+    /// X window.
+    resize: Option<(u32, u32)>,
+    /// The compositor asked to close it, not yet passed on.
+    close: bool,
+    /// The host XID of the window it was last made a dialog of
+    /// (`WM_TRANSIENT_FOR`).
+    parent: Option<u32>,
 }
 
 /// The connection, what the compositor has said about its screens, and the
@@ -123,6 +153,8 @@ pub struct WaylandLink {
     renamed: HashSet<u32>,
     /// The keyboard and the pointer ([`input`]).
     seat: input::Seat,
+    /// What the compositor asked, for the server to carry out.
+    requests: Vec<Request>,
 }
 
 impl WaylandLink {
@@ -142,6 +174,7 @@ impl WaylandLink {
             toplevels: HashMap::new(),
             renamed: HashSet::new(),
             seat: input::Seat::default(),
+            requests: Vec::new(),
         })
     }
 
@@ -194,13 +227,20 @@ impl WaylandLink {
                     toplevel.frame_pending = false;
                 }
             }
-            Event::Configure { surface, .. } => {
+            Event::Configure {
+                surface,
+                width,
+                height,
+            } => {
                 if let Some(toplevel) = self.by_surface(surface) {
                     toplevel.configured = true;
+                    toplevel.resize = Some((width, height));
                 }
             }
             Event::CloseRequested(surface) => {
-                log::info!("wayland: the compositor asked to close {surface:?}; not yet done");
+                if let Some(toplevel) = self.by_surface(surface) {
+                    toplevel.close = true;
+                }
             }
             other => log::debug!("wayland: {other:?}"),
         }
@@ -220,11 +260,17 @@ impl WaylandLink {
         }
     }
 
+    /// What the compositor asked since the last call, for the server to
+    /// carry out.
+    pub fn take_requests(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.requests)
+    }
+
     /// Bring the compositor's windows in line with the X server's
     /// top-levels, and hand over each image that changed and whose last
     /// frame the compositor has shown. Once per loop iteration.
     pub fn sync(&mut self, state: &ServerState, images: &mut dyn WindowImages) {
-        let wanted: Vec<(u32, &Window)> = state
+        let mut wanted: Vec<(u32, &Window)> = state
             .resources
             .children(ROOT_WINDOW)
             .iter()
@@ -234,6 +280,10 @@ impl WaylandLink {
                 is_toplevel(child, window).then_some((host_xid, window))
             })
             .collect();
+        // Dialogs after the windows they belong to, so that a dialog is
+        // made with its parent in hand: the compositor decides at the first
+        // commit whether a window floats.
+        wanted.sort_by_key(|(_, window)| transient_for(state, window).is_some());
 
         let client = &mut self.client;
         self.toplevels.retain(|host_xid, toplevel| {
@@ -246,6 +296,13 @@ impl WaylandLink {
         });
 
         for &(host_xid, window) in &wanted {
+            // The window it is a dialog of, when that is one of the
+            // compositor's windows already.
+            let parent = transient_for(state, window)
+                .filter(|parent| *parent != host_xid && self.toplevels.contains_key(parent));
+            let parent_surface = parent
+                .and_then(|parent| self.toplevels.get(&parent))
+                .map(|parent| parent.surface);
             let toplevel = match self.toplevels.entry(host_xid) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -254,6 +311,7 @@ impl WaylandLink {
                         title: title.clone(),
                         app_id: app_id.clone(),
                         size: (u32::from(window.width), u32::from(window.height)),
+                        parent: parent_surface,
                     };
                     match self.client.toplevel(&options) {
                         Ok(surface) => {
@@ -270,6 +328,9 @@ impl WaylandLink {
                                 frame_pending: false,
                                 shown: None,
                                 configured: false,
+                                resize: None,
+                                close: false,
+                                parent,
                             })
                         }
                         Err(error) => {
@@ -279,6 +340,12 @@ impl WaylandLink {
                     }
                 }
             };
+
+            // A window made a dialog, or no longer one, after it mapped.
+            if parent != toplevel.parent {
+                toplevel.parent = parent;
+                self.client.set_parent(toplevel.surface, parent_surface);
+            }
 
             if self.renamed.contains(&host_xid) {
                 let (title, app_id) = names(state, window);
@@ -290,6 +357,22 @@ impl WaylandLink {
                     self.client.set_app_id(toplevel.surface, &app_id);
                     toplevel.app_id = app_id;
                 }
+            }
+
+            // What the compositor asked, carried out by the server after
+            // this.
+            if let Some((width, height)) = toplevel.resize.take()
+                && (width, height) != (u32::from(window.width), u32::from(window.height))
+            {
+                self.requests.push(Request::Resize {
+                    window: window.id,
+                    width: u16::try_from(width).unwrap_or(u16::MAX),
+                    height: u16::try_from(height).unwrap_or(u16::MAX),
+                });
+            }
+            if std::mem::take(&mut toplevel.close) {
+                log::info!("wayland: the compositor closes window 0x{host_xid:x}");
+                self.requests.push(Request::Close { window: window.id });
             }
 
             if toplevel.frame_pending || self.client.size(toplevel.surface).is_none() {
@@ -304,7 +387,10 @@ impl WaylandLink {
             };
             let opaque = window.depth != 32;
             let (width, height) = (window.width, window.height);
-            match self.client.draw(toplevel.surface, |pixmap| {
+            // At the window's own size: until the X window has taken a size
+            // the compositor asked for, it shows at the one it has.
+            let size = (u32::from(width), u32::from(height));
+            match self.client.draw_sized(toplevel.surface, size, |pixmap| {
                 blit(pixmap, &pixels, width, height, opaque);
             }) {
                 Ok(true) => {
@@ -339,6 +425,19 @@ fn is_toplevel(id: yserver_protocol::x11::ResourceId, window: &Window) -> bool {
         && !window.override_redirect
         && window.width > 0
         && window.height > 0
+}
+
+/// The host XID of the window `window` is a dialog of: `WM_TRANSIENT_FOR`
+/// (ICCCM 4.1.2.6), when it names a window that has one.
+fn transient_for(state: &ServerState, window: &Window) -> Option<u32> {
+    let atom = state.atoms.id_for("WM_TRANSIENT_FOR")?;
+    let data = window.properties.get(&atom)?.data.get(0..4)?;
+    let id = u32::from_le_bytes(data.try_into().ok()?);
+    let parent = state.resources.window(ResourceId(id))?;
+    (parent.id != window.id)
+        .then_some(parent.host_xid)
+        .flatten()
+        .map(|host| host.as_raw())
 }
 
 /// Whether `property` is one [`names`] reads.
