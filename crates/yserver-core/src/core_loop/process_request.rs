@@ -1038,6 +1038,54 @@ fn activate_redirect_backing_for(
     }
 }
 
+/// Redirect every child of `parent` for the server itself: the record a
+/// client's `RedirectSubwindows(parent, mode)` would make, owned by
+/// `SERVER_OWNER`, so no disconnect tears it down. Children that exist now
+/// get their backings at once; later ones get theirs as they map, through
+/// the hooks a client's redirect goes through.
+///
+/// A rootless server whose top-level windows another display system shows
+/// (yserver's Wayland backend, where each is a Wayland window) needs each
+/// top-level's whole subtree in one image it can read back, and that is what
+/// a redirect backing holds. Xwayland redirects its top-levels for its own
+/// `serverClient` for the same reason.
+///
+/// Cheap when the record is there already, so it may be called on every
+/// loop iteration, which also puts it back after a server reset. Returns
+/// whether the server's record is in place: `false` when a client
+/// redirected `parent`'s children first, which is left alone, or when the
+/// backend cannot redirect.
+pub fn redirect_subwindows_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    parent: ResourceId,
+    mode: crate::server::CompositeRedirectMode,
+) -> bool {
+    let key = (parent, true);
+    if let Some(record) = state.composite_redirects.get(&key) {
+        return record.owner == crate::resources::SERVER_OWNER;
+    }
+    if !backend.supports_redirect_activation() {
+        return false;
+    }
+    state.composite_redirects.insert(
+        key,
+        crate::server::RedirectRecord {
+            mode,
+            owner: crate::resources::SERVER_OWNER,
+        },
+    );
+    debug!(
+        "the server redirects the children of 0x{:x} ({mode:?})",
+        parent.0
+    );
+    let children = state.resources.children(parent).to_vec();
+    for child in children {
+        activate_redirect_backing_for(state, backend, None, child, mode);
+    }
+    true
+}
+
 /// Stage 4b.8: same-owner mode-flip handler. When a client
 /// re-issues `Redirect{Window,Subwindows}(W, new_mode)` while it
 /// already owns a record at the same key with a different mode,
@@ -51648,6 +51696,86 @@ mod tests {
             "redirect activation on an already-mapped window must emit an initial \
              full damage wakeup so compositors pull the seeded backing immediately",
         );
+    }
+
+    /// The server's own `RedirectSubwindows(root)`: installed once, owned by
+    /// the server, backing the root's existing children, and never taken
+    /// over from a client that redirected them first.
+    #[test]
+    fn redirect_subwindows_for_server_backs_existing_children_once() {
+        use crate::server::{CompositeRedirectMode, RedirectRecord};
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0020;
+        const HOST_XID: u32 = 0x0040_0020;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new().with_redirect_activation();
+        state.resources.create_window(
+            ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                width: 100,
+                height: 50,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        let root = crate::resources::ROOT_WINDOW;
+        assert!(redirect_subwindows_for_server(
+            &mut state,
+            &mut backend,
+            root,
+            CompositeRedirectMode::Manual
+        ));
+        let record = state.composite_redirects.get(&(root, true)).copied();
+        assert!(record.is_some_and(|r| r.owner == crate::resources::SERVER_OWNER));
+        let backing = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing.as_ref().map(|b| b.host_pixmap));
+        assert!(
+            backing.is_some(),
+            "an existing child gets its backing at once"
+        );
+
+        // Again: nothing new is allocated.
+        assert!(redirect_subwindows_for_server(
+            &mut state,
+            &mut backend,
+            root,
+            CompositeRedirectMode::Manual
+        ));
+        let again = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing.as_ref().map(|b| b.host_pixmap));
+        assert_eq!(backing, again);
+
+        // A client's record is left alone.
+        state.composite_redirects.insert(
+            (root, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Automatic,
+                owner: ClientId(CLIENT_ID),
+            },
+        );
+        assert!(!redirect_subwindows_for_server(
+            &mut state,
+            &mut backend,
+            root,
+            CompositeRedirectMode::Manual
+        ));
+        let kept = state.composite_redirects.get(&(root, true)).copied();
+        assert!(kept.is_some_and(|r| r.owner == ClientId(CLIENT_ID)));
     }
 
     /// A compositor subscribes to DAMAGE on the `NameWindowPixmap`
