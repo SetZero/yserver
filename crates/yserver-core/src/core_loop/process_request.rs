@@ -163,6 +163,17 @@ pub fn process_request(
     // Pre-F2 the legacy `nested::handle_client` did this after each
     // `handle_request`; run_core's path needs the same store, but
     // earlier — before any fanout helper reads the counter.
+    // One line per request, `RUST_LOG=yreq=trace`: which requests a
+    // client makes, including the extension minors no handler logs.
+    log::trace!(
+        target: "yreq",
+        "req client={} seq={} major={} minor={} len={}",
+        client_id.0,
+        sequence.0,
+        header.opcode,
+        header.data,
+        header.length_units
+    );
     if let Some(client) = state.clients.get(&client_id.0) {
         client
             .last_sequence

@@ -516,6 +516,18 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     if wayland {
         backend.attach_wayland(crate::wayland::WaylandLink::connect()?)?;
     }
+    // A zero-card headless server with a fixed screen, for running X
+    // clients without a display (Steam on the host: the Steam spike).
+    #[cfg(feature = "wayland")]
+    if !wayland
+        && device_paths.is_empty()
+        && let Some((w, h)) = std::env::var("YSERVER_HEADLESS_SIZE").ok().and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
+        })
+    {
+        backend.attach_headless_size(w, h)?;
+    }
     // One snapshot of everything `ServerState` needs from the live
     // backend — screen extent, RandR outputs/modes/providers, backend
     // capabilities. The server-reset boundary re-derives a generation

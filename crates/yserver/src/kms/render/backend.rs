@@ -1719,6 +1719,11 @@ pub struct KmsBackend {
     /// could, which was said once (`sync_wayland`).
     #[cfg(feature = "wayland")]
     wayland_redirect_refused: bool,
+
+    /// Headless with a fixed screen (`YSERVER_HEADLESS_SIZE`): the Wayland
+    /// backend's one synthetic output, without a compositor.
+    #[cfg(feature = "wayland")]
+    headless_output: bool,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.
@@ -5325,6 +5330,8 @@ impl KmsBackend {
             #[cfg(feature = "wayland")]
             wayland_randr_ids: None,
             #[cfg(feature = "wayland")]
+            headless_output: false,
+            #[cfg(feature = "wayland")]
             wayland_redirect_refused: false,
         };
         // Validate every route already committed during platform bring-up,
@@ -6279,6 +6286,8 @@ impl KmsBackend {
             wayland: None,
             #[cfg(feature = "wayland")]
             wayland_randr_ids: None,
+            #[cfg(feature = "wayland")]
+            headless_output: false,
             #[cfg(feature = "wayland")]
             wayland_redirect_refused: false,
         };
@@ -8143,6 +8152,22 @@ impl KmsBackend {
         self.wayland = Some(link);
     }
 
+    /// Headless with a fixed virtual screen of `width` x `height`, shown
+    /// as the Wayland backend's one synthetic RandR output
+    /// (`YSERVER_HEADLESS_SIZE=WxH`). Without it a zero-card headless
+    /// server's root is 0x0.
+    ///
+    /// # Errors
+    ///
+    /// Resizing the virtual screen failing.
+    #[cfg(feature = "wayland")]
+    pub fn attach_headless_size(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.apply_virtual_screen_extent(width, height)?;
+        self.headless_output = true;
+        log::info!("headless: fixed virtual screen {width}x{height}");
+        Ok(())
+    }
+
     /// The Wayland backend's RandR topology: one connected output,
     /// `WAYLAND-1`, covering the virtual screen, which is the compositor's
     /// screen (`attach_wayland`). The X screen's size is derived from the
@@ -8735,7 +8760,7 @@ impl KmsBackend {
         use yserver_core::randr::{RandrMode, RandrOutput};
 
         #[cfg(feature = "wayland")]
-        if self.wayland.is_some() {
+        if self.wayland.is_some() || self.headless_output {
             return self.wayland_randr_outputs_and_modes();
         }
 
@@ -9026,7 +9051,7 @@ impl KmsBackend {
         // list from RandR finds no screen (Chromium, so Steam's webhelper:
         // "CreateOutputWindow: Could not find display info").
         #[cfg(feature = "wayland")]
-        if self.wayland.is_some()
+        if (self.wayland.is_some() || self.headless_output)
             && let Some((output_id, crtc_id, _)) = self.wayland_randr_ids
         {
             associations.push((output_id, crtc_id));
