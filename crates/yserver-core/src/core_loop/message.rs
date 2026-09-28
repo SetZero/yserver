@@ -150,6 +150,9 @@ pub enum Message {
         byte_order: ClientByteOrder,
         is_local: bool,
         fd_passing: bool,
+        /// The setup reply bytes the client received, for RECORD's
+        /// ClientStarted.
+        setup_reply: Vec<u8>,
     },
     /// One framed X11 request from a client reader thread.
     Request {

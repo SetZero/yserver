@@ -1367,6 +1367,8 @@ pub struct ServerState {
     /// fair request queue keeps its later requests queued until the entry
     /// is removed — the await fired, or the client left.
     pub sync_awaits: HashMap<u32, SyncAwait>,
+    /// RECORD contexts (`core_loop::record`).
+    pub record: crate::core_loop::record::RecordState,
     /// SERVERTIME value last evaluated against alarms and awaits; the
     /// post-poll pass feeds `(last, now)` through the trigger tests the way
     /// Xorg's `ServertimeWakeupHandler` calls `SyncChangeCounter`.
@@ -1646,6 +1648,7 @@ impl ServerState {
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
             sync_awaits: HashMap::new(),
+            record: crate::core_loop::record::RecordState::default(),
             sync_servertime_last: None,
             repeat_state: None,
             dpms: DpmsState::new(false),
@@ -1948,7 +1951,7 @@ impl ServerState {
 
     /// True iff `id` designates ANY live resource in ANY client-XID
     /// namespace: the 9 ResourceTable maps (via
-    /// `resources.xid_in_use`) plus the 10 extension maps that
+    /// `resources.xid_in_use`) plus the 11 extension maps that
     /// `xid_in_use` does NOT cover. XC-MISC must never report an
     /// occupied id as free — extend this (and the
     /// `xid_occupied_covers_every_namespace` test) when adding an
@@ -1967,10 +1970,11 @@ impl ServerState {
             || self.glx_contexts.contains_key(&id)
             || self.glx_drawables.contains_key(&id)
             || self.present_event_selections.contains_key(&id)
+            || self.record.contains(id)
     }
 
     /// Sorted, deduped list of occupied XIDs in `base..=base|mask`
-    /// across all 19 namespaces. O(total live resources) — called
+    /// across all 20 namespaces. O(total live resources) — called
     /// only on the rare XC-MISC GetXIDRange path.
     #[must_use]
     pub fn used_xids_in(&self, base: u32, mask: u32) -> Vec<u32> {
@@ -1987,6 +1991,7 @@ impl ServerState {
         out.extend(self.glx_contexts.keys().filter(in_range));
         out.extend(self.glx_drawables.keys().filter(in_range));
         out.extend(self.present_event_selections.keys().filter(in_range));
+        out.extend(self.record.ids().filter(|id| (*id & !mask) == base));
         out.sort_unstable();
         out.dedup();
         out
@@ -6392,7 +6397,7 @@ mod tests {
         );
         expect.push(id_dri3_syncobj);
 
-        // ── 10 ServerState extension namespaces ──
+        // ── 11 ServerState extension namespaces ──
 
         // 9. xfixes_regions
         let id_xfixes = base + 10;
@@ -6527,6 +6532,11 @@ mod tests {
         );
         expect.push(id_present);
 
+        // 19. record contexts
+        let id_record = base + 20;
+        state.record.insert_for_test(id_record, owner);
+        expect.push(id_record);
+
         // ── assertions ──
 
         for id in &expect {
@@ -6534,7 +6544,7 @@ mod tests {
         }
         assert_eq!(
             expect.len(),
-            19,
+            20,
             "one seed per namespace — update when adding namespaces"
         );
         assert!(!state.xid_occupied(base + 100), "unseeded id must be free");

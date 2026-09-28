@@ -550,6 +550,32 @@ fn pointer_event_fanout_to_state_inner(
     // Step 1 — translate host-screen coords to ynest-root coords.
     let event = translate_host_event(state, xid_map, event);
 
+    // RECORD sees each physical pointer event once, before grabs and
+    // delivery, and not again when a frozen queue replays it (Xorg
+    // `ProcessDeviceEvent` skips the callback while playingEvents).
+    if !suppress_raw && !state.playing_sync_events {
+        let event_type = match event.kind {
+            PointerEventKind::ButtonPress => Some(4),
+            PointerEventKind::ButtonRelease => Some(5),
+            PointerEventKind::MotionNotify => Some(6),
+            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => None,
+        };
+        if let Some(event_type) = event_type {
+            crate::core_loop::record::record_device_event(
+                state,
+                crate::core_loop::record::RecordedDeviceEvent {
+                    event_type,
+                    detail: if event_type == 6 { 0 } else { event.detail },
+                    repeat: false,
+                    time: event.time,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    state: event.state,
+                },
+            );
+        }
+    }
+
     if matches!(event.kind, PointerEventKind::MotionNotify) {
         const MOTION_HISTORY_CAPACITY: usize = 256;
         if state.pointer_motion_history.len() == MOTION_HISTORY_CAPACITY {

@@ -19143,6 +19143,23 @@ impl Backend for KmsBackend {
                 } else {
                     self.core.down_keys.remove(&cooked.keycode);
                 }
+                // RECORD sees an autorepeat as a flagged press with no
+                // release, as Xorg generates it.
+                let repeat = matches!(ev, HostInputEvent::KeyRepeat(_));
+                if !(repeat && !cooked.pressed) {
+                    yserver_core::core_loop::record::record_device_event(
+                        state,
+                        yserver_core::core_loop::record::RecordedDeviceEvent {
+                            event_type: if cooked.pressed { 2 } else { 3 },
+                            detail: cooked.keycode,
+                            repeat,
+                            time: cooked.time,
+                            root_x: cooked.root_x,
+                            root_y: cooked.root_y,
+                            state: cooked.state,
+                        },
+                    );
+                }
                 let _dropped = key_event_fanout_to_state(state, self, cooked);
                 return;
             }
@@ -37267,6 +37284,57 @@ mod tests {
             .map(|e| e.0)
             .collect();
         assert_eq!(kinds, vec![13, 2, 3, 2, 14, 3]);
+    }
+
+    /// RECORD records an autorepeat as Xorg generates it: a press flagged
+    /// in the sequence field and no release (`record-probe repeat l` on
+    /// Xvfb: `02260000`, then presses with seqfield 1, then `03260000`).
+    #[test]
+    fn record_sees_autorepeat_as_flagged_presses() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
+        };
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, 5);
+        // CreateContext(ctx 1, FutureClients, device events 2..3), then
+        // EnableContext on the same connection.
+        let mut create = Vec::new();
+        for word in [1u32, 0, 1, 1, 2] {
+            create.extend_from_slice(&word.to_le_bytes());
+        }
+        create.extend_from_slice(&[0; 18]);
+        create.extend_from_slice(&[2, 3, 0, 0, 0, 0]);
+        kbd_map_request(&mut state, &mut b, 154, 1, &create);
+        kbd_map_request(&mut state, &mut b, 154, 5, &1u32.to_le_bytes());
+        let ev = |pressed| HostKeyEvent {
+            keycode: 38,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        b.on_host_input(&mut state, HostInputEvent::Key(ev(true)));
+        b.on_host_input(&mut state, HostInputEvent::KeyRepeat(ev(false)));
+        b.on_host_input(&mut state, HostInputEvent::KeyRepeat(ev(true)));
+        b.on_host_input(&mut state, HostInputEvent::Key(ev(false)));
+
+        let bytes = kbd_map_drain(&mut peer);
+        let mut recorded = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len =
+                32 + 4 * u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if bytes[at] == 1 && bytes[at + 1] == 0 {
+                let event = &bytes[at + 32..at + len];
+                recorded.push((event[0], event[1], u16::from_le_bytes([event[2], event[3]])));
+            }
+            at += len;
+        }
+        assert_eq!(recorded, [(2, 38, 0), (2, 38, 1), (3, 38, 0)]);
     }
 
     /// Test A: a compiled `grp:alt_shift_toggle` option makes the
