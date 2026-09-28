@@ -143,6 +143,11 @@ fn run_setup(
     is_local: bool,
     fd_passing: bool,
 ) -> io::Result<()> {
+    // The handshake reads with a timeout, which needs a blocking socket. An
+    // accepted socket is blocking on Linux, but a kernel that hands it the
+    // listener's O_NONBLOCK would make the first read fail with EAGAIN and
+    // drop the client ("unable to open display"), so say it.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
 
