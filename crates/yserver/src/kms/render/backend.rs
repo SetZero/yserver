@@ -18414,23 +18414,33 @@ impl crate::wayland::WindowImages for KmsBackend {
             .map(|drawable| drawable.content_version)
     }
 
-    fn read_image(&mut self, host_xid: u32, width: u16, height: u16) -> Option<Vec<u8>> {
+    fn read_image(
+        &mut self,
+        host_xid: u32,
+        width: u16,
+        height: u16,
+        border: u16,
+    ) -> Option<Vec<u8>> {
         let target = self.resolve_paint_target(host_xid)?;
         let depth = target.x11_depth();
         if depth != 24 && depth != 32 {
             return None;
         }
-        // The content, inside the border: `get_image`'s rectangle at the
-        // window's own origin.
+        // The content, and `border` pixels of the border around it:
+        // `get_image`'s rectangle at the window's own origin, less the
+        // border, which the backing holds around the content.
+        let border = u32::from(border);
+        let (width, height) = (
+            u32::from(width) + 2 * border,
+            u32::from(height) + 2 * border,
+        );
+        let inset = i32::try_from(border).unwrap_or(0);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
-                x: target.offset().0,
-                y: target.offset().1,
+                x: target.offset().0 - inset,
+                y: target.offset().1 - inset,
             },
-            extent: ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
-            },
+            extent: ash::vk::Extent2D { width, height },
         };
         let readback = self.engine.get_image(
             &mut self.store,
@@ -18444,7 +18454,7 @@ impl crate::wayland::WindowImages for KmsBackend {
             Ok(mut bytes) => {
                 // Short only while a resize is under way: pad, as
                 // `get_image` does, so the rows stay where they belong.
-                bytes.resize(usize::from(width) * usize::from(height) * 4, 0);
+                bytes.resize(width as usize * height as usize * 4, 0);
                 Some(bytes)
             }
             Err(error) => {

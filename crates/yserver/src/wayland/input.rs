@@ -147,13 +147,15 @@ impl WaylandLink {
         }
     }
 
-    /// The X top-level the compositor's window `surface` is, if it still is
-    /// one.
+    /// The compositor's window the pointer is on, if any.
+    pub(super) fn pointer_surface(&self) -> Option<SurfaceId> {
+        self.seat.pointer
+    }
+
+    /// The X window the compositor's window or popup `surface` is, if it
+    /// still is one.
     fn window_of(&self, state: &ServerState, surface: SurfaceId) -> Option<ResourceId> {
-        let (&host_xid, _) = self
-            .toplevels
-            .iter()
-            .find(|(_, toplevel)| toplevel.surface == surface)?;
+        let host_xid = self.host_xid_of(surface)?;
         state
             .resources
             .children(ROOT_WINDOW)

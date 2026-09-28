@@ -103,6 +103,7 @@ pub enum Request {
 }
 
 mod input;
+mod popups;
 pub use input::CursorSource;
 
 /// What the link needs of the renderer: each top-level's image, by the
@@ -112,27 +113,44 @@ pub trait WindowImages {
     /// image; `None` for a window the renderer does not know.
     fn image_version(&self, host_xid: u32) -> Option<u64>;
 
-    /// The window's image, `width` × `height` pixels without its border, each
-    /// four bytes in memory order B, G, R and alpha (unused below depth 32):
-    /// an X `ZPixmap` at 32 bits per pixel.
-    fn read_image(&mut self, host_xid: u32, width: u16, height: u16) -> Option<Vec<u8>>;
+    /// The window's image, its `width` × `height` content with `border`
+    /// pixels of its border around it (0 for none), each four bytes in
+    /// memory order B, G, R and alpha (unused below depth 32): an X
+    /// `ZPixmap` at 32 bits per pixel.
+    fn read_image(
+        &mut self,
+        host_xid: u32,
+        width: u16,
+        height: u16,
+        border: u16,
+    ) -> Option<Vec<u8>>;
+}
+
+/// Where a window of the compositor's is in drawing it: the frame callback
+/// it waits for and the image it last showed.
+#[derive(Debug, Default)]
+struct Frames {
+    /// A frame callback was asked for and has not come.
+    pending: bool,
+    /// The [`WindowImages::image_version`] last drawn.
+    shown: Option<u64>,
+    /// The compositor configured it since it was last drawn.
+    configured: bool,
 }
 
 /// A top-level X window as the compositor's window.
 #[derive(Debug)]
 struct Toplevel {
+    /// The X window.
+    window: ResourceId,
     /// The compositor's window.
     surface: SurfaceId,
     /// What it was last given.
     title: String,
     /// What it was last given.
     app_id: String,
-    /// A frame callback was asked for and has not come.
-    frame_pending: bool,
-    /// The [`WindowImages::image_version`] last drawn.
-    shown: Option<u64>,
-    /// The compositor configured it since it was last drawn.
-    configured: bool,
+    /// Its frames.
+    frames: Frames,
     /// The size the compositor's last configure gave, not yet asked of the
     /// X window.
     resize: Option<(u32, u32)>,
@@ -155,6 +173,13 @@ pub struct WaylandLink {
     seat: input::Seat,
     /// What the compositor asked, for the server to carry out.
     requests: Vec<Request>,
+    /// Override-redirect windows as the compositor's popups, in the order
+    /// they were made, which a child popup is after its parent in
+    /// ([`popups`]).
+    popups: Vec<popups::Popup>,
+    /// Host XIDs of popups the compositor took away (`popup_done`), not
+    /// made again until their X window unmaps.
+    dismissed: HashSet<u32>,
 }
 
 impl WaylandLink {
@@ -175,6 +200,8 @@ impl WaylandLink {
             renamed: HashSet::new(),
             seat: input::Seat::default(),
             requests: Vec::new(),
+            popups: Vec::new(),
+            dismissed: HashSet::new(),
         })
     }
 
@@ -223,8 +250,8 @@ impl WaylandLink {
         };
         match event {
             Event::Frame { surface, .. } => {
-                if let Some(toplevel) = self.by_surface(surface) {
-                    toplevel.frame_pending = false;
+                if let Some(frames) = self.frames_of(surface) {
+                    frames.pending = false;
                 }
             }
             Event::Configure {
@@ -233,10 +260,13 @@ impl WaylandLink {
                 height,
             } => {
                 if let Some(toplevel) = self.by_surface(surface) {
-                    toplevel.configured = true;
                     toplevel.resize = Some((width, height));
                 }
+                if let Some(frames) = self.frames_of(surface) {
+                    frames.configured = true;
+                }
             }
+            Event::Closed(surface) => self.popup_dismissed(surface),
             Event::CloseRequested(surface) => {
                 if let Some(toplevel) = self.by_surface(surface) {
                     toplevel.close = true;
@@ -250,6 +280,38 @@ impl WaylandLink {
         self.toplevels
             .values_mut()
             .find(|toplevel| toplevel.surface == surface)
+    }
+
+    /// The frames of the window or popup `surface` is.
+    fn frames_of(&mut self, surface: SurfaceId) -> Option<&mut Frames> {
+        let Self {
+            toplevels, popups, ..
+        } = self;
+        toplevels
+            .values_mut()
+            .find(|toplevel| toplevel.surface == surface)
+            .map(|toplevel| &mut toplevel.frames)
+            .or_else(|| {
+                popups
+                    .iter_mut()
+                    .find(|popup| popup.surface == surface)
+                    .map(|popup| &mut popup.frames)
+            })
+    }
+
+    /// The host XID of the X window the compositor's window or popup
+    /// `surface` shows.
+    pub(crate) fn host_xid_of(&self, surface: SurfaceId) -> Option<u32> {
+        self.toplevels
+            .iter()
+            .find(|(_, toplevel)| toplevel.surface == surface)
+            .map(|(&host_xid, _)| host_xid)
+            .or_else(|| {
+                self.popups
+                    .iter()
+                    .find(|popup| popup.surface == surface)
+                    .map(|popup| popup.host_xid)
+            })
     }
 
     /// A window's title or class may have changed: `property` was set or
@@ -284,6 +346,11 @@ impl WaylandLink {
         // made with its parent in hand: the compositor decides at the first
         // commit whether a window floats.
         wanted.sort_by_key(|(_, window)| transient_for(state, window).is_some());
+
+        // Popups go before the windows they hang from, and a child popup
+        // before its parent.
+        let kept: HashSet<u32> = wanted.iter().map(|&(host_xid, _)| host_xid).collect();
+        self.retire_popups(state, &kept);
 
         let client = &mut self.client;
         self.toplevels.retain(|host_xid, toplevel| {
@@ -322,12 +389,11 @@ impl WaylandLink {
                                 window.height,
                             );
                             entry.insert(Toplevel {
+                                window: window.id,
                                 surface,
                                 title,
                                 app_id,
-                                frame_pending: false,
-                                shown: None,
-                                configured: false,
+                                frames: Frames::default(),
                                 resize: None,
                                 close: false,
                                 parent,
@@ -375,34 +441,16 @@ impl WaylandLink {
                 self.requests.push(Request::Close { window: window.id });
             }
 
-            if toplevel.frame_pending || self.client.size(toplevel.surface).is_none() {
-                continue;
-            }
-            let version = images.image_version(host_xid);
-            if version.is_some() && version == toplevel.shown && !toplevel.configured {
-                continue;
-            }
-            let Some(pixels) = images.read_image(host_xid, window.width, window.height) else {
-                continue;
-            };
-            let opaque = window.depth != 32;
-            let (width, height) = (window.width, window.height);
-            // At the window's own size: until the X window has taken a size
-            // the compositor asked for, it shows at the one it has.
-            let size = (u32::from(width), u32::from(height));
-            match self.client.draw_sized(toplevel.surface, size, |pixmap| {
-                blit(pixmap, &pixels, width, height, opaque);
-            }) {
-                Ok(true) => {
-                    self.client.request_frame(toplevel.surface);
-                    toplevel.frame_pending = true;
-                    toplevel.shown = version;
-                    toplevel.configured = false;
-                }
-                Ok(false) => {}
-                Err(error) => log::warn!("wayland: drawing 0x{host_xid:x}: {error}"),
-            }
+            show(
+                &mut self.client,
+                images,
+                toplevel.surface,
+                (host_xid, window),
+                &mut toplevel.frames,
+                false,
+            );
         }
+        self.show_popups(state, images);
         self.renamed.clear();
         self.flush();
     }
@@ -412,6 +460,53 @@ impl WaylandLink {
         if let Err(error) = self.client.flush() {
             log::warn!("wayland: flush: {error}");
         }
+    }
+}
+
+/// Hand the compositor `window`'s image when it changed and its last frame
+/// has been shown, at the window's own size: until the X window has taken a
+/// size the compositor asked for, it shows at the one it has.
+///
+/// A window with `bordered` is shown with its X border around it: an
+/// override-redirect window, whose border X shows as its own since no
+/// window manager draws one. A top-level's border is not shown, as a window
+/// manager's frame would take its place.
+fn show(
+    client: &mut Client,
+    images: &mut dyn WindowImages,
+    surface: SurfaceId,
+    (host_xid, window): (u32, &Window),
+    frames: &mut Frames,
+    bordered: bool,
+) {
+    if frames.pending || client.size(surface).is_none() {
+        return;
+    }
+    let version = images.image_version(host_xid);
+    if version.is_some() && version == frames.shown && !frames.configured {
+        return;
+    }
+    let border = if bordered { window.border_width } else { 0 };
+    let (width, height) = (
+        window.width.saturating_add(border.saturating_mul(2)),
+        window.height.saturating_add(border.saturating_mul(2)),
+    );
+    let Some(pixels) = images.read_image(host_xid, window.width, window.height, border) else {
+        return;
+    };
+    let opaque = window.depth != 32;
+    let size = (u32::from(width), u32::from(height));
+    match client.draw_sized(surface, size, |pixmap| {
+        blit(pixmap, &pixels, width, height, opaque);
+    }) {
+        Ok(true) => {
+            client.request_frame(surface);
+            frames.pending = true;
+            frames.shown = version;
+            frames.configured = false;
+        }
+        Ok(false) => {}
+        Err(error) => log::warn!("wayland: drawing 0x{host_xid:x}: {error}"),
     }
 }
 
