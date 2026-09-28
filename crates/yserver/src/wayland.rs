@@ -29,10 +29,12 @@
 //! The title is `_NET_WM_NAME`, or `WM_NAME`; the app id is `WM_CLASS`'s
 //! class, what a window rule matches. Both follow the properties.
 //!
-//! Not yet: override-redirect windows (menus, as popups), input, and the
-//! compositor's own size and close for a window (docs/YSERVER.md, Y4 and
-//! Y5). Until then an X window keeps the size its client gave it, drawn at
-//! the top left of the window the compositor tiles, on black.
+//! The seat -- keys, pointer, wheel, focus and cursor -- is [`input`]'s.
+//!
+//! Not yet: override-redirect windows (menus, as popups), and the
+//! compositor's own size and close for a window (docs/YSERVER.md, Y5).
+//! Until then an X window keeps the size its client gave it, drawn at the
+//! top left of the window the compositor tiles, on black.
 //!
 //! # Layout
 //!
@@ -41,33 +43,45 @@
 //! `KmsBackend` (`kms/render/backend.rs`), each piece behind
 //! `feature = "wayland"`:
 //!
-//! * `KmsBackend::attach_wayland` takes the [`WaylandLink`] at startup;
+//! * `KmsBackend::attach_wayland` takes the [`WaylandLink`] at startup, and
+//!   the compositor's keyboard layout for the server's keymap;
 //! * `Backend::on_wayland_ready` calls [`WaylandLink::dispatch`], which
-//!   hands each [`Event`] to `WaylandLink::handle` -- where the compositor's
-//!   input will go;
+//!   hands each [`Event`] to `WaylandLink::handle`, where the seat's events
+//!   are kept, then [`WaylandLink::deliver_input`], which hands them to X
+//!   ([`input`]);
 //! * `Backend::poll_deferred_input` calls `KmsBackend::sync_wayland` once
 //!   per loop iteration: the server's own redirect of the root's children
 //!   (`yserver_core`'s `redirect_subwindows_for_server`), then
-//!   [`WaylandLink::sync`];
+//!   [`WaylandLink::sync`] and [`WaylandLink::sync_cursor`];
 //! * `Backend::on_window_property_changed` calls
 //!   [`WaylandLink::property_changed`];
-//! * `impl WindowImages for KmsBackend` reads a window back.
+//! * `impl WindowImages for KmsBackend` reads a window back, and
+//!   `impl CursorSource for KmsBackend` gives the cursor in effect.
+//!
+//! Two core pieces serve the seat: `ServerState::pointer_scope`, which keeps
+//! the pointer's hit test to the top-level the compositor has it on, and
+//! `set_input_focus_for_server` in `process_request.rs`, the server's own
+//! SetInputFocus for the keyboard's enter and leave.
 //!
 //! A top-level is keyed by its X window's host XID ([`WaylandLink`]'s
 //! `toplevels`), and `WaylandLink::by_surface` finds one from the
 //! compositor's side.
 
-use std::collections::{HashMap, HashSet};
-use std::io;
-use std::time::Duration;
-
-use compositor_toolkit::tiny_skia::PixmapMut;
-use compositor_toolkit::{Client, Event, SurfaceId, ToplevelOptions};
-use yserver_core::resources::{
-    COMPOSITE_OVERLAY_WINDOW, MapState, ROOT_WINDOW, Window, WindowClass,
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    time::Duration,
 };
-use yserver_core::server::ServerState;
+
+use compositor_toolkit::{Client, Event, SurfaceId, ToplevelOptions, tiny_skia::PixmapMut};
+use yserver_core::{
+    resources::{COMPOSITE_OVERLAY_WINDOW, MapState, ROOT_WINDOW, Window, WindowClass},
+    server::ServerState,
+};
 use yserver_protocol::x11::AtomId;
+
+mod input;
+pub use input::CursorSource;
 
 /// What the link needs of the renderer: each top-level's image, by the
 /// window's host XID.
@@ -107,6 +121,8 @@ pub struct WaylandLink {
     toplevels: HashMap<u32, Toplevel>,
     /// Host XIDs whose title or class changed since the last sync.
     renamed: HashSet<u32>,
+    /// The keyboard and the pointer ([`input`]).
+    seat: input::Seat,
 }
 
 impl WaylandLink {
@@ -125,6 +141,7 @@ impl WaylandLink {
             client,
             toplevels: HashMap::new(),
             renamed: HashSet::new(),
+            seat: input::Seat::default(),
         })
     }
 
@@ -168,6 +185,9 @@ impl WaylandLink {
     }
 
     fn handle(&mut self, event: Event) {
+        let Some(event) = self.seat.take(event) else {
+            return;
+        };
         match event {
             Event::Frame { surface, .. } => {
                 if let Some(toplevel) = self.by_surface(surface) {

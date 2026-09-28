@@ -290,6 +290,22 @@ pub struct Xi1ActiveGrab {
     pub passive_detail: Option<u8>,
 }
 
+/// Where the pointer may hit windows, for a rootless server whose
+/// top-levels are windows of a host compositor (the Wayland backend). The
+/// host says which of its windows the pointer is over, and X top-levels
+/// can overlap in root coordinates where the host shows them apart, so the
+/// hit test keeps to that one — Xwayland's `xwl_xy_to_window`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PointerScope {
+    /// Every window, as on a server that owns the screen.
+    #[default]
+    Anywhere,
+    /// The pointer is over none of this server's windows: the root.
+    Nowhere,
+    /// The pointer is over this top-level and nothing else of ours.
+    Within(ResourceId),
+}
+
 /// Core keyboard focus state — Xorg `FocusClassRec` (win/revert/time)
 /// for the virtual core keyboard.
 #[derive(Debug, Clone, Copy)]
@@ -1025,6 +1041,9 @@ pub struct ServerState {
     /// (Xorg `ConfineCursorToWindow`). The pointer fanout clamps
     /// motion to this window's rectangle.
     pub pointer_confine_to: ResourceId,
+    /// Which windows the pointer can hit ([`PointerScope`]); `Anywhere`
+    /// unless a rootless backend narrows it.
+    pub pointer_scope: PointerScope,
     /// Currently-pressed pointer buttons, bit b-1 for button b —
     /// fills the button half of the core event state for synthetic
     /// (XTest) events and gates passive-grab activation ("no other
@@ -1449,6 +1468,7 @@ impl ServerState {
             last_xkb_group: 0,
             last_xkb_mods: 0,
             pointer_confine_to: ResourceId(0),
+            pointer_scope: PointerScope::Anywhere,
             buttons_down: 0,
             confine_warp_active: false,
             barrier_bypass: false,
@@ -2380,7 +2400,18 @@ impl ServerState {
 
     #[must_use]
     pub fn root_pointer_target_at(&self, x: i16, y: i16) -> Option<(ResourceId, i16, i16)> {
-        self.pointer_target_at(ROOT_WINDOW, x, y)
+        match self.pointer_scope {
+            PointerScope::Anywhere => self.pointer_target_at(ROOT_WINDOW, x, y),
+            PointerScope::Nowhere => Some((ROOT_WINDOW, x, y)),
+            PointerScope::Within(top_level) => {
+                let Some(hit) = self.hit_test_child(top_level, x, y) else {
+                    return Some((ROOT_WINDOW, x, y));
+                };
+                let mut best = hit;
+                self.pointer_target_at_inner(hit.0, hit.1, hit.2, &mut best);
+                Some(best)
+            }
+        }
     }
 
     #[must_use]
@@ -5274,6 +5305,64 @@ mod tests {
             target, sib,
             "empty COW input shape must let clicks through to sibling below"
         );
+    }
+
+    #[test]
+    fn a_pointer_scope_keeps_the_hit_test_to_one_top_level() {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        // Two top-levels over each other at the root's origin, as two X
+        // windows a compositor shows side by side are; `upper` is on top.
+        let lower = ResourceId(0x0010_0080);
+        let upper = ResourceId(0x0010_0081);
+        let child = ResourceId(0x0010_0082);
+        for (window, parent, x) in [
+            (lower, ROOT_WINDOW, 0),
+            (upper, ROOT_WINDOW, 0),
+            (child, lower, 20),
+        ] {
+            state.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x,
+                    y: x,
+                    width: if parent == ROOT_WINDOW { 200 } else { 50 },
+                    height: if parent == ROOT_WINDOW { 100 } else { 50 },
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(window);
+        }
+
+        let at = |state: &ServerState, x, y| state.root_pointer_target_at(x, y);
+        assert_eq!(
+            at(&state, 30, 30),
+            Some((upper, 30, 30)),
+            "anywhere: the upper one"
+        );
+
+        state.pointer_scope = PointerScope::Within(lower);
+        assert_eq!(
+            at(&state, 30, 30),
+            Some((child, 10, 10)),
+            "within the lower one: its child, under the upper one"
+        );
+        assert_eq!(
+            at(&state, 300, 30),
+            Some((ROOT_WINDOW, 300, 30)),
+            "outside the one the pointer is on: the root"
+        );
+
+        state.pointer_scope = PointerScope::Nowhere;
+        assert_eq!(at(&state, 30, 30), Some((ROOT_WINDOW, 30, 30)));
     }
 
     // ---- #133 step 8 (P9): border-inclusive input ----------------

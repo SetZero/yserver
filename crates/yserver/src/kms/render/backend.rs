@@ -8104,7 +8104,8 @@ impl KmsBackend {
     ///
     /// Resizing the virtual screen failing.
     #[cfg(feature = "wayland")]
-    pub fn attach_wayland(&mut self, link: crate::wayland::WaylandLink) -> io::Result<()> {
+    pub fn attach_wayland(&mut self, mut link: crate::wayland::WaylandLink) -> io::Result<()> {
+        link.adopt_keyboard_layout(&mut self.core);
         if let Some((width, height)) = link.screen_size() {
             self.apply_virtual_screen_extent(width, height)?;
             log::info!("wayland: the root window is the compositor's screen, {width}x{height}");
@@ -8140,6 +8141,7 @@ impl KmsBackend {
             return;
         };
         link.sync(state, self);
+        link.sync_cursor(self);
         self.wayland = Some(link);
     }
 
@@ -18333,6 +18335,19 @@ fn dri3_import_supported_for_topology(
     selected_renderer != RenderDeviceId::UnverifiedFallback || kms_device_count <= 1
 }
 
+/// The cursor in effect, for the Wayland backend to give the compositor.
+#[cfg(feature = "wayland")]
+impl crate::wayland::CursorSource for KmsBackend {
+    fn cursor_key(&self) -> Option<(u32, u64)> {
+        let xid = self.effective_cursor_xid?;
+        Some((xid, self.cursor_records.get(&xid)?.version))
+    }
+
+    fn cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
+        Backend::get_active_cursor_image(self)
+    }
+}
+
 /// Each top-level's image for the Wayland backend: the window read through
 /// its redirect routing, which under the server's own redirect of the root's
 /// children is its backing, subwindows included.
@@ -20775,12 +20790,13 @@ impl Backend for KmsBackend {
     }
 
     #[cfg(feature = "wayland")]
-    fn on_wayland_ready(&mut self, _state: &mut ServerState) -> bool {
-        let Some(link) = self.wayland.as_mut() else {
+    fn on_wayland_ready(&mut self, state: &mut ServerState) -> bool {
+        let Some(mut link) = self.wayland.take() else {
             return true;
         };
-        match link.dispatch() {
+        let alive = match link.dispatch() {
             Ok(()) => {
+                link.deliver_input(state, self);
                 link.flush();
                 true
             }
@@ -20788,7 +20804,9 @@ impl Backend for KmsBackend {
                 log::warn!("wayland: {error}");
                 false
             }
-        }
+        };
+        self.wayland = Some(link);
+        alive
     }
 
     #[cfg(feature = "wayland")]

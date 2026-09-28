@@ -25868,44 +25868,86 @@ fn handle_set_input_focus(
             state.debug_client_label(client_id),
             state.debug_window_label(window),
         );
-        let from_raw = state.core_focus.raw;
-        let to_raw = window.0;
-        if from_raw != to_raw {
-            // Xorg SetInputFocus (dix/events.c:4923): the focus transition
-            // is reported NotifyWhileGrabbed (3) while a keyboard grab is
-            // active, else NotifyNormal (0). bspwm focuses a newly-mapped
-            // window WHILE sxhkd's synchronous passive key grab is still
-            // active; emitting NotifyNormal there told GLFW/kitty it had
-            // genuinely taken focus mid-grab, and its focus state machine
-            // then ignored every typed key (the keys still routed
-            // correctly to its window — only the FocusIn mode was wrong).
-            // Mirrors the same gate in `revert_core_focus_from`.
-            let mode = if state.active_keyboard_grab.is_some() {
-                3 // NotifyWhileGrabbed
-            } else {
-                0 // NotifyNormal
-            };
-            emit_core_focus_transition(state, from_raw, to_raw, mode);
-        }
-        state.core_focus = crate::server::CoreFocus {
-            raw: to_raw,
+        apply_core_focus(
+            state,
+            window.0,
             revert_to,
-            time: if time == 0 { now } else { time },
-        };
-        // Legacy mirror — the key fanout's `current_focus` and other
-        // readers still consult the per-client field; None/PointerRoot
-        // map to ROOT_WINDOW there (the fanout resolves PointerRoot
-        // through `state.core_focus` directly).
-        let mirror = match to_raw {
-            0 | 1 => ROOT_WINDOW,
-            w => ResourceId(w),
-        };
-        for c in state.clients.values_mut() {
-            c.focused_window = mirror;
-        }
+            if time == 0 { now } else { time },
+        );
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// Move the core keyboard focus to `to_raw` (0 None, 1 PointerRoot, else a
+/// window), with the FocusOut/FocusIn chain when it changes: what a
+/// validated SetInputFocus does.
+fn apply_core_focus(state: &mut ServerState, to_raw: u32, revert_to: u8, time: u32) {
+    let from_raw = state.core_focus.raw;
+    if from_raw != to_raw {
+        // Xorg SetInputFocus (dix/events.c:4923): the focus transition
+        // is reported NotifyWhileGrabbed (3) while a keyboard grab is
+        // active, else NotifyNormal (0). bspwm focuses a newly-mapped
+        // window WHILE sxhkd's synchronous passive key grab is still
+        // active; emitting NotifyNormal there told GLFW/kitty it had
+        // genuinely taken focus mid-grab, and its focus state machine
+        // then ignored every typed key (the keys still routed
+        // correctly to its window — only the FocusIn mode was wrong).
+        // Mirrors the same gate in `revert_core_focus_from`.
+        let mode = if state.active_keyboard_grab.is_some() {
+            3 // NotifyWhileGrabbed
+        } else {
+            0 // NotifyNormal
+        };
+        emit_core_focus_transition(state, from_raw, to_raw, mode);
+    }
+    state.core_focus = crate::server::CoreFocus {
+        raw: to_raw,
+        revert_to,
+        time,
+    };
+    // Legacy mirror — the key fanout's `current_focus` and other
+    // readers still consult the per-client field; None/PointerRoot
+    // map to ROOT_WINDOW there (the fanout resolves PointerRoot
+    // through `state.core_focus` directly).
+    let mirror = match to_raw {
+        0 | 1 => ROOT_WINDOW,
+        w => ResourceId(w),
+    };
+    for c in state.clients.values_mut() {
+        c.focused_window = mirror;
+    }
+}
+
+/// The server's own SetInputFocus, for a backend whose host decides the
+/// focus: a rootless server gives its top-level the focus when the host's
+/// keyboard enters that window, as the window manager would, and takes it
+/// away (`None`) when the keyboard leaves. `window` is `None` for None; a
+/// window that is gone or not viewable is refused, as the request would be.
+/// The focus reverts to PointerRoot if the window goes.
+///
+/// Returns whether the focus is now where it was asked to be.
+pub fn set_input_focus_for_server(state: &mut ServerState, window: Option<ResourceId>) -> bool {
+    let to_raw = match window {
+        None => 0,
+        Some(window) => {
+            let viewable = state
+                .resources
+                .window(window)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+            if !viewable {
+                return false;
+            }
+            window.0
+        }
+    };
+    let time = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.core_focus.time);
+    let revert_to = if to_raw == 0 { 0 } else { 1 };
+    apply_core_focus(state, to_raw, revert_to, time);
+    true
 }
 
 /// Focus revert when the focus window (or an ancestor) becomes
@@ -40819,6 +40861,67 @@ mod tests {
     /// focus mid-grab and then ignore every typed key (the KeyPress
     /// events still routed correctly to its window). Mirrors the gate
     /// already present in `revert_core_focus_from`.
+    /// The server's own focus (a rootless backend's keyboard enter and
+    /// leave) moves the focus as SetInputFocus does, with the events, and
+    /// refuses a window that is not viewable.
+    #[test]
+    fn the_server_gives_the_focus_to_a_window_and_takes_it_away() {
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 72;
+        const WIN: u32 = 0x0072_0001;
+        const HIDDEN: u32 = 0x0072_0002;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT);
+        for win in [WIN, HIDDEN] {
+            state.resources.create_window(
+                ClientId(CLIENT),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(win),
+                    parent: ROOT_WINDOW,
+                    width: 200,
+                    height: 100,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(state.resources.map_window(ResourceId(WIN)));
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(WIN), FOCUS_CHANGE_MASK);
+
+        assert!(!set_input_focus_for_server(
+            &mut state,
+            Some(ResourceId(HIDDEN))
+        ));
+        assert_eq!(state.core_focus.raw, 1, "still PointerRoot");
+
+        assert!(set_input_focus_for_server(
+            &mut state,
+            Some(ResourceId(WIN))
+        ));
+        assert_eq!(state.core_focus.raw, WIN);
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.chunks_exact(32).any(|event| event[0] & 0x7f == 9),
+            "FocusIn on the window"
+        );
+
+        assert!(set_input_focus_for_server(&mut state, None));
+        assert_eq!(state.core_focus.raw, 0, "None");
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.chunks_exact(32).any(|event| event[0] & 0x7f == 10),
+            "FocusOut from the window"
+        );
+    }
+
     #[test]
     fn set_input_focus_during_keyboard_grab_is_notify_while_grabbed() {
         use crate::server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource};
