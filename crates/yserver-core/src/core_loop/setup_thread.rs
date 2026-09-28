@@ -22,7 +22,7 @@
 
 use std::{
     collections::HashMap,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Write},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -216,8 +216,7 @@ fn run_setup(
         .max(1)
         .min(u32::from(u16::MAX)) as u16;
 
-    x11::write_setup_success(
-        &mut stream,
+    let setup_reply = x11::encode_setup_success(
         setup.byte_order,
         x11::SetupSuccess {
             protocol_major: setup.protocol_major,
@@ -259,6 +258,7 @@ fn run_setup(
             },
         },
     )?;
+    stream.write_all(&setup_reply)?;
 
     // Clear timeouts before handing the stream to the core; the reader
     // thread (C3) treats EAGAIN as "wait on poll(2) and retry", but
@@ -277,6 +277,7 @@ fn run_setup(
         byte_order: setup.byte_order,
         is_local,
         fd_passing,
+        setup_reply,
     })?;
     Ok(())
 }

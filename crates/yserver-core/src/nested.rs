@@ -24,7 +24,7 @@ use crate::{host_x11::HostX11Backend, server::ServerState};
 // Current allocation (error counts in parens):
 //   RANDR 147 (5) · RENDER 152 (5) · XInput 157 (5) · [host XKB 162 (1)]
 //   · XFIXES 163 (1) · SYNC 164 (3) · DAMAGE 167 (1) · MIT-SHM 168 (1)
-//   · GLX 169 (13, →181) · XFree86-VidMode 182 (7, →188).
+//   · GLX 169 (13, →181) · XFree86-VidMode 182 (7, →188) · RECORD 189 (1).
 //   SHAPE/Composite/Present/DPMS/screensaver: 0.
 // Do NOT pack these 1 apart — a multi-error extension (RENDER=5, GLX=13)
 // would then overlap its neighbours.
@@ -108,6 +108,9 @@ pub(crate) const GLX_FIRST_ERROR: u8 = 169; // 13 errors (169-181); routed past 
 pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
 pub(crate) const XF86VIDMODE_MAJOR_OPCODE: u8 = 153;
 pub(crate) const XF86VIDMODE_FIRST_ERROR: u8 = 182;
+
+pub(crate) const RECORD_MAJOR_OPCODE: u8 = 154;
+pub(crate) const RECORD_FIRST_ERROR: u8 = 189;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
@@ -336,6 +339,15 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: 0,
         event_count: 0,
         first_error: XF86VIDMODE_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "RECORD",
+        major_opcode: RECORD_MAJOR_OPCODE,
+        first_event: 0,
+        event_count: 0,
+        first_error: RECORD_FIRST_ERROR, // 1 error: BadContext
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
@@ -1022,6 +1034,17 @@ mod tests {
         assert_eq!(ext.major_opcode, 153);
         assert_eq!(ext.first_event, 0);
         assert_eq!(ext.first_error, 182);
+    }
+
+    #[test]
+    fn record_is_advertised_with_its_error() {
+        let ext = EXTENSIONS
+            .iter()
+            .find(|ext| ext.name == "RECORD")
+            .expect("RECORD in EXTENSIONS");
+        assert_eq!(ext.major_opcode, 154);
+        assert_eq!(ext.first_event, 0);
+        assert_eq!(ext.first_error, 189);
     }
 
     mod render {

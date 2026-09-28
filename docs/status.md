@@ -33,6 +33,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-28 RECORD 1.13, partial (#180, branch `feat/180-record`):**
+  advertised (major 154, first error 189) so python-xlib/pynput find it.
+  All eight requests with Xorg's validation order and GetContext range
+  rebuild (`core_loop/record.rs`, wire in `x11::record`). Recorded: core
+  device events KeyPress..MotionNotify (once, before grabs, not on replay;
+  autorepeat as a press with the sequence field set, no release),
+  ClientStarted (the setup bytes the client got) and ClientDied. Request,
+  reply, error and delivered-event ranges are accepted, validated, stored and
+  returned by GetContext but NOT recorded yet; XI1 device events neither. The
+  enabling client is suspended via `client_runnable`; a data connection whose
+  write fails (incl. `OUTBOUND_CAP`) stops recording and is disconnected from
+  the core loop (`take_failed_recorders`). Ground truth:
+  `tools/record-probe.c` on Xvfb 21.1.24; vng A/B
+  (`tools/vng-scenarios/record-host.sh yserver|xorg`) matches apart from the
+  items below. Deviations: one reply per element (Xorg batches), zeroed pads,
+  stale Xorg error values sent as 0, ClientDied rec seq is the 16-bit client
+  sequence, retained clients' contexts are freed, the nested backend records
+  host autorepeat as release+press pairs. Pre-existing, not RECORD: XTEST-held
+  keys do not autorepeat on yserver (XTEST bypasses the repeat timer). Xorg
+  and Xvfb 21.1 abort (`free(): invalid pointer`) in the server reset after
+  the probe's `basic` scenario, so run Xvfb with `-noreset`.
 - **2026-09-26 XI2 raw key events (#173, branch `fix/173-xi2-raw-keys`):**
   `XI_RawKeyPress` / `XI_RawKeyRelease` were never generated (only the pointer
   path had raw events), so global-hotkey clients selecting them on the root

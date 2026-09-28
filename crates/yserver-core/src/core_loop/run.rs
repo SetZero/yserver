@@ -792,8 +792,9 @@ pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
 }
 
 /// A client's queued requests may be dispatched unless it waits on
-/// asynchronous backend work or a SYNC `Await` / `AwaitFence` suspended it
-/// (Xorg `IgnoreClient`). Either way its requests keep their order and
+/// asynchronous backend work, a SYNC `Await` / `AwaitFence` suspended it, or
+/// it is the data connection of an enabled RECORD context (Xorg
+/// `IgnoreClient`). Either way its requests keep their order and
 /// every other client keeps running.
 fn client_runnable(
     pending: &PendingBackendRequests,
@@ -802,6 +803,7 @@ fn client_runnable(
 ) -> bool {
     !pending.client_is_blocked(client)
         && !crate::core_loop::sync_await::client_is_suspended(state, client)
+        && !crate::core_loop::record::client_blocks_requests(state, client)
 }
 
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
@@ -1556,6 +1558,7 @@ pub fn run_core(
                                 byte_order,
                                 is_local,
                                 fd_passing,
+                                setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
                                     poll.registry(),
@@ -1570,6 +1573,7 @@ pub fn run_core(
                                     byte_order,
                                     is_local,
                                     fd_passing,
+                                    &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
                                     disconnect_with_pending_cleanup(
@@ -1818,6 +1822,17 @@ pub fn run_core(
         // reregister errors that mean "fd already deregistered" so a
         // disconnect that ran during this iteration doesn't break
         // the next one.
+        // RECORD data connections whose stream write failed (queued, since
+        // the write can happen inside another client's disconnect).
+        for disc_id in crate::core_loop::record::take_failed_recorders(state) {
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                &mut pending_backend_requests,
+                &mut reset_trigger,
+                disc_id,
+            );
+        }
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
             disconnect_with_pending_cleanup(
                 state,
@@ -2391,6 +2406,18 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
             }
             HostEvent::Key(ev) => {
                 use crate::core_loop::key_fanout::key_event_fanout_to_state;
+                crate::core_loop::record::record_device_event(
+                    state,
+                    crate::core_loop::record::RecordedDeviceEvent {
+                        event_type: if ev.pressed { 2 } else { 3 },
+                        detail: ev.keycode,
+                        repeat: false,
+                        time: ev.time,
+                        root_x: ev.root_x,
+                        root_y: ev.root_y,
+                        state: ev.state,
+                    },
+                );
                 let _dropped = key_event_fanout_to_state(state, backend, ev);
             }
             HostEvent::Configure(ev) => {
@@ -3297,6 +3324,7 @@ fn handle_client_setup_complete(
     byte_order: yserver_protocol::x11::ClientByteOrder,
     is_local: bool,
     fd_passing: bool,
+    setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     let writer = stream.try_clone()?;
@@ -3378,6 +3406,9 @@ fn handle_client_setup_complete(
         transport_label,
         if fd_passing { "on" } else { "off" },
     );
+    // Xorg's ClientStateRunning callback: FutureClients contexts take the
+    // client on, and enabled ones record its setup reply.
+    crate::core_loop::record::client_started(state, id, setup_reply);
 
     // Reaching here is what "ESTABLISHED" means: the poller registration
     // and the reader spawn have both succeeded, so the client can
@@ -4104,6 +4135,34 @@ mod tests {
         assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
     }
 
+    /// A RECORD data connection whose stream write failed is no longer
+    /// recording, but its pipelined requests must not run before the core
+    /// loop disconnects it.
+    #[test]
+    fn failed_record_client_keeps_its_queued_requests_parked() {
+        let failed = yserver_protocol::x11::ClientId(57);
+        let other = yserver_protocol::x11::ClientId(12);
+        let pending = PendingBackendRequests::default();
+        let mut state = ServerState::new();
+        state.record.fail_recorder_for_test(failed);
+        assert!(!crate::core_loop::record::client_is_recording(
+            &state, failed
+        ));
+
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(failed.0, 2));
+        queue.push_back(deferred_request(other.0, 10));
+
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+        assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+        assert!(!queue.has_runnable(&pending, &state));
+        assert_eq!(
+            crate::core_loop::record::take_failed_recorders(&mut state),
+            [failed]
+        );
+    }
+
     #[test]
     fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
         use crate::{backend::recording::RecordingBackend, server::ClientState};
@@ -4813,6 +4872,7 @@ mod tests {
                 // the session credential the Refuse just revoked.
                 is_local: false,
                 fd_passing: false,
+                setup_reply: Vec::new(),
             })
             .expect("send the racing completion");
 
@@ -6589,6 +6649,7 @@ mod server_reset {
                 byte_order: ClientByteOrder::LittleEndian,
                 is_local: true,
                 fd_passing: true,
+                setup_reply: Vec::new(),
             })
             .expect("send the stale completion");
 

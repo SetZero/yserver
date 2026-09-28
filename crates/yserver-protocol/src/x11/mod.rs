@@ -20,6 +20,7 @@ pub mod glx;
 pub mod mit_shm;
 pub mod present;
 pub mod randr;
+pub mod record;
 pub mod request_lengths;
 pub mod request_swap;
 pub mod screensaver;
@@ -663,6 +664,15 @@ pub fn write_setup_success(
     byte_order: ClientByteOrder,
     setup: SetupSuccess<'_>,
 ) -> io::Result<()> {
+    writer.write_all(&encode_setup_success(byte_order, setup)?)
+}
+
+/// The connection-setup success reply exactly as `write_setup_success`
+/// sends it (RECORD's ClientStarted replays these bytes).
+pub fn encode_setup_success(
+    byte_order: ClientByteOrder,
+    setup: SetupSuccess<'_>,
+) -> io::Result<Vec<u8>> {
     let vendor = setup.vendor.as_bytes();
 
     let mut extra = Vec::new();
@@ -737,7 +747,7 @@ pub fn write_setup_success(
     write_u16(byte_order, &mut reply, setup.protocol_minor);
     write_u16(byte_order, &mut reply, length_units);
     reply.extend_from_slice(&extra);
-    writer.write_all(&reply)
+    Ok(reply)
 }
 
 fn write_screen(byte_order: ClientByteOrder, out: &mut Vec<u8>, screen: Screen) {

@@ -124,6 +124,16 @@ from.
       upstream. Until then, downgrade priority — MATE is the
       validated desktop, Cinnamon's click activation works on the
       wire and the next step is process-side diagnosis.
+- [ ] **Event fanouts ignore their dropped-client list (2026-09-28).**
+      `fanout_event_to_clients` and the damage fanouts return the
+      clients whose write failed or hit `OUTBOUND_CAP`, but every caller
+      discards it (`let _dropped = …`, e.g. `xkb_layout.rs`,
+      `sync_await.rs`, `xi1_state_notify.rs`). A client over the cap is
+      not disconnected: that event is silently lost and later ones still
+      go out. RECORD routes its failures through
+      `take_failed_recorders` → `disconnect_with_pending_cleanup`; the
+      other fanouts need the same. Found in static review; not yet
+      observed at runtime.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's

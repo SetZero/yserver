@@ -216,6 +216,10 @@ pub fn process_disconnect_reporting(
         }
     }
 
+    // RECORD: Xorg's ClientStateGone callback runs before any resource is
+    // freed, and needs the client's base and sequence.
+    crate::core_loop::record::client_disconnected(state, client_id);
+
     // Audit #9 (docs/protocol-audit-2026-05-19.md) — before the
     // disconnecting client's windows are destroyed, fire
     // `XFixesSelectionNotify(SelectionClientClose)` to any subscriber
