@@ -192,8 +192,9 @@ pointer/keyboard events, crossings, event masks.
 Extensions implemented: BIG-REQUESTS, COMPOSITE, DAMAGE, DPMS,
 DRI3, Generic Event Extension, GLX (modern direct-rendering only
 via DRI3/Present), MIT-SCREEN-SAVER, MIT-SHM, PRESENT, RANDR,
-RENDER, SHAPE, SYNC, X-Resource, XC-MISC, XFIXES, XINERAMA,
-XInput2, XKB (XKEYBOARD), XTEST. Coverage
+RECORD (device events and client start/death only), RENDER,
+SHAPE, SYNC, X-Resource, XC-MISC, XFIXES, XINERAMA, XInput2,
+XKB (XKEYBOARD), XTEST. Coverage
 is what real clients actually drive — extension versions and
 capability sets are conservative where the implementation isn't
 mature.
