@@ -1419,6 +1419,16 @@ pub fn run_core(
                     BackendFdKind::ScanoutRenderCompletion => {
                         backend.on_scanout_render_completion(state);
                     }
+                    BackendFdKind::Wayland => {
+                        if !backend.on_wayland_ready(state) {
+                            log::info!("wayland compositor closed the connection; shutting down");
+                            cancel_all_pending_backend_requests(
+                                backend,
+                                &mut pending_backend_requests,
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
                 continue;
             }

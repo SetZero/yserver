@@ -81,6 +81,10 @@ pub enum BackendFdKind {
     /// fences which gate a copied scanout path. Readiness means work rendered
     /// on the source GPU may advance to the sink-GPU copy.
     ScanoutRenderCompletion,
+    /// The connection to a Wayland compositor the server is a client of
+    /// (the rootless Wayland backend); readiness drives
+    /// `Backend::on_wayland_ready` on the core thread.
+    Wayland,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -739,6 +743,15 @@ pub trait Backend {
     /// Dispatch libinput inline. Default: no-op; direct KMS uses a dedicated
     /// input thread and never registers this fd.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
+
+    /// The Wayland compositor's connection is readable: read its events and
+    /// act on them with `state` in hand. Returns `false` when the compositor
+    /// closed the connection, which ends the server as the loss of its only
+    /// display would. Default: `true`; only the Wayland backend registers
+    /// the fd.
+    fn on_wayland_ready(&mut self, _state: &mut ServerState) -> bool {
+        true
+    }
 
     /// Called once per core-loop iteration (with `state`) so a backend can
     /// service time-based backend work that isn't tied to an fd readiness

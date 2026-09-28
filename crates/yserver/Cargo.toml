@@ -19,6 +19,7 @@ name = "yserver"
 path = "src/bin/yserver.rs"
 
 [dependencies]
+compositor-toolkit = { git = "https://github.com/SetZero/ferrix", rev = "fb8eaabb7bfffd546030f3221083269a40288b90", optional = true }
 ash.workspace = true
 crossbeam-channel.workspace = true
 drm.workspace = true
@@ -49,6 +50,10 @@ udev.workspace = true
 default = []
 tcp-transport = []
 xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
+# The rootless Wayland backend (Ferrix's docs/YSERVER.md): a client of a
+# Wayland compositor through Ferrix's own client runtime. Off by default, so
+# a build that does not ask for it fetches nothing from Ferrix.
+wayland = ["dep:compositor-toolkit"]
 
 [lints]
 workspace = true
