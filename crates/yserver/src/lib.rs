@@ -592,8 +592,12 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // libinput could not be set up at all (`SendContext::new()` failed
             // → `take_input_ctx()` is None). Refuse to start: a session with no
             // input is dead on arrival and cannot even be zapped.
-            ensure_input_devices_opened(0)?;
-            unreachable!("ensure_input_devices_opened(0) always returns Err");
+            if std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_some() {
+                log::warn!("yserver: no input devices; YSERVER_ALLOW_NO_INPUT set, starting anyway");
+            } else {
+                ensure_input_devices_opened(0)?;
+                unreachable!("ensure_input_devices_opened(0) always returns Err");
+            }
         }
         InputStartup::DirectSpawn => {
             let mut input_ctx =
@@ -619,7 +623,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // satisfy the guard, or we come up with a dead, un-zappable
             // session. The context tracks capability at add time.
             let opened = input_ctx.usable_input_device_count();
-            ensure_input_devices_opened(opened)?;
+            if opened > 0 || std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_none() {
+                ensure_input_devices_opened(opened)?;
+            }
             log::info!("yserver: {opened} usable input device(s) opened at startup");
 
             let input_sender = sender.clone_handle();
