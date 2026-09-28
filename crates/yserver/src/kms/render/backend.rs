@@ -9012,11 +9012,25 @@ impl KmsBackend {
         state.randr = yserver_core::randr::RandrState::from_outputs_with_modes_and_reservations(
             new_ts, outputs, mode_table, &reserved,
         );
-        let associations = self
+        #[allow(unused_mut)]
+        let mut associations: Vec<(u32, u32)> = self
             .randr_id_alloc
             .entries()
             .filter(|(_, entry)| entry.crtc_associated)
-            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id));
+            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id))
+            .collect();
+        // The Wayland backend's synthetic output is not among
+        // `randr_id_alloc`'s entries, so without this its CRTC association
+        // is dropped on the first rebuild: GetOutputInfo then reports crtc 0
+        // (the output looks disabled), and a client that builds its display
+        // list from RandR finds no screen (Chromium, so Steam's webhelper:
+        // "CreateOutputWindow: Could not find display info").
+        #[cfg(feature = "wayland")]
+        if self.wayland.is_some()
+            && let Some((output_id, crtc_id, _)) = self.wayland_randr_ids
+        {
+            associations.push((output_id, crtc_id));
+        }
         state.randr.set_output_crtc_associations(associations);
         state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
