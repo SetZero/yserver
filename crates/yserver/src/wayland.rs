@@ -33,6 +33,29 @@
 //! compositor's own size and close for a window (docs/YSERVER.md, Y4 and
 //! Y5). Until then an X window keeps the size its client gave it, drawn at
 //! the top left of the window the compositor tiles, on black.
+//!
+//! # Layout
+//!
+//! The Wayland side lives here and knows the X server only through
+//! `&ServerState` and [`WindowImages`]; the renderer side lives in
+//! `KmsBackend` (`kms/render/backend.rs`), each piece behind
+//! `feature = "wayland"`:
+//!
+//! * `KmsBackend::attach_wayland` takes the [`WaylandLink`] at startup;
+//! * `Backend::on_wayland_ready` calls [`WaylandLink::dispatch`], which
+//!   hands each [`Event`] to `WaylandLink::handle` -- where the compositor's
+//!   input will go;
+//! * `Backend::poll_deferred_input` calls `KmsBackend::sync_wayland` once
+//!   per loop iteration: the server's own redirect of the root's children
+//!   (`yserver_core`'s `redirect_subwindows_for_server`), then
+//!   [`WaylandLink::sync`];
+//! * `Backend::on_window_property_changed` calls
+//!   [`WaylandLink::property_changed`];
+//! * `impl WindowImages for KmsBackend` reads a window back.
+//!
+//! A top-level is keyed by its X window's host XID ([`WaylandLink`]'s
+//! `toplevels`), and `WaylandLink::by_surface` finds one from the
+//! compositor's side.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
