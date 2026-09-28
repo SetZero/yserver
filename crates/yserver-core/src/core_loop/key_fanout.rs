@@ -320,6 +320,7 @@ fn deliver_key_to_window(
         .into_iter()
         .filter(|c| !xi2_targets.contains(c))
         .collect();
+    let event = &relative_to(state, event, target_window);
     let mut dropped = if core_targets.is_empty() {
         Vec::new()
     } else {
@@ -367,6 +368,7 @@ fn deliver_key_to_grab_owner(
     grab_window: ResourceId,
     via_xi2: bool,
 ) -> Vec<ClientId> {
+    let event = &relative_to(state, event, grab_window);
     if via_xi2 {
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
             encode_key_xi2(buf, order, seq, event, grab_window);
@@ -383,6 +385,26 @@ fn xi2_evtype_for(event: &HostKeyEvent) -> u16 {
         XI2_KEYPRESS_EVTYPE
     } else {
         XI2_KEYRELEASE_EVTYPE
+    }
+}
+
+/// `event` with its pointer position relative to `window`, the window it
+/// is reported on: Xorg `FixUpEventFromWindow` sets a key event's
+/// `event_x`/`event_y` from the root position and that window's origin,
+/// whatever the producer put there (the backends put the root position).
+fn relative_to(state: &ServerState, event: &HostKeyEvent, window: ResourceId) -> HostKeyEvent {
+    let (x, y) = state.resources.window_absolute_position(window);
+    let relative = |root: i16, origin: i32| {
+        i16::try_from(i32::from(root) - origin).unwrap_or(if origin > 0 {
+            i16::MIN
+        } else {
+            i16::MAX
+        })
+    };
+    HostKeyEvent {
+        event_x: relative(event.root_x, x),
+        event_y: relative(event.root_y, y),
+        ..*event
     }
 }
 
@@ -758,6 +780,49 @@ pub(crate) fn deepest_window_at_pointer(state: &ServerState) -> ResourceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key event is placed relative to the window it is reported on, as
+    /// Xorg's `FixUpEventFromWindow` places it, whatever the backend said.
+    #[test]
+    fn a_key_event_is_placed_relative_to_its_window() {
+        let mut state = ServerState::new();
+        let window = ResourceId(0x0010_0001);
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 50,
+                width: 200,
+                height: 200,
+                border_width: 2,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let key = HostKeyEvent {
+            pressed: true,
+            keycode: 38,
+            time: 0,
+            root_x: 223,
+            root_y: 173,
+            event_x: 223,
+            event_y: 173,
+            state: 0,
+        };
+        let placed = relative_to(&state, &key, window);
+        assert_eq!(
+            (placed.event_x, placed.event_y),
+            (121, 121),
+            "inside the border"
+        );
+        assert_eq!((placed.root_x, placed.keycode), (223, 38));
+        let on_root = relative_to(&state, &key, ROOT_WINDOW);
+        assert_eq!((on_root.event_x, on_root.event_y), (223, 173));
+    }
     use crate::server::{
         ActiveKeyboardGrab, ActiveKeyboardGrabSource, KeyGrab, ScreenSaverActive, ServerState,
     };
