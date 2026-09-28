@@ -143,6 +143,13 @@ fn run_setup(
     is_local: bool,
     fd_passing: bool,
 ) -> io::Result<()> {
+    // Blocking, whatever the listener is: the reads below wait for the
+    // client under the timeouts, and a `WouldBlock` would end the setup of
+    // a client that has not written yet. Linux gives an accepted socket its
+    // own blocking mode, but a system whose `accept` hands on the
+    // listener's `O_NONBLOCK`, as the BSDs' does and as Ferrix's did,
+    // dropped such clients without a word.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
 
@@ -361,6 +368,37 @@ mod tests {
         let mut buf = vec![0u8; n];
         s.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    /// A connection handed over non-blocking, as an `accept` that passes on
+    /// the listener's `O_NONBLOCK` gives it, from a client that writes its
+    /// setup late: the setup still waits for it rather than ending at the
+    /// first empty read.
+    #[test]
+    fn a_non_blocking_connection_still_waits_for_a_late_setup() {
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let registry = make_registry();
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+        spawn(
+            ClientId(8),
+            server_side,
+            sender.bind(),
+            registry.clone(),
+            AuthState::new(None),
+            true,
+            true,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        write_setup_request(&mut client_side).unwrap();
+        let allocated = wait_for_message(&rx, Duration::from_secs(2));
+        shutdown_all(&registry);
+        assert!(
+            matches!(allocated, Some(Message::SetupAllocate { .. })),
+            "the late setup was read: {allocated:?}"
+        );
     }
 
     #[test]
