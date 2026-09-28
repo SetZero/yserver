@@ -1291,6 +1291,29 @@ fn bordered_backing_extent(width: u16, height: u16, border_width: u16) -> (u16, 
     (width.saturating_add(bw2), height.saturating_add(bw2))
 }
 
+/// The part of a window's `new` content size a grow from `old` exposed, as
+/// at most two `(x, y, width, height)` rectangles in content coordinates:
+/// the strip right of the old content, the whole new height, and the one
+/// below it.
+fn exposed_by_grow(old: (u16, u16), new: (u16, u16)) -> Vec<(i16, i16, u16, u16)> {
+    let kept = (old.0.min(new.0), old.1.min(new.1));
+    [
+        (kept.0, 0, new.0 - kept.0, new.1),
+        (0, kept.1, kept.0, new.1 - kept.1),
+    ]
+    .into_iter()
+    .filter(|&(_, _, width, height)| width > 0 && height > 0)
+    .filter_map(|(x, y, width, height)| {
+        Some((
+            i16::try_from(x).ok()?,
+            i16::try_from(y).ok()?,
+            width,
+            height,
+        ))
+    })
+    .collect()
+}
+
 fn rotate_redirected_backing_on_resize(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -1547,6 +1570,44 @@ fn rotate_redirected_backing_on_resize(
             old_backing.as_raw(),
             new_backing.as_raw(),
         );
+    }
+
+    // What a grow exposed, past the old content carried over above, gets
+    // the window's background, as Xorg paints a resize's exposed region
+    // before it sends the Expose (`miWindowExposures`). The new backing is
+    // seeded from the window's own leaf, which a redirected window does
+    // not repaint on resize (`configure_subwindow` leaves it to the
+    // backing), so without this the new area kept whatever the leaf's
+    // storage held: black, where xev's white window grew to fill a tile.
+    // A window with no background keeps what is there.
+    let old_content = (
+        old_width.saturating_sub(old_inset),
+        old_height.saturating_sub(old_inset),
+    );
+    let new_content = (
+        new_width.saturating_sub(new_inset),
+        new_height.saturating_sub(new_inset),
+    );
+    if let Some(bg) = state.resources.window_resolved_background(window) {
+        for (x, y, width, height) in exposed_by_grow(old_content, new_content) {
+            if let Err(err) = backend.clear_area(
+                origin,
+                host_window.as_raw(),
+                bg.background_pixel,
+                bg.background_pixmap_host_xid.map(|h| h.as_raw()),
+                x,
+                y,
+                width,
+                height,
+                bg.tile_origin_offset,
+            ) {
+                log::warn!(
+                    "rotate_redirected_backing_on_resize(0x{:x}): background of the grown \
+                     area failed: {err}",
+                    window.0
+                );
+            }
+        }
     }
 
     // Drop the rotate-scoped retain we took before release. If no
@@ -51879,6 +51940,19 @@ mod tests {
         ));
         let kept = state.composite_redirects.get(&(root, true)).copied();
         assert!(kept.is_some_and(|r| r.owner == ClientId(CLIENT_ID)));
+    }
+
+    #[test]
+    fn exposed_by_grow_is_the_new_area_and_nothing_else() {
+        assert_eq!(
+            exposed_by_grow((178, 178), (982, 726)),
+            vec![(178, 0, 804, 726), (0, 178, 178, 548)]
+        );
+        assert_eq!(
+            exposed_by_grow((178, 178), (178, 300)),
+            vec![(0, 178, 178, 122)]
+        );
+        assert!(exposed_by_grow((485, 726), (178, 178)).is_empty());
     }
 
     /// A compositor subscribes to DAMAGE on the `NameWindowPixmap`

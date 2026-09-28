@@ -5114,6 +5114,24 @@ impl KmsBackend {
     /// `host_xid` maps — along with the background each window should be
     /// tiled with. Windows with neither bg pixel nor bg pixmap are
     /// skipped (X11 background None = contents stay undefined).
+    /// `host_xid`'s mapped descendants, parents before their children.
+    fn viewable_descendants(&self, host_xid: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut stack = vec![host_xid];
+        while let Some(xid) = stack.pop() {
+            if xid != host_xid {
+                out.push(xid);
+            }
+            stack.extend(
+                self.windows
+                    .iter()
+                    .filter(|(_, g)| g.parent == Some(xid) && g.mapped)
+                    .map(|(child, _)| *child),
+            );
+        }
+        out
+    }
+
     fn collect_viewable_bg_paint_targets(
         &self,
         host_xid: u32,
@@ -20987,6 +21005,15 @@ impl Backend for KmsBackend {
                 ) {
                     log::debug!("render map_subwindow: bg paint failed for 0x{xid:x}: {e:?}");
                 }
+            }
+            // A descendant's border lies inside its parent's content, which
+            // the backgrounds above have just painted over, so each is
+            // painted again after them, parents first. Xorg's exposure of a
+            // window that becomes viewable paints its border as well as its
+            // background (`miPaintWindow` on the border clip).
+            for xid in self.viewable_descendants(host_xid) {
+                let tile_origin = self.border_tile_origin(xid);
+                let _ = self.paint_window_border(xid, tile_origin);
             }
         }
         self.scene.wake_for_damage();
@@ -39289,6 +39316,19 @@ mod tests {
                 (0x200, 54, 4, 64, 14, 4, 50),
             ],
         );
+    }
+
+    /// Mapped descendants come parents first, which is the order their
+    /// borders have to be painted in after the backgrounds.
+    #[test]
+    fn viewable_descendants_come_parents_first_and_skip_the_unmapped() {
+        let mut b = KmsBackend::for_tests();
+        let _ = seed_window(&mut b, 0x100, None, 0, 0);
+        let _ = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
+        let _ = seed_window(&mut b, 0x300, Some(0x200), 5, 5);
+        let _ = seed_window(&mut b, 0x400, Some(0x100), 50, 50);
+        b.windows.get_mut(&0x400).unwrap().mapped = false;
+        assert_eq!(b.viewable_descendants(0x100), vec![0x200, 0x300]);
     }
 
     /// The seed root's own ring is not in the plan: the backing's
