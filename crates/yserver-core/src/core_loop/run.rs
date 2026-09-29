@@ -636,6 +636,7 @@ impl PendingBackendRequests {
                     set_time: 0,
                     output_bbox_before: None,
                     byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                    apply_transform: None,
                 },
             },
             request_wire_bytes: 0,
@@ -2629,7 +2630,11 @@ pub(crate) fn notify_randr_output_property_changed(
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
-    let timestamp = state.randr.timestamp;
+    // Xorg stamps property notifies with the current time and leaves
+    // lastSetTime alone (`rrproperty.c:75`): mutter/muffin compare
+    // lastSetTime with their own SetCrtcConfig reply to tell their
+    // configuration from an external one.
+    let timestamp = state.timestamp_now();
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()
@@ -2844,8 +2849,9 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut max_y = 0i32;
     for output in state.randr.outputs.iter().filter(|o| o.mode_id != 0) {
         any = true;
-        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
-        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
+        let (width, height) = output.footprint();
+        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(width)));
+        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(height)));
     }
     any.then(|| {
         (
@@ -4076,6 +4082,7 @@ mod tests {
                         set_time: 0,
                         output_bbox_before: None,
                         byte_order: ClientByteOrder::LittleEndian,
+                        apply_transform: None,
                     },
                 },
                 request_wire_bytes: 28,
@@ -4208,8 +4215,12 @@ mod tests {
             set_time: 123,
             output_bbox_before: enabled_output_bbox(&state),
             byte_order: ClientByteOrder::LittleEndian,
+            apply_transform: None,
         };
-        let continuation = PendingCrtcConfig { token, completion };
+        let continuation = PendingCrtcConfig {
+            token,
+            completion: completion.clone(),
+        };
         let mut pending = PendingBackendRequests::default();
         pending
             .park_crtc(ParkedCrtcConfig {

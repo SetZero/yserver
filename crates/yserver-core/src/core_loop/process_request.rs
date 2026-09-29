@@ -128,7 +128,7 @@ pub enum RequestOutcome {
 
 /// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
 /// without redispatching the original request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PendingCrtcConfig {
     pub token: CrtcConfigToken,
     pub completion: CrtcConfigCompletion,
@@ -137,12 +137,16 @@ pub struct PendingCrtcConfig {
 /// Protocol continuation shared by synchronous and asynchronous CRTC apply
 /// paths. It contains no backend token, so immediate completion never needs a
 /// sentinel token value.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CrtcConfigCompletion {
     pub output_id: u32,
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
     pub byte_order: yserver_protocol::x11::ClientByteOrder,
+    /// The pending transform this enable applies, snapshotted at request
+    /// time, when it differs from the current one (`RRCrtcPendingTransform`,
+    /// rrcrtc.c:765).
+    pub apply_transform: Option<Box<crate::randr::CrtcTransform>>,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -2951,15 +2955,17 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
         .randr
         .enabled_outputs()
         .map(|output| {
+            // The CRTC's footprint (`RRMonitorGetCrtcGeometry`, rrmonitor.c:71).
+            let (width, height) = output.footprint();
             let width_mm = if output.mm_width > 0 {
                 output.mm_width
             } else {
-                ((u32::from(output.width) * 254 + 480) / 960).max(1)
+                ((u32::from(width) * 254 + 480) / 960).max(1)
             };
             let height_mm = if output.mm_height > 0 {
                 output.mm_height
             } else {
-                ((u32::from(output.height) * 254 + 480) / 960).max(1)
+                ((u32::from(height) * 254 + 480) / 960).max(1)
             };
             ActiveMonitor {
                 name: output.name.clone(),
@@ -2967,8 +2973,8 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
                 primary: output.output_id == primary,
                 x: output.x,
                 y: output.y,
-                width: output.width,
-                height: output.height,
+                width,
+                height,
                 width_mm,
                 height_mm,
             }
@@ -3300,7 +3306,75 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_CRTC_TRANSFORM => {
+            // ProcRRSetCrtcTransform (rrcrtc.c:1755-1785) + RRCrtcTransformSet
+            // (rrcrtc.c:1091-1128), then the spec's D2 contract. Every yserver
+            // CRTC supports transforms, so Xorg's `!crtc->transforms`
+            // BadValue has no counterpart.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
             let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if !crtc_exists(state, req.crtc) {
+                return error(state, RANDR_BAD_CRTC, req.crtc);
+            }
+            if crtc_is_leased(state, req.crtc) {
+                return error(state, x11::error::BAD_ACCESS, 0);
+            }
+            if !crate::randr::CrtcTransform::invertible(&req.transform) {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            let Some(spec) = req.filter else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let filter = if spec.name.is_empty() {
+                if !spec.params.is_empty() {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                None
+            } else {
+                let Some(filter) = crate::randr::Filter::from_name(&spec.name) else {
+                    return error(state, x11::error::BAD_NAME, 0);
+                };
+                if !filter.params_valid(&spec.params) {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                Some(filter)
+            };
+            let Some(transform) =
+                crate::randr::CrtcTransform::new(req.transform, filter, spec.params)
+            else {
+                return error(state, x11::error::BAD_MATCH, 0);
+            };
+            // D2: pure scale, nearest/bilinear only; the rest is refused on
+            // purpose rather than rendered approximately.
+            if !(transform.is_identity() || transform.is_pure_scale())
+                || filter == Some(crate::randr::Filter::Convolution)
+            {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            if let Some(output) = state
+                .randr
+                .outputs
+                .iter_mut()
+                .find(|o| o.crtc_id == req.crtc)
+            {
+                output.pending_transform = transform;
+            }
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_GET_CRTC_TRANSFORM => {
+            // REQUEST_SIZE_MATCH(xRRGetCrtcTransformReq) before the lookup.
+            if body.len() != 4 {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3310,55 +3384,7 @@ fn handle_randr_request(
                     u16::from(minor),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
-            if !crtc_exists(state, req.crtc) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    RANDR_BAD_CRTC,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
             }
-            if !req.is_identity_transform() {
-                // Arbitrary projective transforms need an internal
-                // composition path; they cannot be represented as direct
-                // KMS CRTC state.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "rejecting non-identity transform with BadMatch",
-                );
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
-            }
-            if req.filter_name_len != 0 || req.filter_param_count != 0 {
-                // The filter has no observable effect for an identity
-                // transform, but yserver does not retain it for GetCrtcTransform.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "accepting identity transform but not retaining its filter",
-                );
-            }
-            return Ok(RequestOutcome::Handled);
-        }
-        x11randr::RR_GET_CRTC_TRANSFORM => {
             let crtc = request_xid(body);
             if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
@@ -3371,7 +3397,24 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let buf = x11randr::encode_get_crtc_transform_reply(byte_order, sequence);
+            let Some(output) = state.randr.outputs.iter().find(|o| o.crtc_id == crtc) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            // `transform_filter_encode`: no filter, no name and no params.
+            fn part(t: &crate::randr::CrtcTransform) -> x11randr::CrtcTransformReplyPart<'_> {
+                x11randr::CrtcTransformReplyPart {
+                    matrix: t.matrix,
+                    filter_name: t.filter.map_or(&[][..], |f| f.canonical_name().as_bytes()),
+                    params: if t.filter.is_some() { &t.params } else { &[] },
+                }
+            }
+            let buf = x11randr::encode_get_crtc_transform_reply(
+                byte_order,
+                sequence,
+                true,
+                part(&output.pending_transform),
+                part(&output.current_transform),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -3714,7 +3757,6 @@ fn handle_randr_request(
             // — only the unrelated `RRNoticePropertyChange` driver hook is
             // gated on `is_pending`. The wire notify fires regardless of
             // whether this write landed in `.current` or `.pending`.
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -3788,7 +3830,6 @@ fn handle_randr_request(
                 );
             }
             entries.remove(index);
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -4687,15 +4728,15 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let ts = state.timestamp_now();
             state
                 .randr
-                .set_logical_size(ts, req.width, req.height, req.mm_width, req.mm_height);
+                .set_logical_size(req.width, req.height, req.mm_width, req.mm_height);
             // Pure screen-size change: fire root ConfigureNotify +
             // ScreenChangeNotify ONLY — no per-CRTC/Output change
             // (CRTC positions are unchanged). Pass an empty changed
             // list so only ScreenChangeNotify + root ConfigureNotify fire.
             super::run::apply_screen_size_side_effects(state, backend, req.width, req.height, &[]);
+            backend.randr_layout_changed(state);
             // RRSetScreenSize has NO reply (it is a void request).
             return Ok(RequestOutcome::Handled);
         }
@@ -4799,8 +4840,8 @@ fn handle_randr_request(
                 }
                 Ok(r) => r,
             };
-            // (2)+(3) rotation + bounds only when enabling.
-            if let Some(ref m) = resolved {
+            // (2) rotation only when enabling.
+            if resolved.is_some() {
                 if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
                     return emit_x11_error_with_minor(
                         state,
@@ -4824,17 +4865,9 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if let Err((code, error_value)) = state.randr.screen_encompasses(m, x, y) {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        code,
-                        error_value,
-                        u16::from(header.data),
-                        RANDR_MAJOR_OPCODE,
-                    );
-                }
+                // No screen-bounds check: Xorg skips it for a CRTC with
+                // transform support (rrcrtc.c:1436), and every yserver CRTC
+                // has it; a screen may crop a CRTC.
             }
 
             // Resolve connector name from crtc_id (validated above →
@@ -4853,6 +4886,13 @@ fn handle_randr_request(
             };
             let output_id = output_row.output_id;
             let connector = output_row.name.clone();
+            // A disable keeps the current transform (xf86RandR12CrtcSet
+            // only installs one with a mode).
+            let apply_transform = (resolved.is_some()
+                && !output_row
+                    .pending_transform
+                    .equivalent(&output_row.current_transform))
+            .then(|| Box::new(output_row.pending_transform.applied()));
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -4870,6 +4910,7 @@ fn handle_randr_request(
                 set_time,
                 output_bbox_before,
                 byte_order,
+                apply_transform,
             };
             match backend.begin_crtc_config(
                 output_id,
@@ -5144,11 +5185,23 @@ pub(crate) fn complete_crtc_config(
     result: io::Result<bool>,
 ) -> io::Result<RequestOutcome> {
     let status = match result {
-        Ok(true) => {
+        // A new transform is a change even with identical mode/x/y.
+        Ok(changed) if changed || completion.apply_transform.is_some() => {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
             backend.refresh_randr_state_set_time(state, completion.set_time);
+            if let Some(transform) = completion.apply_transform
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                // RRCrtcNotify: RRTransformCopy of pending into current.
+                output.current_transform = *transform;
+            }
+            backend.randr_layout_changed(state);
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs
@@ -5164,7 +5217,7 @@ pub(crate) fn complete_crtc_config(
             );
             0
         }
-        Ok(false) => {
+        Ok(_) => {
             // A no-op succeeds without a rebuild or change notification.
             0
         }
@@ -11005,8 +11058,9 @@ fn default_present_crtc_for_window(state: &ServerState, window: ResourceId) -> u
     for output in state.randr.enabled_outputs() {
         let output_x = i32::from(output.x);
         let output_y = i32::from(output.y);
-        let output_right = output_x.saturating_add(i32::from(output.width));
-        let output_bottom = output_y.saturating_add(i32::from(output.height));
+        let (footprint_w, footprint_h) = output.footprint();
+        let output_right = output_x.saturating_add(i32::from(footprint_w));
+        let output_bottom = output_y.saturating_add(i32::from(footprint_h));
         let width = window_right.min(output_right) - window_x.max(output_x);
         let height = window_bottom.min(output_bottom) - window_y.max(output_y);
         let area = if width > 0 && height > 0 {
@@ -33546,6 +33600,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![crtc_id.wrapping_add(0x1000)],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }
     }
 
@@ -34566,6 +34622,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             crate::randr::RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -34583,6 +34641,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
 
@@ -36563,91 +36623,703 @@ mod tests {
         assert!(mark_randr_unsupported_warned(&mut state, 19));
     }
 
-    #[test]
-    fn randr_set_crtc_transform_accepts_only_direct_identity_state() {
-        use yserver_protocol::x11::randr as x11randr;
+    const RR_IDENTITY: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
 
-        let mut state = ServerState::new();
-        let crtc = state.randr.outputs[0].crtc_id;
-        let mut peer = install_client(&mut state, 1);
+    fn rr_scale(word: i32) -> [i32; 9] {
+        [word, 0, 0, 0, word, 0, 0, 0, 0x0001_0000]
+    }
+
+    fn randr_transform_body_with_params(
+        crtc: u32,
+        matrix: [i32; 9],
+        filter_name: &[u8],
+        params: &[i32],
+    ) -> Vec<u8> {
+        let mut body = randr_transform_body(crtc, matrix, filter_name);
+        for param in params {
+            body.extend_from_slice(&param.to_le_bytes());
+        }
+        body
+    }
+
+    /// Send one SetCrtcTransform; the error code it produced, if any.
+    fn randr_set_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Option<u8> {
         let mut backend = RecordingBackend::new();
-        let identity = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
         let header = RequestHeader {
             opcode: 128,
-            data: x11randr::RR_SET_CRTC_TRANSFORM,
-            length_units: 12,
+            data: yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
         };
-
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(1),
             header,
-            &randr_transform_body(crtc, identity, &[]),
+            body,
         )
-        .expect("identity transform");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_eq!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
-        );
+        .expect("SetCrtcTransform");
+        let out = read_all_available(peer);
+        if out.is_empty() {
+            return None;
+        }
+        assert_eq!(out.len(), 32, "one error");
+        assert_eq!(out[0], 0, "error packet");
+        assert_eq!(out[10], 128, "major = RANDR");
+        Some(out[1])
+    }
 
-        // An identity filter is harmless and remains a wire-success no-op,
-        // but its parameters are not retained for GetCrtcTransform, so even
-        // an empty filter name with a parameter tail must warn.
-        let mut parameter_only = randr_transform_body(crtc, identity, &[]);
-        parameter_only.extend_from_slice(&0x0001_0000i32.to_le_bytes());
+    #[test]
+    fn randr_set_crtc_transform_validates_in_xorg_order() {
+        // rrcrtc.c:1755-1785 and RRCrtcTransformSet, then D2. Each case
+        // also carries the fault of every later step, so it shows the
+        // earlier check wins. BadAccess (leased CRTC) is not reachable:
+        // yserver has no RANDR leases.
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+        let bad_crtc = RANDR_BAD_CRTC;
+        let singular = [0i32; 9];
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let mut overrun = randr_transform_body(crtc, singular, b"");
+        overrun[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let mut overrun_bad_crtc = overrun.clone();
+        overrun_bad_crtc[0..4].copy_from_slice(&0xdeadu32.to_le_bytes());
+        let mut overrun_invertible = randr_transform_body(crtc, RR_IDENTITY, b"");
+        overrun_invertible[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let one = 0x0001_0000;
+        let cases: Vec<(&str, Vec<u8>, Option<u8>)> = vec![
+            ("BadCrtc", overrun_bad_crtc, Some(bad_crtc)),
+            ("non-invertible", overrun, Some(x11::error::BAD_MATCH)),
+            (
+                "negative nparams",
+                overrun_invertible,
+                Some(x11::error::BAD_LENGTH),
+            ),
+            (
+                "unknown filter",
+                randr_transform_body(crtc, rotate, b"box"),
+                Some(x11::error::BAD_NAME),
+            ),
+            (
+                "convolution parameter check",
+                randr_transform_body_with_params(crtc, RR_IDENTITY, b"convolution", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "params without a filter",
+                randr_transform_body_with_params(crtc, rotate, b"", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: valid convolution",
+                randr_transform_body_with_params(
+                    crtc,
+                    RR_IDENTITY,
+                    b"convolution",
+                    &[one, one, one],
+                ),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: rotation",
+                randr_transform_body(crtc, rotate, b"good"),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: translation",
+                randr_transform_body(crtc, [one, 0, 5 * one, 0, one, 0, 0, 0, one], b""),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "pure scale",
+                randr_transform_body(crtc, rr_scale(104_857), b"good"),
+                None,
+            ),
+            (
+                "bilinear keeps its parameters",
+                randr_transform_body_with_params(crtc, rr_scale(131_072), b"bilinear", &[one]),
+                None,
+            ),
+            (
+                "identity with a filter",
+                randr_transform_body(crtc, RR_IDENTITY, b"FAST"),
+                None,
+            ),
+        ];
+        for (name, body, expected) in cases {
+            assert_eq!(
+                randr_set_crtc_transform(&mut state, &mut peer, &body),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    fn randr_get_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        crtc: u32,
+    ) -> Vec<u8> {
+        randr_get_crtc_transform_body(state, peer, &crtc.to_le_bytes())
+    }
+
+    fn randr_get_crtc_transform_body(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(2),
             RequestHeader {
-                length_units: 13,
-                ..header
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
-            &parameter_only,
+            body,
         )
-        .expect("identity transform with filter parameter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_ne!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
+        .expect("GetCrtcTransform");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn get_crtc_transform_of_the_wrong_length_is_bad_length_before_bad_crtc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let crtc = state.randr.outputs[0].crtc_id;
+        // Short (header only) and oversized, for a real and a bogus CRTC.
+        for body in [
+            Vec::new(),
+            [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+            [0xdead_u32.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+        ] {
+            let reply = randr_get_crtc_transform_body(&mut state, &mut peer, &body);
+            assert_eq!(reply.len(), 32, "{body:?}");
+            assert_eq!(
+                (reply[0], reply[1]),
+                (0, x11::error::BAD_LENGTH),
+                "{body:?}"
+            );
+            assert_eq!(
+                (reply[8], reply[10]),
+                (yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM, 128)
+            );
+        }
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, 0xdead);
+        assert_eq!(
+            (reply[0], reply[1]),
+            (0, RANDR_BAD_CRTC),
+            "the right size looks up"
+        );
+    }
+
+    #[test]
+    fn randr_set_crtc_transform_stores_pending_for_get_crtc_transform() {
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 96, "default: no filter bytes");
+        assert_eq!(reply[44], 1, "hasTransforms");
+        assert_eq!(&reply[88..96], &[0u8; 8]);
+
+        // muffin's scale-down 125% CRTC 6 request (spec table): `good`.
+        let body = randr_transform_body_with_params(crtc, rr_scale(104_857), b"good", &[0x8000]);
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.pending_transform.matrix, rr_scale(104_857));
+        assert_eq!(
+            output.pending_transform.filter,
+            Some(crate::randr::Filter::Bilinear)
+        );
+        assert_eq!(
+            output.current_transform,
+            crate::randr::CrtcTransform::identity()
         );
 
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 108);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            104_857
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[48..52].try_into().unwrap()),
+            0x0001_0000
+        );
+        assert_eq!(&reply[88..96], &[8, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&reply[96..104], b"bilinear", "canonical name, not `good`");
+        assert_eq!(&reply[104..108], &0x8000i32.to_le_bytes());
+
+        // A rejected request leaves the pending transform alone.
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let body = randr_transform_body(crtc, rotate, b"");
+        assert_eq!(
+            randr_set_crtc_transform(&mut state, &mut peer, &body),
+            Some(x11::error::BAD_MATCH)
+        );
+        assert_eq!(
+            state.randr.outputs[0].pending_transform.matrix,
+            rr_scale(104_857)
+        );
+    }
+
+    fn randr_crtc_config_body(crtc: u32, x: i16, y: i16, mode: u32, outputs: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(24 + outputs.len() * 4);
+        body.extend_from_slice(&crtc.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        body.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&mode.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // RR_Rotate_0
+        body.extend_from_slice(&[0u8; 2]);
+        for output in outputs {
+            body.extend_from_slice(&output.to_le_bytes());
+        }
+        body
+    }
+
+    fn randr_set_crtc_config(
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        body: &[u8],
+    ) -> io::Result<RequestOutcome> {
         handle_randr_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+        )
+    }
+
+    /// `(width, height)` of every CrtcChangeNotify in `wire`, and whether a
+    /// SetCrtcConfig Success reply is present.
+    fn randr_crtc_notifies_and_success(wire: &[u8]) -> (Vec<(u16, u16)>, bool) {
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+        let notifies = wire
+            .chunks_exact(32)
+            .filter(|c| c[0] == 89 + 1 && c[1] == yserver_protocol::x11::randr::NOTIFY_CRTC_CHANGE)
+            .map(|c| (u16_at(c, 28), u16_at(c, 30)))
+            .collect();
+        let success = wire.chunks_exact(32).any(|c| c[0] == 1 && c[1] == 0);
+        (notifies, success)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_applies_a_pending_transform_as_a_change() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let same_config =
+            randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+
+        // Nothing pending: the backend's no-op stays a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert!(notifies.is_empty());
+
+        // xrandr --scale 2 (spec, "What Xorg does").
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "one CrtcChangeNotify carrying the mode size"
+        );
+        let applied = &state.randr.outputs[0];
+        assert_eq!(applied.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(applied.footprint(), (output.width * 2, output.height * 2));
+
+        // Applied: the same config is a no-op again.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A disable leaves the current transform in place.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(
+            state.randr.outputs[0].current_transform.matrix,
+            rr_scale(131_072)
+        );
+    }
+
+    #[test]
+    fn an_asynchronous_crtc_config_applies_the_transform_pending_at_request_time() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        backend.pending_crtc_config = Some(CrtcConfigToken(7));
+        let config = randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+        let RequestOutcome::PendingCrtcConfig(pending) =
+            randr_set_crtc_config(&mut state, &mut backend, &config).unwrap()
+        else {
+            panic!("the enable must park");
+        };
+        // A new SetCrtcTransform while the enable is in flight stays pending.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        complete_crtc_config(
             &mut state,
             &mut backend,
             ClientId(1),
             SequenceNumber(3),
-            RequestHeader {
-                length_units: 13,
-                ..header
-            },
-            &randr_transform_body(crtc, identity, b"box"),
+            pending.completion,
+            Ok(true),
         )
-        .expect("identity transform with named filter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        .unwrap();
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(output.pending_transform.matrix, rr_scale(32_768));
+    }
 
-        let mut projective = identity;
-        projective[6] = 1;
-        handle_randr_request(
-            &mut state,
-            &mut backend,
-            ClientId(1),
-            SequenceNumber(4),
-            header,
-            &randr_transform_body(crtc, projective, &[]),
-        )
-        .expect("reject non-identity transform");
-        let error = read_all_available(&mut peer);
-        assert_eq!(error.len(), 32);
-        assert_eq!(error[0], 0);
-        assert_eq!(error[1], x11::error::BAD_MATCH);
-        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), crtc);
-        assert_eq!(&error[8..10], &u16::from(header.data).to_le_bytes());
-        assert_eq!(error[10], 128);
+    #[test]
+    fn randr_set_crtc_config_does_not_bound_a_crtc_by_the_screen() {
+        // rrcrtc.c:1436 skips the bounds check for transform-capable CRTCs.
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let x = i16::try_from(state.randr.screen_width).unwrap();
+        let body =
+            randr_crtc_config_body(output.crtc_id, x, 0, output.mode_id, &[output.output_id]);
+        randr_set_crtc_config(&mut state, &mut backend, &body).unwrap();
+        let (_, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success, "past the screen edge is not BadValue");
+    }
+
+    /// The two 2560×1440 outputs of the muffin capture (spec, "What muffin
+    /// sends"): CRTC 4 at 0,0 and CRTC 6 at 2560,0, both mode 0x13.
+    const MUFFIN_MODE: u32 = 0x13;
+    const MUFFIN_MM: (u32, u32) = (597, 336);
+
+    fn muffin_output(output_id: u32, crtc_id: u32, x: i16) -> crate::randr::RandrOutput {
+        crate::randr::RandrOutput {
+            name: format!("DP-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: MUFFIN_MODE,
+            connected: true,
+            x,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: MUFFIN_MM.0,
+            mm_height: MUFFIN_MM.1,
+            mode_ids: vec![MUFFIN_MODE],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+        }
+    }
+
+    struct MuffinReplay {
+        state: ServerState,
+        peer: UnixStream,
+        backend: RecordingBackend,
+    }
+
+    type Rect = (i16, i16, u16, u16);
+
+    impl MuffinReplay {
+        const OUTPUT_4: u32 = 3;
+        const OUTPUT_6: u32 = 5;
+
+        fn new() -> Self {
+            let mut state = ServerState::new();
+            state.randr = crate::randr::RandrState::from_outputs_with_modes(
+                1,
+                vec![
+                    muffin_output(Self::OUTPUT_4, 4, 0),
+                    muffin_output(Self::OUTPUT_6, 6, 2560),
+                ],
+                vec![crate::randr::RandrMode {
+                    mode_id: MUFFIN_MODE,
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 60,
+                    timing: None,
+                }],
+            );
+            let root = state.resources.window_mut(ROOT_WINDOW).unwrap();
+            (root.width, root.height) = (5120, 1440);
+            let peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            backend.apply_crtc_configs = true;
+            Self {
+                state,
+                peer,
+                backend,
+            }
+        }
+
+        fn send(&mut self, minor: u8, body: &[u8]) -> Vec<u8> {
+            handle_randr_request(
+                &mut self.state,
+                &mut self.backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("RANDR request");
+            read_all_available(&mut self.peer)
+        }
+
+        fn set_screen_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&w.to_le_bytes());
+            body.extend_from_slice(&h.to_le_bytes());
+            body.extend_from_slice(&mm_w.to_le_bytes());
+            body.extend_from_slice(&mm_h.to_le_bytes());
+            let out = self.send(yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE, &body);
+            assert!(
+                out.chunks_exact(32).all(|c| c[0] != 0),
+                "SetScreenSize {w}x{h} failed: {out:02x?}"
+            );
+        }
+
+        /// SetCrtcTransform then SetCrtcConfig, as muffin orders them.
+        fn configure(&mut self, crtc: u32, output: u32, x: i16, scale: i32, filter: &[u8]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+                &randr_transform_body(crtc, rr_scale(scale), filter),
+            );
+            assert!(out.is_empty(), "SetCrtcTransform crtc {crtc}: {out:02x?}");
+            self.set_crtc_config(crtc, x, MUFFIN_MODE, &[output]);
+        }
+
+        fn set_crtc_config(&mut self, crtc: u32, x: i16, mode: u32, outputs: &[u32]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                &randr_crtc_config_body(crtc, x, 0, mode, outputs),
+            );
+            let reply = out.chunks_exact(32).find(|c| c[0] != 0 && c[0] < 2);
+            assert_eq!(
+                reply.map(|c| (c[0], c[1])),
+                Some((1, 0)),
+                "SetCrtcConfig crtc {crtc} succeeds: {out:02x?}"
+            );
+        }
+
+        fn screen(&self) -> (u16, u16) {
+            let root = self.state.resources.window(ROOT_WINDOW).unwrap();
+            assert_eq!(
+                (root.width, root.height),
+                (
+                    self.state.randr.screen_width,
+                    self.state.randr.screen_height
+                ),
+                "root follows the RANDR screen"
+            );
+            (root.width, root.height)
+        }
+
+        /// GetCrtcInfo's `(x, y, width, height)`.
+        fn crtc_info(&mut self, crtc: u32) -> Rect {
+            let mut body = crtc.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_le_bytes());
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_CRTC_INFO, &body);
+            assert_eq!(r[0], 1, "GetCrtcInfo reply");
+            let i16_at = |o: usize| i16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            let u16_at = |o: usize| u16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            (i16_at(12), i16_at(14), u16_at(16), u16_at(18))
+        }
+
+        /// GetMonitors' `(x, y, width, height)` per monitor; asserts the
+        /// EDID mm are untouched by any transform.
+        fn monitors(&mut self) -> Vec<Rect> {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[1, 0, 0, 0]);
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_MONITORS, &body);
+            assert_eq!(r[0], 1, "GetMonitors reply");
+            let count = u32::from_le_bytes(r[12..16].try_into().unwrap());
+            let mut offset = 32;
+            let mut rects = Vec::new();
+            for _ in 0..count {
+                let m = &r[offset..];
+                let n_out = usize::from(u16::from_le_bytes(m[6..8].try_into().unwrap()));
+                let i16_at = |o: usize| i16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u16_at = |o: usize| u16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u32_at = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+                assert_eq!((u32_at(16), u32_at(20)), MUFFIN_MM);
+                rects.push((i16_at(8), i16_at(10), u16_at(12), u16_at(14)));
+                offset += 24 + n_out * 4;
+            }
+            rects
+        }
+
+        fn assert_layout(
+            &mut self,
+            screen: (u16, u16),
+            crtc4: Rect,
+            crtc6: Rect,
+            monitors: &[Rect],
+        ) {
+            assert_eq!(self.screen(), screen, "screen");
+            assert_eq!(self.crtc_info(4), crtc4, "GetCrtcInfo 4");
+            assert_eq!(self.crtc_info(6), crtc6, "GetCrtcInfo 6");
+            assert_eq!(self.monitors(), monitors, "GetMonitors");
+        }
+    }
+
+    const MUFFIN_IDENTITY: i32 = 0x0001_0000;
+    const MUFFIN_2_0: i32 = 131_072;
+    const MUFFIN_1_599991: i32 = 104_857;
+    const MUFFIN_1_337494: i32 = 87_654;
+    const MUFFIN_0_5: i32 = 32_768;
+    const MUFFIN_0_799988: i32 = 52_428;
+
+    #[test]
+    fn randr_replays_muffin_scale_down_100_125_150() {
+        let mut r = MuffinReplay::new();
+        let left = (0, 0, 2560, 1440);
+        r.assert_layout(
+            (5120, 1440),
+            left,
+            (2560, 0, 2560, 1440),
+            &[left, (2560, 0, 2560, 1440)],
+        );
+
+        // Each row of the spec table: SetScreenSize, then CRTC 4, then CRTC 6.
+        for (screen, mm, scale6, crtc6) in [
+            ((7680, 2880), (1355, 508), MUFFIN_2_0, (2560, 0, 5120, 2880)),
+            (
+                (6656, 2304),
+                (1084, 375),
+                MUFFIN_1_599991,
+                (2560, 0, 4096, 2304),
+            ),
+            (
+                (5984, 1926),
+                (906, 292),
+                MUFFIN_1_337494,
+                (2560, 0, 3424, 1926),
+            ),
+        ] {
+            let before6 = r.crtc_info(6);
+            r.set_screen_size(screen.0, screen.1, mm.0, mm.1);
+            // A screen may crop the previous scaled footprint for a moment.
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_IDENTITY, b"fast");
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(6, MuffinReplay::OUTPUT_6, 2560, scale6, b"good");
+            r.assert_layout(screen, left, crtc6, &[left, crtc6]);
+        }
+    }
+
+    #[test]
+    fn randr_replays_muffin_scale_up_125_through_both_crtcs_off() {
+        let mut r = MuffinReplay::new();
+        r.set_crtc_config(4, 0, 0, &[]);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 0, 0),
+            (2560, 0, 2560, 1440),
+            &[(2560, 0, 2560, 1440)],
+        );
+        r.set_crtc_config(6, 0, 0, &[]);
+        r.assert_layout((5120, 1440), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        r.set_screen_size(4608, 1152, 750, 188);
+        r.assert_layout((4608, 1152), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        // The mode is taller than the screen: this is what went dark.
+        r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_0_5, b"nearest");
+        let left = (0, 0, 1280, 720);
+        r.assert_layout((4608, 1152), left, (0, 0, 0, 0), &[left]);
+        // CRTC 6 stays at 2560 although CRTC 4 is only 1280 wide.
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_0_799988, b"good");
+        let right = (2560, 0, 2048, 1152);
+        r.assert_layout((4608, 1152), left, right, &[left, right]);
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((4608, 1152))
+        );
+    }
+
+    #[test]
+    fn randr_client_screen_size_survives_a_larger_transformed_bbox() {
+        let mut r = MuffinReplay::new();
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_2_0, b"good");
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((7680, 2880))
+        );
+        let right = (2560, 0, 5120, 2880);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 2560, 1440),
+            right,
+            &[(0, 0, 2560, 1440), right],
+        );
+    }
+
+    #[test]
+    fn present_default_crtc_uses_the_transformed_footprint() {
+        const WINDOW: u32 = 0x0001_1001;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 2560, 1440, true),
+                present_test_output(2, 22, 2560, 0, 2560, 1440, true),
+            ],
+        );
+        state.randr.primary_output = 1;
+        // Below CRTC 22's mode but inside its 2.0 footprint.
+        create_present_test_window(&mut state, WINDOW, 2600, 1500, 500, 500);
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            11
+        );
+        state.randr.outputs[1].current_transform =
+            crate::randr::CrtcTransform::new(rr_scale(MUFFIN_2_0), None, Vec::new()).unwrap();
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            22
+        );
     }
 
     #[test]
@@ -37804,6 +38476,60 @@ mod tests {
             .expect("property stored");
         assert_eq!(stored.current.as_ref().unwrap().data, 42u32.to_le_bytes());
         assert_eq!(stored.current.as_ref().unwrap().r#type, prop_type);
+    }
+
+    /// #185: an output property write must not move lastSetTime/lastConfigTime
+    /// (Xorg `rrproperty.c`). muffin treats a lastSetTime that no longer
+    /// matches its own SetCrtcConfig reply as an external reconfiguration and
+    /// rebuilds its monitor config (Cinnamon then comes back at 200%).
+    #[test]
+    fn randr_change_output_property_leaves_randr_timestamps_alone() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.randr.timestamp = 29_342;
+        state.randr.config_timestamp = 29_133;
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        for (seq, mode) in [(1, 0u8), (2, 2u8)] {
+            let body = change_output_property_body(
+                output,
+                property.0,
+                prop_type.0,
+                32,
+                mode,
+                &42u32.to_le_bytes(),
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(seq),
+                change_output_property_header(body.len()),
+                &body,
+            )
+            .expect("ChangeOutputProperty");
+        }
+        let mut delete = output.to_le_bytes().to_vec();
+        delete.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_DELETE_OUTPUT_PROPERTY,
+                length_units: 3,
+            },
+            &delete,
+        )
+        .expect("DeleteOutputProperty");
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (29_342, 29_133)
+        );
     }
 
     #[test]
@@ -46137,6 +46863,8 @@ mod tests {
                 mm_height: 340,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             }],
         );
         let expected = current_vidmode_mode_line(&state).expect("active RandR mode");
@@ -62517,6 +63245,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             // Equal connector names are legal across different DRM devices.
             // Address this second row by CRTC/XID to prove the core never
@@ -62537,6 +63267,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let mut state = ServerState::new();
@@ -62716,6 +63448,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -62776,6 +63510,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -62856,6 +63592,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -75368,6 +76106,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -75456,6 +76196,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -75679,6 +76421,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);

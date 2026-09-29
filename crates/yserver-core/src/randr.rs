@@ -4,6 +4,10 @@ use yserver_protocol::x11::randr as proto;
 
 use crate::properties::PropertyValue;
 
+mod transform;
+
+pub use transform::{CrtcTransform, FIXED_ONE, Filter, IDENTITY_MATRIX};
+
 /// A client-settable RANDR output property (`RRChangeOutputProperty` /
 /// `RRConfigureOutputProperty` / `RRDeleteOutputProperty`,
 /// randr/rrproperty.c `RRPropertyRec`). Distinct from the backend-
@@ -71,6 +75,11 @@ pub struct RandrOutput {
     /// Count of leading entries in `mode_ids` that are preferred modes
     /// (Xorg `GetOutputInfo` `nPreferred`).
     pub num_preferred: u16,
+    /// `SetCrtcTransform`'s stored transform, applied by the next
+    /// `SetCrtcConfig` (`client_pending_transform`).
+    pub pending_transform: CrtcTransform,
+    /// The transform in effect (`client_current_transform`).
+    pub current_transform: CrtcTransform,
 }
 
 /// Real per-mode timing carried through from the kernel DRM mode, so
@@ -259,6 +268,13 @@ impl RandrOutput {
     pub fn effective_timing(&self) -> EffectiveTiming {
         EffectiveTiming::resolve(self.width, self.height, self.vrefresh, self.timing)
     }
+
+    /// The CRTC's framebuffer footprint: its mode through
+    /// `current_transform` (spec D3); the mode size for identity.
+    #[must_use]
+    pub fn footprint(&self) -> (u16, u16) {
+        self.current_transform.footprint(self.width, self.height)
+    }
 }
 
 /// A virtual-screen slot held by a route that is physically gone but
@@ -376,7 +392,7 @@ impl RandrState {
         let screen_width: u16 = screen_extent(
             outputs
                 .iter()
-                .map(|o| i32::from(o.x).saturating_add(i32::from(o.width)))
+                .map(|o| i32::from(o.x).saturating_add(i32::from(o.footprint().0)))
                 .chain(
                     reserved
                         .iter()
@@ -386,7 +402,7 @@ impl RandrState {
         let screen_height: u16 = screen_extent(
             outputs
                 .iter()
-                .map(|o| i32::from(o.y).saturating_add(i32::from(o.height)))
+                .map(|o| i32::from(o.y).saturating_add(i32::from(o.footprint().1)))
                 .chain(
                     reserved
                         .iter()
@@ -444,6 +460,36 @@ impl RandrState {
         I: IntoIterator<Item = (u32, u32)>,
     {
         self.output_crtc_associations = associations.into_iter().collect();
+    }
+
+    /// Every CRTC's `(crtc_id, pending, current)` transforms, to carry
+    /// over a rebuild from backend outputs (which start at identity).
+    #[must_use]
+    pub fn crtc_transforms(&self) -> Vec<(u32, CrtcTransform, CrtcTransform)> {
+        self.outputs
+            .iter()
+            .map(|o| {
+                (
+                    o.crtc_id,
+                    o.pending_transform.clone(),
+                    o.current_transform.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Restore transforms taken by [`Self::crtc_transforms`] onto the
+    /// CRTCs that still exist.
+    pub fn restore_crtc_transforms(
+        &mut self,
+        transforms: Vec<(u32, CrtcTransform, CrtcTransform)>,
+    ) {
+        for (crtc_id, pending, current) in transforms {
+            if let Some(output) = self.outputs.iter_mut().find(|o| o.crtc_id == crtc_id) {
+                output.pending_transform = pending;
+                output.current_transform = current;
+            }
+        }
     }
 
     /// Look up a provider by its protocol XID.
@@ -541,6 +587,8 @@ impl RandrState {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         Self::from_outputs(timestamp, vec![synthetic])
     }
@@ -575,7 +623,9 @@ impl RandrState {
     }
 
     /// Would shrinking the logical screen to `w`×`h` crop any enabled
-    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.)
+    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.) The box
+    /// is the untransformed mode even for a scaled CRTC, as measured
+    /// (spec Q3, `tools/vng-scenarios/xrandr-scale-crop.sh`).
     #[must_use]
     pub fn screen_size_would_crop(&self, w: u16, h: u16) -> bool {
         self.outputs.iter().filter(|o| o.mode_id != 0).any(|o| {
@@ -587,14 +637,14 @@ impl RandrState {
     /// Set the logical (reported) screen size after validation. Uses
     /// the CLIENT-supplied physical mm verbatim (Xorg `RRScreenSizeSet`
     /// passes `stuff->widthInMillimeters`/`heightInMillimeters` — it does
-    /// NOT recompute from pixels). Does not touch outputs.
-    pub fn set_logical_size(&mut self, timestamp: u32, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+    /// NOT recompute from pixels). Does not touch outputs, nor either
+    /// timestamp: Xorg's SetScreenSize moves neither lastSetTime nor
+    /// lastConfigTime (only SetCrtcConfig/SetScreenConfig set the former).
+    pub fn set_logical_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
         self.screen_width = w;
         self.screen_height = h;
         self.width_mm = mm_w;
         self.height_mm = mm_h;
-        self.timestamp = timestamp.max(1);
-        self.config_timestamp = self.timestamp;
     }
 
     /// Monitors for RANDR `GetMonitors` / XINERAMA: one per output with a
@@ -706,9 +756,9 @@ impl RandrState {
     }
 
     /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
-    /// `rrcrtc.c` order, EXCLUDING rotation + bounds — the handler does
-    /// those after, in that order). `Ok(None)` = disable;
-    /// `Ok(Some(mode))` = enable with this resolved mode;
+    /// `rrcrtc.c` order, EXCLUDING rotation — the handler does that
+    /// after). `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
+    /// resolved mode;
     /// `Err((code, error_value))` = protocol error + field-specific
     /// `errorValue`.
     pub fn validate_set_crtc_config(
@@ -756,24 +806,6 @@ impl RandrState {
         Ok(Some(mode))
     }
 
-    /// Bounds check: does `mode` placed at `(x, y)` fit the current
-    /// (logical) screen? Xorg `rrcrtc.c`: `x + width > screen.width` ⇒
-    /// `BadValue(errorValue=x)`; then `y + height > screen.height` ⇒
-    /// `BadValue(errorValue=y)`.
-    pub fn screen_encompasses(&self, mode: &RandrMode, x: i16, y: i16) -> Result<(), (u8, u32)> {
-        use yserver_protocol::x11::error;
-        // Xorg rrcrtc.c: `x + width > screen.width` ⇒ BadValue(x), then
-        // `y + height > screen.height` ⇒ BadValue(y). errorValue carries
-        // the raw INT16 sign-extended into the CARD32 field.
-        if i32::from(x) + i32::from(mode.width) > i32::from(self.screen_width) {
-            return Err((error::BAD_VALUE, i32::from(x) as u32));
-        }
-        if i32::from(y) + i32::from(mode.height) > i32::from(self.screen_height) {
-            return Err((error::BAD_VALUE, i32::from(y) as u32));
-        }
-        Ok(())
-    }
-
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
         let mut modes: Vec<RandrMode> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
@@ -812,12 +844,14 @@ impl RandrState {
             .filter(|o| o.crtc_id == crtc_id)
             .map(|o| o.output_id)
             .collect();
+        // `RRCrtcGetScanoutSize`: the transformed footprint (rrcrtc.c:1212).
+        let (width, height) = out.footprint();
         Some(CrtcInfoData {
             timestamp: self.timestamp,
             x: out.x,
             y: out.y,
-            width: out.width,
-            height: out.height,
+            width,
+            height,
             mode_id: out.mode_id,
             outputs,
             possible_outputs,
@@ -1088,6 +1122,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7, 8, 9],
             num_preferred: 2,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1");
@@ -1115,6 +1151,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "HDMI-2".into(),
@@ -1132,6 +1170,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1160,6 +1200,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![21],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }
     }
 
@@ -1215,7 +1257,7 @@ mod tests {
         );
         assert_eq!(st.screen_width, 5120);
 
-        st.set_logical_size(7, 2560, 1440, 677, 381);
+        st.set_logical_size(2560, 1440, 677, 381);
         assert_eq!(
             (st.screen_width, st.screen_height, st.width_mm, st.height_mm),
             (2560, 1440, 677, 381),
@@ -1241,6 +1283,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7, 8],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mode_table = vec![
             RandrMode {
@@ -1284,6 +1328,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "B".into(),
@@ -1301,6 +1347,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1326,6 +1374,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "B".into(),
@@ -1343,6 +1393,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1369,6 +1421,8 @@ mod tests {
             mm_height: 336,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -1394,6 +1448,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -1421,6 +1477,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "B".into(),
@@ -1438,6 +1496,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1462,6 +1522,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         outs.push(RandrOutput {
             name: "HDMI-A-1".into(),
@@ -1479,6 +1541,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![],
             num_preferred: 0,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         });
         let st = RandrState::from_outputs(1, outs);
         let info = st
@@ -1510,6 +1574,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![],
                 num_preferred: 0,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -1527,6 +1593,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         assert_eq!(RandrState::from_outputs(1, outs).primary_output, 4);
@@ -1554,6 +1622,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -1571,6 +1641,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1601,6 +1673,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![12, 13],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
 
@@ -1649,6 +1723,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![13],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let state = RandrState::from_outputs(41, vec![output]);
 
@@ -1698,6 +1774,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.outputs[0].y, 1080, "y must not be flattened");
@@ -1729,6 +1807,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let mode_table = vec![RandrMode {
             mode_id: 7,
@@ -1787,6 +1867,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let mode_table = vec![RandrMode {
             mode_id: 7,
@@ -1834,6 +1916,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 // connected but OFF (mode_id 0)
@@ -1852,6 +1936,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 // disconnected
@@ -1870,6 +1956,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![],
                 num_preferred: 0,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1901,6 +1989,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         assert!(
@@ -1916,15 +2006,18 @@ mod tests {
     #[test]
     fn set_logical_size_stores_client_mm_verbatim() {
         let mut st = RandrState::nested(1, 1920, 1080);
+        st.timestamp = 40;
+        st.config_timestamp = 30;
         // Caller passes client-supplied mm values; the impl must NOT
         // recompute them from pixels.
-        st.set_logical_size(42, 2560, 1440, 597, 336);
+        st.set_logical_size(2560, 1440, 597, 336);
         assert_eq!(st.screen_width, 2560);
         assert_eq!(st.screen_height, 1440);
         assert_eq!(st.width_mm, 597, "mm verbatim from client");
         assert_eq!(st.height_mm, 336, "mm verbatim from client");
-        assert_eq!(st.timestamp, 42);
-        assert_eq!(st.config_timestamp, 42);
+        // Xorg's SetScreenSize moves neither timestamp; muffin treats a moved
+        // lastSetTime as an external reconfiguration (#185).
+        assert_eq!((st.timestamp, st.config_timestamp), (40, 30));
     }
 
     use yserver_protocol::x11::error as x11_err;
@@ -1948,6 +2041,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![7, 8],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             }],
             vec![
                 RandrMode {
@@ -2007,30 +2102,6 @@ mod tests {
     }
 
     #[test]
-    fn screen_encompasses_rejects_overflow_x_then_y() {
-        let st = one_output_state(); // screen 1920x1080
-        let m1080 = RandrMode {
-            mode_id: 7,
-            width: 1920,
-            height: 1080,
-            vrefresh: 60,
-            timing: None,
-        };
-        // Place 1920x1080 at x=100 → 2020 > 1920. errorValue = x.
-        assert_eq!(
-            st.screen_encompasses(&m1080, 100, 0),
-            Err((x11_err::BAD_VALUE, 100))
-        );
-        // x ok, y overflow: at y=100 → 1180 > 1080. errorValue = y.
-        assert_eq!(
-            st.screen_encompasses(&m1080, 0, 100),
-            Err((x11_err::BAD_VALUE, 100))
-        );
-        // exact fit (x+w == screen.width) is allowed (Xorg uses `>`).
-        assert_eq!(st.screen_encompasses(&m1080, 0, 0), Ok(()));
-    }
-
-    #[test]
     fn set_crtc_config_valid_enable_resolves_mode() {
         let st = one_output_state();
         let mode = st
@@ -2044,5 +2115,110 @@ mod tests {
     fn set_crtc_config_valid_disable() {
         let st = one_output_state();
         assert_eq!(st.validate_set_crtc_config(2, 0, &[]), Ok(None));
+    }
+
+    fn scale_transform(word: i32) -> CrtcTransform {
+        CrtcTransform::new([word, 0, 0, 0, word, 0, 0, 0, FIXED_ONE], None, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn crtc_transforms_default_to_identity_without_a_filter() {
+        let st = one_output_state();
+        let out = &st.outputs[0];
+        for t in [&out.pending_transform, &out.current_transform] {
+            assert_eq!(t.matrix, IDENTITY_MATRIX);
+            assert_eq!(t.filter, None);
+            assert!(t.params.is_empty());
+        }
+        assert_eq!(out.footprint(), (1920, 1080));
+    }
+
+    #[test]
+    fn footprint_follows_the_current_transform_only() {
+        let mut st = one_output_state();
+        // xrandr --scale 2 (spec, "What Xorg does").
+        st.outputs[0].pending_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (1920, 1080));
+        st.outputs[0].current_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (3840, 2160));
+    }
+
+    #[test]
+    fn crtc_transforms_survive_a_rebuild_by_crtc_id() {
+        let mut st = one_output_state();
+        st.outputs[0].pending_transform = scale_transform(32_768);
+        st.outputs[0].current_transform = scale_transform(131_072);
+        let saved = st.crtc_transforms();
+        let mut rebuilt = one_output_state();
+        rebuilt.restore_crtc_transforms(saved);
+        assert_eq!(
+            rebuilt.outputs[0].pending_transform,
+            scale_transform(32_768)
+        );
+        assert_eq!(
+            rebuilt.outputs[0].current_transform,
+            scale_transform(131_072)
+        );
+        // A CRTC that vanished takes its transform with it.
+        let mut other = one_output_state();
+        other.restore_crtc_transforms(vec![(99, scale_transform(32_768), scale_transform(32_768))]);
+        assert_eq!(
+            other.outputs[0].current_transform,
+            CrtcTransform::identity()
+        );
+    }
+
+    /// Two 1920×1440 outputs, B right of A (`xrandr-scale-crop.sh`).
+    fn crop_probe_state(b_scale: i32) -> RandrState {
+        let output = |output_id: u32, crtc_id: u32, x: i16| RandrOutput {
+            name: format!("Virtual-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: 9,
+            connected: true,
+            x,
+            y: 0,
+            width: 1920,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![9],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+        };
+        let mut st = RandrState::from_outputs(1, vec![output(1, 3, 0), output(2, 4, 1920)]);
+        st.outputs[1].current_transform = scale_transform(b_scale);
+        st
+    }
+
+    #[test]
+    fn screen_size_crop_uses_the_untransformed_mode_box() {
+        // spec Q3: the same thresholds scaled 2x2 and at identity.
+        for b_scale in [131_072, FIXED_ONE] {
+            let st = crop_probe_state(b_scale);
+            assert!(!st.screen_size_would_crop(3840, 1440), "{b_scale}");
+            assert!(st.screen_size_would_crop(3839, 1440), "{b_scale}");
+            assert!(st.screen_size_would_crop(3840, 1439), "{b_scale}");
+            assert!(!st.screen_size_would_crop(5759, 3841), "{b_scale}");
+        }
+    }
+
+    #[test]
+    fn crtc_info_and_derived_extent_use_the_footprint() {
+        let st = crop_probe_state(131_072);
+        let info = st.crtc_info(4, 0).unwrap();
+        assert_eq!(
+            (info.x, info.y, info.width, info.height),
+            (1920, 0, 3840, 2880)
+        );
+        let info = st.crtc_info(3, 0).unwrap();
+        assert_eq!((info.width, info.height), (1920, 1440));
+        let mut outputs = st.outputs.clone();
+        outputs[1].current_transform = scale_transform(131_072);
+        let derived = RandrState::from_outputs(1, outputs);
+        assert_eq!((derived.screen_width, derived.screen_height), (5760, 2880));
     }
 }

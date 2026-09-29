@@ -1,6 +1,7 @@
 # RANDR CRTC transforms (fractional scaling)
 
-> **Status: draft, reviewed by codex round 1 (2026-09-29), changes applied.**
+> **Status: implementation-ready — reviewed by codex rounds 1–4 (2026-09-29),
+> changes applied.**
 > Issue #185.
 
 ## Problem
@@ -114,8 +115,7 @@ All from `../xserver`, 21.1 branch.
 - `SetCrtcConfig`: applies `pending` → `current`; a differing `pending` makes
   an otherwise identical config a real change (reconfigure + notifies).
 - `GetCrtcTransform`: the full reply (pending and current, names, params).
-- `hasTransforms = 1` is advertised **only in the last commit**, when D3–D6
-  work, as RECORD did. Until then the old BadMatch stays.
+- `hasTransforms = 1`. The branch merges only once D4–D6 render correctly.
 
 ### D2 — Accepted forms (phase 1 contract)
 
@@ -131,30 +131,56 @@ All from `../xserver`, 21.1 branch.
 
 ### D3 — Geometry: one footprint
 
-- `RandrOutput::footprint()` = the mode box through `current`, rounded as
-  Xorg does (the fixed-point bounds; goldens: 1280 × 1.333328 → 1707,
-  1280 × 1.599991 → 2048). Computed from the 16.16 values, never a rounded
-  float scale.
-- Every geometry consumer switches to it: `crtc_info`, `active_monitors`
-  (GetMonitors, XINERAMA), `screen_size_would_crop`, `enabled_output_bbox`,
-  Present's CRTC selection, the logical scene/root extent (not the KMS
-  scanout images, which stay mode-sized), the input thread's pointer bounds.
-  CrtcChangeNotify keeps the mode size.
+- `RandrOutput::footprint()` = `pixman_transform_bounds` of the mode box
+  `(0, 0, w, h)` through the **fixed-point** `current` matrix, as Xorg's
+  `RRModeGetScanoutSize` (`rrcrtc.c:1028-1048`); goldens: 1280 × 1.333328 →
+  1707, 1280 × 1.599991 → 2048. Never a rounded float scale.
+- **Two extents, kept separate.** A client may set the root smaller than a
+  footprint (Q3; Cinnamon does so transiently while changing scale):
+  - the **footprint** serves CRTC and monitor geometry: `crtc_info`,
+    `active_monitors` (GetMonitors, XINERAMA), Present's CRTC selection,
+    output composition (D4) and nearest-CRTC confinement (D5b);
+  - the **root extent** stays exactly what `RRSetScreenSize` set: root
+    storage and protocol geometry, and the input thread's rectangular safety
+    clamp. The footprint-based output bbox derives the root extent only where
+    it does today — before any client logical size (startup, hotplug
+    recompute) — and feeds the "outputs caught up" notification check
+    (`run.rs:2819-2839`). Once a client has set a logical size, that override
+    survives later SetCrtcConfig calls, as it already does
+    (`randr.rs:1209`, `an_explicit_client_logical_size_overrides_a_reserved_slot`);
+    a transformed bbox larger than a cropped root never resizes root storage.
+  The KMS scanout images stay mode-sized. CrtcChangeNotify keeps the mode
+  size.
 - SetCrtcConfig skips `screen_encompasses` when transforms are supported, as
   Xorg does. This is what un-darkens the scale-up sequence.
-- Pointer confinement follows Xorg's `RRPointerMoved` (`rrpointer.c:35-60`,
-  settles Q2): a position outside every CRTC footprint moves to the nearest
-  CRTC, so the holes of a scale-up layout are never reachable. See D5.
-
-### D4 — Rendering a transformed output
-
+- SetScreenSize's crop check keeps using the **untransformed** box: BadMatch
+  iff `width < crtc.x + mode.width` or `height < crtc.y + mode.height`, for
+  every enabled CRTC, transformed or not (measured at the exact boundaries,
+  Q3). A screen may therefore crop a scaled CRTC's footprint.
+- Pointer confinement follows what Xorg 21.1 actually runs (`RRPointerMoved`
+  exists but has no caller): `RRConstrainCursorHarder` on every move and warp
+  (`randr.c:356`, `rrcrtc.c:1942`) keeps a move that would leave every CRTC on
+  the CRTC it came from, only when the CRTCs touch — in a non-touching layout
+  (Cinnamon scale-up) the pointer can enter the hole; after a layout change,
+  `RRPointerScreenConfigured` (`randr.c:665`) moves a pointer outside every
+  CRTC to the nearest one. This also applies to identity layouts with holes.
 - The scene composites a transformed output into an **intermediate image**
-  the size of its footprint, in root space: the existing walk, damage and
-  buffer-age work unchanged, with the output's layout rect = the footprint.
+  allocated at the full footprint size, in root space, origin = the CRTC's
+  (x, y): the existing walk, damage and buffer-age work unchanged, with the
+  output's layout rect = the footprint.
 - A **scale pass** then draws the whole mode-sized scanout image, sampling the
   intermediate through `current` (scanout pixel → root pixel, i.e. the wire
   matrix, minus the CRTC offset), with a nearest or linear sampler. A full
   pass every frame the output repaints; no damage transform in phase 1.
+- **Outside the root extent.** Only footprint ∩ root is composited; the rest
+  of the intermediate is explicitly cleared to transparent black whenever the
+  root or the footprint changes. The pass samples the whole intermediate with
+  clamp-to-edge (in bounds by construction), so the UV origin is fixed and the
+  bilinear edge at the root boundary blends toward that black, matching
+  Xorg's shadow pass, where every sample outside the root reads transparent
+  black and is written as black: `PictOpSrc` from a source picture on the screen drawable with the
+  default `repeat = None` (`xf86Rotate.c:59-89`). Bilinear filtering at the
+  root edge blends toward black, as pixman does.
 - Identity outputs keep today's path: no intermediate, no pass, no cost.
 - Intermediate lifetime: allocated when a transform becomes current, freed
   when it goes back to identity or the output is disabled; accounted under
@@ -175,15 +201,21 @@ All from `../xserver`, 21.1 branch.
 
 - The pointer lives in root (framebuffer) space, as on Xorg. Relative motion
   is applied in root space, unscaled: on a 2.0 output it covers half the
-  physical distance per device unit. Assumed to match Xorg, not verified (Q6).
-- Two directions, one utility over `current`:
-  - scanout → root (the wire matrix plus the CRTC offset): anything that
-    starts from a physical position on a CRTC (absolute devices mapped to an
-    output, touch).
-  - root → scanout (the inverse): where the cursor appears on the physical
-    output, hit-testing a root position against an output.
-- Pointer bounds: nearest-CRTC confinement over footprints (D3), replacing
-  the single bounding box while any CRTC is transformed.
+  physical distance per device unit, as Xorg (measured, Q6).
+- Absolute devices (tablets, touch) map over the **whole root extent**, as
+  Xorg's default does without a Coordinate Transformation Matrix
+  (`input_thread.rs`, fed the root extent). Per-output mapping, and with it
+  any scanout ↔ root mapping on the input side, is out of scope. The scale
+  pass is the only consumer of `M` outside geometry, and a software cursor
+  drawn in root space needs no inverse.
+- **Where confinement runs.** The input thread only knows a rectangular
+  root extent (`input_thread.rs:91`) and keeps clamping to it as a safety
+  bound. Nearest-footprint confinement runs in the backend/core, where the
+  existing pointer clamp lives (`backend.rs:13910`), **before** the cursor
+  moves or any motion/crossing event is delivered, so no event carries an
+  unreachable root position. After a hole clamp, and after a RANDR
+  reconfiguration relocates the pointer, the backend resyncs the input thread
+  with `push_position`.
 - Warps (WarpPointer, XIWarpPointer, XTEST) set a root position and go
   through the same confinement.
 
@@ -199,12 +231,12 @@ All from `../xserver`, 21.1 branch.
 
 ## Phases
 
-1. **Protocol, state, geometry** (D1–D3), still rejecting non-identity
-   transforms at the end of SetCrtcTransform so nothing changes for clients.
-   Unit tests against the goldens.
-2. **Rendering** (D4–D6) behind the same rejection.
-3. **Advertise**: accept D2's forms, `hasTransforms = 1`, status.md.
-   Hardware smoke in both Cinnamon modes on silence's two outputs.
+One feature branch, squashed on merge; merged only when all phases work.
+
+1. **Protocol, state, geometry** (D1–D3), unit tests against the goldens.
+2. **Rendering, cursor, input, readback** (D4–D6).
+3. `docs/status.md`, vng runs, hardware smoke in both Cinnamon modes on
+   silence's two outputs.
 
 ## Invariants
 
@@ -227,7 +259,11 @@ All from `../xserver`, 21.1 branch.
   end (screen size, CRTC info, monitors after each step), including the
   scale-up sequence that currently goes dark.
 - Pixels: a lavapipe test scaling a known pattern through the pass (nearest
-  exact, bilinear within tolerance); vng: root GetImage A/B against Xorg
+  exact, bilinear within tolerance), including a root smaller than the
+  footprint (the cropped part black, the edge blended toward black). Xorg's
+  scanout cannot be dumped in vng, so that crop golden comes from the source
+  rule above plus yserver's own scanout dump, and root GetImage (which only
+  covers the root) is A/B'd against Xorg; vng: root GetImage A/B against Xorg
   after `xrandr --scale` (framebuffer space, should be identical); yserver's
   scanout dump vs root GetImage scaled on the CPU.
 - Hardware: Cinnamon scale-down 100/125/150% and scale-up 125% on silence,
@@ -236,29 +272,39 @@ All from `../xserver`, 21.1 branch.
 
 ## Open questions
 
-- **Q1** Rounding: is Xorg's footprint `pixman_transform_bounds` (outward
-  rounding) of the fixed matrix? The 1.333 → 1707 golden says it rounds up;
-  confirm on the exact code path before writing `footprint()`.
-- **Q2** *Settled:* Xorg moves the pointer to the nearest CRTC footprint
-  (`rrpointer.c:35-60`); D3/D5b adopt it.
-- **Q3** `SetScreenSize`'s crop check in Xorg appears to add the CRTC offset
-  twice (`rrscreen.c:271-279` bounds a box that already starts at x/y through
-  an `f_transform` that also translates). Measure on a two-output Xorg before
-  copying it.
-- **Q4** Scanout image format/modifier must be a colour attachment (or
-  storage image) for the pass; true for the pool today? Otherwise the pass
-  writes a linear/optimal intermediate-sized copy target.
+- **Q1** *Settled:* `pixman_transform_bounds` over the fixed-point
+  `crtc->transform` (`rrcrtc.c:1028-1048`); D3 names it.
+- **Q2** *Settled (corrected in phase 2):* `RRConstrainCursorHarder` per
+  move/warp plus `RRPointerScreenConfigured` after a layout change, not
+  `RRPointerMoved` (no caller in 21.1); see D3.
+- **Q3** *Settled by measurement* (`tools/vng-scenarios/xrandr-scale-crop.sh`,
+  two outputs, B at x = 1920, 1920×1440, `--scale 2x2`, footprint to x = 5760
+  and y = 2880): Xorg applies 5759, 3841 and **3840** wide, rejects **3839**;
+  applies 1441 and **1440** high, rejects **1439** (width and height
+  independently); the identity control has the same 3840 / 1440 thresholds. The check is the untransformed
+  `crtc.x + mode.width` box, not the footprint and not the doubled offset the
+  source reading (`rrscreen.c:266-281` through the translating `f_transform`)
+  predicts. Why the source reads differently is untraced; the measured rule is
+  what D3 adopts.
+- **Q4** *Settled:* scanout images are `COLOR_ATTACHMENT | TRANSFER_SRC |
+  TRANSFER_DST` (`scanout.rs:5801-5811`, pinned by
+  `scanout_usage_matches_render_and_readback_paths`), so the scale pass renders
+  into them as a colour attachment; they are deliberately not `SAMPLED`, which
+  the pass does not need. The intermediate is `SAMPLED | COLOR_ATTACHMENT`.
 - **Q5** VRAM: the transformed CRTC of the scale-down 100% capture needs a
   5120×2880 intermediate, 56.25 MiB at 32 bpp, on top of its scanout images;
   identity CRTCs need none. Acceptable, or allocate lazily on first repaint?
 
-- **Q6** Does Xorg scale relative pointer motion by the CRTC transform?
-  Measure in vng (`xdotool mousemove_relative` / a QEMU relative mouse under
-  `--scale 2x2`) before implementing D5b.
+- **Q6** *Settled by measurement* (`tools/vng-scenarios/pointer-scale-host.sh`,
+  QEMU PS/2 mouse, 4 × `mouse_move 25 10`): Xorg moves the root pointer
+  +53,+21 at identity and +56,+22 under `--scale 2x2` — the same within
+  acceleration noise, so relative motion is not scaled by the transform.
+  yserver's identity phase: +53,+21. `xdotool mousemove_relative` remains a
+  warp/confinement test only.
 
 ## Do not
 
-- Do not advertise `hasTransforms = 1` before D4–D6 render correctly.
+- Do not merge before D4–D6 render correctly.
 - Do not render accepted-but-unsupported matrices or filters approximately:
   reject them.
 - Do not derive the footprint from a rounded float scale.
