@@ -1,0 +1,265 @@
+# RANDR CRTC transforms (fractional scaling)
+
+> **Status: draft, reviewed by codex round 1 (2026-09-29), changes applied.**
+> Issue #185.
+
+## Problem
+
+Cinnamon's fractional scaling (muffin `x11-randr-fractional-scaling`, both
+`fractional-scale-mode`s) and `xrandr --scale` / `--transform` need
+`RRSetCrtcTransform`. yserver answers `BadMatch` for any non-identity
+transform (`process_request.rs`, `RR_SET_CRTC_TRANSFORM`) and reports
+`hasTransforms = 0`, so:
+
+- scale-down 125% shows the 2× UI unscaled (200%) and cannot return to 100%
+  while fractional scaling is on;
+- scale-up 125% disables both CRTCs, sets a screen smaller than the modes,
+  and the re-enable fails: the display stays dark (jos had to zap).
+
+## Measured
+
+### What muffin sends (jos, silence, two 2560×1440 outputs, 2026-09-29)
+
+Captured with a diag build logging every mutating RANDR request
+(`diag/185-randr-log`, local). CRTC 4 at 0,0 and CRTC 6 at 2560,0, both
+mode `0x13` (2560×1440). Order per change: `SetScreenSize`, then per CRTC
+`SetCrtcTransform` + `SetCrtcConfig`.
+
+| setting | SetScreenSize | CRTC 4 | CRTC 6 |
+|---|---|---|---|
+| scale-down 100% | 7680×2880, 1355×508 mm | identity, `fast` | 2.0, `good` |
+| scale-down 125% | 6656×2304, 1084×375 mm | identity, `fast` | 1.599991, `good` |
+| scale-down 150% | 5984×1926, 906×292 mm | identity, `fast` | 1.337494, `good` |
+| scale-up 125% | 4608×1152, 750×188 mm | 0.5, `nearest` | 0.799988, `good` |
+
+- The wire matrix is **the reciprocal of muffin's log text** ("Scaling CRTC 6
+  at 0.625" is its own per-CRTC scale; the wire carries 1.6). All matrices
+  are pure diagonal scale, no translation, `m33 = 1`.
+- Filters are named `fast`, `good` or `nearest`, never `bilinear`: the Render
+  aliases matter.
+- Scale-up keeps CRTC 6 at x = 2560 although CRTC 4's footprint is only 1280
+  wide: outputs are not packed, the screen can have holes.
+- Scale-up disables both CRTCs (mode 0) before re-enabling them with
+  transforms; each CRTC is configured while the other may be off.
+
+### What Xorg does (`tools/vng-scenarios/xrandr-scale.sh`)
+
+Xorg 21.1.24, modesetting, vng guest, one 1280×800 output, a client holding
+the connection (Xorg resets and drops the transform when its last client
+leaves):
+
+| `--scale` | screen = CRTC = monitor | transform read back |
+|---|---|---|
+| 1.6 | 2048×1280 | 1.599991 |
+| 0.625 | 800×500 | 0.625000 |
+| 0.8 | 1024×640 | 0.799988 |
+| 2 | 2560×1600 | 2.000000 |
+| 0.5 | 640×400 | 0.500000 |
+| 1.333333 | 1707×1067 | 1.333328 |
+
+The filter reads back `bilinear`; monitor mm are unchanged by the transform.
+
+## Xorg reference behaviour
+
+All from `../xserver`, 21.1 branch.
+
+- **Direction.** The matrix maps CRTC (scanout) pixels to framebuffer (root)
+  pixels. The framebuffer footprint of a CRTC is its mode rectangle pushed
+  through the matrix (`RRModeGetScanoutSize`, `rrcrtc.c:1030-1058`). `f_transform`
+  additionally carries the CRTC's x/y translation (`rrtransform.c:280-286`).
+- **Pending vs current.** `SetCrtcTransform` only stores the client's
+  *pending* transform (`RRCrtcTransformSet`, `rrcrtc.c:1091-1128`). The next
+  `SetCrtcConfig` applies it and counts a changed pending transform as a
+  change even with identical mode/x/y (`rrcrtc.c:765`); `RRCrtcNotify`
+  copies pending to current (`rrcrtc.c:219-230`).
+- **Validation order** (`ProcRRSetCrtcTransform`, `rrcrtc.c:1755-1785`):
+  BadCrtc → BadAccess (leased) → non-invertible matrix BadMatch → negative
+  param count BadLength → CRTC without transform support BadValue → unknown
+  filter BadName → filter parameter check BadMatch → params without a filter
+  BadMatch.
+- **Filters** are Render's (`PictureSetDefaultFilters`, `render/filter.c:245-265`):
+  `nearest`, `bilinear`, `convolution`, aliases `fast` → nearest,
+  `good`/`best` → bilinear. GetCrtcTransform returns the canonical
+  name.
+- **Geometry.** GetCrtcInfo width/height and GetMonitors use the transformed
+  footprint (`rrcrtc.c:1212`, `rrmonitor.c:71`). CrtcChangeNotify keeps the
+  **mode** size (`rrcrtc.c:249-250`). SetCrtcConfig skips its screen-bounds
+  check when the CRTC supports transforms (`rrcrtc.c:1436`); SetScreenSize
+  checks each CRTC's transformed box (`rrscreen.c:271-279`).
+- **Scanout.** The modesetting driver renders a transformed CRTC through a
+  shadow: the framebuffer is composited into a per-CRTC shadow pixmap
+  through the transform, damage-limited and widened by the filter size
+  (`xf86Rotate.c:90-212`). Page flipping is off while any CRTC has a shadow
+  (`modesetting/present.c:266`).
+- **Cursor.** Hardware cursor is refused while any enabled CRTC has a
+  transform (`xf86Cursors.c:569`): the software cursor is drawn in
+  framebuffer space and scaled with the content.
+- **Pointer** coordinates stay in framebuffer space, confined to the CRTCs'
+  transformed bounds (`RRConstrainCursorHarder`, `rrcrtc.c:275-296`).
+- **Root GetImage** reads the framebuffer, not the scanout: its content is
+  untransformed.
+
+## Design
+
+### D1 — Protocol and state
+
+- Per CRTC: `pending` and `current` transforms, each = 16.16 matrix as
+  received, derived `f64` forward and inverse, canonical filter name
+  (optional), filter params. Default identity with **no** filter, as Xorg's
+  `RRTransformInit` (`rrtransform.c:27-36`); GetCrtcTransform then returns
+  zero filter bytes (`rrcrtc.c:1809`). `nearest` is only the renderer's
+  sampler fallback, never a protocol value the client did not send.
+- `SetCrtcTransform`: Xorg's validation order above, storing `pending`.
+  Big- and little-endian bodies.
+- `SetCrtcConfig`: applies `pending` → `current`; a differing `pending` makes
+  an otherwise identical config a real change (reconfigure + notifies).
+- `GetCrtcTransform`: the full reply (pending and current, names, params).
+- `hasTransforms = 1` is advertised **only in the last commit**, when D3–D6
+  work, as RECORD did. Until then the old BadMatch stays.
+
+### D2 — Accepted forms (phase 1 contract)
+
+- **Matrices:** pure scale only: `m11 > 0`, `m22 > 0`, `m33 = 1`, every
+  other element 0. Translation, rotation, shear, reflection and projective
+  matrices → `BadMatch` on purpose (translation would need its own source
+  origin, clipping, damage, cursor and readback rules; nothing measured sends
+  it). Xorg accepts these; the divergence is documented in `docs/status.md`.
+- **Filters:** `nearest`, `bilinear`, `fast`, `good`, `best` render as named.
+  `convolution` → `BadMatch` on purpose rather than
+  being silently drawn as bilinear.
+- Everything muffin and `xrandr --scale` send is inside this contract.
+
+### D3 — Geometry: one footprint
+
+- `RandrOutput::footprint()` = the mode box through `current`, rounded as
+  Xorg does (the fixed-point bounds; goldens: 1280 × 1.333328 → 1707,
+  1280 × 1.599991 → 2048). Computed from the 16.16 values, never a rounded
+  float scale.
+- Every geometry consumer switches to it: `crtc_info`, `active_monitors`
+  (GetMonitors, XINERAMA), `screen_size_would_crop`, `enabled_output_bbox`,
+  Present's CRTC selection, the logical scene/root extent (not the KMS
+  scanout images, which stay mode-sized), the input thread's pointer bounds.
+  CrtcChangeNotify keeps the mode size.
+- SetCrtcConfig skips `screen_encompasses` when transforms are supported, as
+  Xorg does. This is what un-darkens the scale-up sequence.
+- Pointer confinement follows Xorg's `RRPointerMoved` (`rrpointer.c:35-60`,
+  settles Q2): a position outside every CRTC footprint moves to the nearest
+  CRTC, so the holes of a scale-up layout are never reachable. See D5.
+
+### D4 — Rendering a transformed output
+
+- The scene composites a transformed output into an **intermediate image**
+  the size of its footprint, in root space: the existing walk, damage and
+  buffer-age work unchanged, with the output's layout rect = the footprint.
+- A **scale pass** then draws the whole mode-sized scanout image, sampling the
+  intermediate through `current` (scanout pixel → root pixel, i.e. the wire
+  matrix, minus the CRTC offset), with a nearest or linear sampler. A full
+  pass every frame the output repaints; no damage transform in phase 1.
+- Identity outputs keep today's path: no intermediate, no pass, no cost.
+- Intermediate lifetime: allocated when a transform becomes current, freed
+  when it goes back to identity or the output is disabled; accounted under
+  its own `vram by use` bucket (#169).
+
+### D5 — Direct scanout, cursor
+
+- Direct scanout (client buffer flipped to the CRTC) is off while **any**
+  CRTC has a non-identity current transform, as Xorg. Entering a transform
+  while flipped goes through the normal unflip.
+- The cursor is forced to the software path while any CRTC is transformed,
+  and then on **every** output, identity ones included, so it does not vanish
+  when crossing from a transformed output to an untransformed one. On a
+  transformed output it is drawn into the intermediate at root coordinates and
+  scales with the content.
+
+### D5b — Input and cursor mapping
+
+- The pointer lives in root (framebuffer) space, as on Xorg. Relative motion
+  is applied in root space, unscaled: on a 2.0 output it covers half the
+  physical distance per device unit. Assumed to match Xorg, not verified (Q6).
+- Two directions, one utility over `current`:
+  - scanout → root (the wire matrix plus the CRTC offset): anything that
+    starts from a physical position on a CRTC (absolute devices mapped to an
+    output, touch).
+  - root → scanout (the inverse): where the cursor appears on the physical
+    output, hit-testing a root position against an output.
+- Pointer bounds: nearest-CRTC confinement over footprints (D3), replacing
+  the single bounding box while any CRTC is transformed.
+- Warps (WarpPointer, XIWarpPointer, XTEST) set a root position and go
+  through the same confinement.
+
+### D6 — Root GetImage and screenshots
+
+- Root GetImage / ShmGetImage returns **framebuffer-space** content for the
+  whole requested rect, as Xorg: for each output the request overlaps, the
+  overlapping part comes from the intermediate if the output is transformed,
+  else from its scanout image; the rest as today (zero-filled holes). A
+  request crossing a transformed and an untransformed output is assembled
+  from both.
+- The scanout dump keeps dumping scanout images (what the monitor shows).
+
+## Phases
+
+1. **Protocol, state, geometry** (D1–D3), still rejecting non-identity
+   transforms at the end of SetCrtcTransform so nothing changes for clients.
+   Unit tests against the goldens.
+2. **Rendering** (D4–D6) behind the same rejection.
+3. **Advertise**: accept D2's forms, `hasTransforms = 1`, status.md.
+   Hardware smoke in both Cinnamon modes on silence's two outputs.
+
+## Invariants
+
+- An identity transform renders exactly as today, on the same path.
+- All protocol-visible sizes of a CRTC come from `footprint()`, except
+  CrtcChangeNotify (mode size).
+- A root-space pixel read back by GetImage is the pixel the scene composited,
+  never a scaled scanout pixel.
+- No non-identity transform is ever flipped directly to a CRTC.
+
+## Test plan
+
+- Protocol: request/reply encoding both byte orders; validation order; the
+  pending/current split and SetCrtcConfig re-apply; GetCrtcTransform
+  canonical filter names. Goldens from Xorg modesetting in vng (extend
+  `xrandr-scale.sh` with `xrandr --verbose` readback and error cases; Xvfb
+  cannot serve, it has no transform support and answers BadValue).
+- Geometry: footprint rounding for 1.6, 1.333, 0.8, 2.0, 0.5 against the
+  table above; muffin's four captured sequences replayed as unit tests end to
+  end (screen size, CRTC info, monitors after each step), including the
+  scale-up sequence that currently goes dark.
+- Pixels: a lavapipe test scaling a known pattern through the pass (nearest
+  exact, bilinear within tolerance); vng: root GetImage A/B against Xorg
+  after `xrandr --scale` (framebuffer space, should be identical); yserver's
+  scanout dump vs root GetImage scaled on the CPU.
+- Hardware: Cinnamon scale-down 100/125/150% and scale-up 125% on silence,
+  cursor, direct-scanout apps (video, a game) under a transform, then back to
+  identity.
+
+## Open questions
+
+- **Q1** Rounding: is Xorg's footprint `pixman_transform_bounds` (outward
+  rounding) of the fixed matrix? The 1.333 → 1707 golden says it rounds up;
+  confirm on the exact code path before writing `footprint()`.
+- **Q2** *Settled:* Xorg moves the pointer to the nearest CRTC footprint
+  (`rrpointer.c:35-60`); D3/D5b adopt it.
+- **Q3** `SetScreenSize`'s crop check in Xorg appears to add the CRTC offset
+  twice (`rrscreen.c:271-279` bounds a box that already starts at x/y through
+  an `f_transform` that also translates). Measure on a two-output Xorg before
+  copying it.
+- **Q4** Scanout image format/modifier must be a colour attachment (or
+  storage image) for the pass; true for the pool today? Otherwise the pass
+  writes a linear/optimal intermediate-sized copy target.
+- **Q5** VRAM: the transformed CRTC of the scale-down 100% capture needs a
+  5120×2880 intermediate, 56.25 MiB at 32 bpp, on top of its scanout images;
+  identity CRTCs need none. Acceptable, or allocate lazily on first repaint?
+
+- **Q6** Does Xorg scale relative pointer motion by the CRTC transform?
+  Measure in vng (`xdotool mousemove_relative` / a QEMU relative mouse under
+  `--scale 2x2`) before implementing D5b.
+
+## Do not
+
+- Do not advertise `hasTransforms = 1` before D4–D6 render correctly.
+- Do not render accepted-but-unsupported matrices or filters approximately:
+  reject them.
+- Do not derive the footprint from a rounded float scale.
+- Do not transform output damage in phase 1; repaint the pass fully.
