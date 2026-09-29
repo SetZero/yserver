@@ -130,10 +130,12 @@ from.
       discards it (`let _dropped = …`, e.g. `xkb_layout.rs`,
       `sync_await.rs`, `xi1_state_notify.rs`). A client over the cap is
       not disconnected: that event is silently lost and later ones still
-      go out. RECORD routes its failures through
-      `take_failed_recorders` → `disconnect_with_pending_cleanup`; the
-      other fanouts need the same. Found in static review; not yet
-      observed at runtime.
+      go out. Xorg never drops: a write error is a deferred close
+      (`MarkClientException`, `os/io.c:948`), and a slow client's output
+      buffer just grows (`io.c:915-928`), so the cap itself is ours.
+      RECORD routes its failures through `take_failed_recorders` →
+      `disconnect_with_pending_cleanup`; the other fanouts need the same.
+      Found in static review; not yet observed at runtime.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's
