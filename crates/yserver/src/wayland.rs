@@ -29,7 +29,8 @@
 //! The title is `_NET_WM_NAME`, or `WM_NAME`; the app id is `WM_CLASS`'s
 //! class, what a window rule matches. Both follow the properties.
 //!
-//! The seat -- keys, pointer, wheel, focus and cursor -- is [`input`]'s.
+//! The seat -- keys, pointer, wheel, focus and cursor -- is [`input`]'s,
+//! and the clipboard, X's selections both ways, [`clipboard`]'s.
 //!
 //! Not yet: override-redirect windows (menus, as popups), and the
 //! compositor's own size and close for a window (docs/YSERVER.md, Y5).
@@ -52,7 +53,8 @@
 //! * `Backend::poll_deferred_input` calls `KmsBackend::sync_wayland` once
 //!   per loop iteration: the server's own redirect of the root's children
 //!   (`yserver_core`'s `redirect_subwindows_for_server`), then
-//!   [`WaylandLink::sync`] and [`WaylandLink::sync_cursor`];
+//!   [`WaylandLink::sync`], [`WaylandLink::sync_cursor`] and
+//!   [`WaylandLink::sync_clipboard`];
 //! * `Backend::on_window_property_changed` calls
 //!   [`WaylandLink::property_changed`];
 //! * `impl WindowImages for KmsBackend` reads a window back, and
@@ -62,6 +64,11 @@
 //! the pointer's hit test to the top-level the compositor has it on, and
 //! `set_input_focus_for_server` in `process_request.rs`, the server's own
 //! SetInputFocus for the keyboard's enter and leave.
+//!
+//! The clipboard's core pieces are `ServerState::server_selection_events`,
+//! where what the selection protocol sends the server's own window is
+//! queued, and the server's own selection requests in `process_request.rs`
+//! (`selection_window_for_server` and its siblings).
 //!
 //! A top-level is keyed by its X window's host XID ([`WaylandLink`]'s
 //! `toplevels`), and `WaylandLink::by_surface` finds one from the
@@ -102,6 +109,7 @@ pub enum Request {
     },
 }
 
+mod clipboard;
 mod input;
 mod popups;
 pub use input::CursorSource;
@@ -180,6 +188,10 @@ pub struct WaylandLink {
     /// Host XIDs of popups the compositor took away (`popup_done`), not
     /// made again until their X window unmaps.
     dismissed: HashSet<u32>,
+    /// X's selections and the compositor's clipboard, one in both
+    /// directions ([`clipboard`]); `None` when the compositor has no
+    /// `ext_data_control_v1`.
+    clipboard: Option<clipboard::Clipboard>,
 }
 
 impl WaylandLink {
@@ -191,10 +203,15 @@ impl WaylandLink {
     /// No `WAYLAND_DISPLAY`, a socket that refuses, or a compositor that
     /// closes the connection during the first round trips.
     pub fn connect() -> io::Result<Self> {
-        let client = Client::connect().map_err(|error| {
+        let mut client = Client::connect().map_err(|error| {
             io::Error::new(io::ErrorKind::NotConnected, format!("wayland: {error}"))
         })?;
+        let clipboard = clipboard::Clipboard::bind(&mut client);
+        if clipboard.is_none() {
+            log::warn!("wayland: the compositor has no ext_data_control_v1; no clipboard");
+        }
         Ok(Self {
+            clipboard,
             client,
             toplevels: HashMap::new(),
             renamed: HashSet::new(),
@@ -272,8 +289,38 @@ impl WaylandLink {
                     toplevel.close = true;
                 }
             }
+            Event::Object {
+                object,
+                opcode,
+                ref args,
+                ..
+            } if self.clipboard.as_mut().is_some_and(|clipboard| {
+                clipboard.event(&mut self.client, object, opcode, args)
+            }) => {}
             other => log::debug!("wayland: {other:?}"),
         }
+    }
+
+    /// Follow X's selections and the compositor's on each other, and move
+    /// what pastes are under way ([`clipboard`]). Once per loop iteration.
+    pub fn sync_clipboard(
+        &mut self,
+        state: &mut ServerState,
+        backend: &mut dyn yserver_core::backend::Backend,
+    ) {
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clipboard.sync(&mut self.client, state, backend);
+        }
+        self.flush();
+    }
+
+    /// Whether a paste is under way, for which the loop must come round
+    /// again soon.
+    #[must_use]
+    pub fn clipboard_busy(&self) -> bool {
+        self.clipboard
+            .as_ref()
+            .is_some_and(clipboard::Clipboard::busy)
     }
 
     fn by_surface(&mut self, surface: SurfaceId) -> Option<&mut Toplevel> {

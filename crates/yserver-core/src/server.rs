@@ -935,6 +935,41 @@ pub struct PresentWindowMsc {
     pub last_raw_msc: u64,
 }
 
+/// A selection event for a window the server owns
+/// ([`ServerState::server_selection_events`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerSelectionEvent {
+    /// A client's `ConvertSelection` of a selection a server window owns:
+    /// the `SelectionRequest` the owner would be sent.
+    Request {
+        /// The request's time, or 0 for `CurrentTime`.
+        time: u32,
+        /// The server's window that owns the selection.
+        owner: ResourceId,
+        /// The client's window the answer goes to.
+        requestor: ResourceId,
+        /// The selection.
+        selection: AtomId,
+        /// The type asked for.
+        target: AtomId,
+        /// Where on `requestor` to put it; `None` from an obsolete client,
+        /// which means `target`.
+        property: AtomId,
+    },
+    /// The `SelectionNotify` a selection's owner sent a server window that
+    /// asked for it, or the server itself sent when nothing owned it.
+    Notify {
+        /// The server's window that asked.
+        requestor: ResourceId,
+        /// The selection.
+        selection: AtomId,
+        /// The type asked for.
+        target: AtomId,
+        /// Where the answer is on `requestor`; `None` when there is none.
+        property: AtomId,
+    },
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -973,6 +1008,15 @@ pub struct ServerState {
     /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
     /// `selection->lastTimeChanged`).
     pub selections: HashMap<AtomId, (ResourceId, u32)>,
+    /// What the server's own selection windows were sent, for the backend
+    /// that owns them to answer: a rootless server's bridge between X
+    /// selections and another display system's clipboard (yserver's
+    /// Wayland backend). A client has no connection to answer through, so
+    /// the requests a `ConvertSelection` would send the owner, and the
+    /// `SelectionNotify` a `SendEvent` would send the requestor, are queued
+    /// here for the backend to take (`core_loop::process_request`'s
+    /// `convert_selection_for_server` and its siblings).
+    pub server_selection_events: Vec<ServerSelectionEvent>,
     /// Last known pointer position in root coordinates, cached from the
     /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
     /// `xXIEnterEvent` layout and carry the pointer position) are emitted
@@ -1449,6 +1493,7 @@ impl ServerState {
             randr_unsupported_warned_mask: 0,
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
+            server_selection_events: Vec::new(),
             pointer_root: (0, 0),
             active_pointer_grab: None,
             button_grabs: Vec::new(),

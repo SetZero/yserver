@@ -1202,6 +1202,183 @@ pub fn close_window_for_server(
     .map(drop)
 }
 
+/// A window of the server's own that can own a selection and be sent one:
+/// an unmapped `InputOnly` child of the root, owned by `SERVER_OWNER`, at
+/// the first free id of the server's range. Made once; an existing one is
+/// given back, and one a server reset took is made again.
+///
+/// A rootless server's bridge to another display system's clipboard
+/// (yserver's Wayland backend) owns X selections with it on that system's
+/// behalf, and asks X clients for theirs with it, as Xwayland does with a
+/// window of its own. What the selection protocol sends it is queued in
+/// [`ServerState::server_selection_events`].
+pub fn selection_window_for_server(
+    state: &mut ServerState,
+    known: Option<ResourceId>,
+) -> ResourceId {
+    if let Some(window) = known
+        && state.resources.window_owner(window) == Some(crate::resources::SERVER_OWNER)
+    {
+        return window;
+    }
+    let mut id = 0x110;
+    while state.xid_occupied(id) {
+        id += 1;
+    }
+    let window = ResourceId(id);
+    state.resources.create_window(
+        crate::resources::SERVER_OWNER,
+        x11::CreateWindowRequest {
+            window,
+            parent: ROOT_WINDOW,
+            width: 1,
+            height: 1,
+            class: 2, // InputOnly
+            ..x11::CreateWindowRequest::default()
+        },
+    );
+    debug!("the server's selection window is 0x{id:x}");
+    window
+}
+
+/// Make the server's `window` the owner of `selection`, or give it up with
+/// `None`, as a client's `SetSelectionOwner` at `CurrentTime` would: the
+/// previous owner hears `SelectionClear`, and XFIXES subscribers are told.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn set_selection_owner_for_server(
+    state: &mut ServerState,
+    selection: AtomId,
+    window: Option<ResourceId>,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&window.map_or(0, |window| window.0).to_le_bytes());
+    body.extend_from_slice(&selection.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    handle_set_selection_owner(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
+/// Ask for `selection` as `target`, to be put in `property` on the server's
+/// `requestor`, as a client's `ConvertSelection` at `CurrentTime` would.
+/// The answer is a [`crate::server::ServerSelectionEvent::Notify`].
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn convert_selection_for_server(
+    state: &mut ServerState,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(20);
+    for word in [requestor.0, selection.0, target.0, property.0, 0] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    handle_convert_selection(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
+/// Replace `property` on `window` with `data` of `type` in `format` (8, 16
+/// or 32, `data` in this machine's order), as a client's `ChangeProperty`
+/// would: the window's watchers hear `PropertyNotify`. How the server
+/// answers a `SelectionRequest` it was sent.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn change_property_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+    property: AtomId,
+    r#type: AtomId,
+    format: u8,
+    data: &[u8],
+) -> io::Result<()> {
+    let unit = usize::from(format / 8).max(1);
+    let length = u32::try_from(data.len() / unit).unwrap_or(u32::MAX);
+    let mut body = Vec::with_capacity(20 + data.len() + 3);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&property.0.to_le_bytes());
+    body.extend_from_slice(&r#type.0.to_le_bytes());
+    body.extend_from_slice(&[format, 0, 0, 0]);
+    body.extend_from_slice(&length.to_le_bytes());
+    body.extend_from_slice(data);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    let header = RequestHeader {
+        opcode: 18,
+        data: 0, // Replace
+        length_units: u32::try_from(body.len() / 4 + 1).unwrap_or(u32::MAX),
+    };
+    handle_change_property(
+        state,
+        backend,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        header,
+        &body,
+    )
+    .map(drop)
+}
+
+/// Tell `requestor`'s client the answer to its `ConvertSelection` is in
+/// `property` (`None` for a refusal), as a selection owner's `SendEvent`
+/// of a `SelectionNotify` would.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn send_selection_notify_for_server(
+    state: &mut ServerState,
+    time: u32,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(40);
+    body.extend_from_slice(&requestor.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let mut event = [0u8; 32];
+    event[0] = 31; // SelectionNotify
+    event[4..8].copy_from_slice(&time.to_le_bytes());
+    event[8..12].copy_from_slice(&requestor.0.to_le_bytes());
+    event[12..16].copy_from_slice(&selection.0.to_le_bytes());
+    event[16..20].copy_from_slice(&target.0.to_le_bytes());
+    event[20..24].copy_from_slice(&property.0.to_le_bytes());
+    body.extend_from_slice(&event);
+    let header = RequestHeader {
+        opcode: 25,
+        data: 0,
+        length_units: 11,
+    };
+    handle_send_event(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        header,
+        &body,
+    )
+    .map(drop)
+}
+
 /// Stage 4b.8: same-owner mode-flip handler. When a client
 /// re-issues `Redirect{Window,Subwindows}(W, new_mode)` while it
 /// already owns a record at the same key with a different mode,
@@ -28947,6 +29124,29 @@ fn handle_convert_selection(
     let property = AtomId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
     let time_val = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
 
+    // A selection the server's own window owns is answered by the backend
+    // that made it, which has no connection for the SelectionRequest.
+    if let Some(&(owner_window, _)) = state.selections.get(&selection)
+        && owner_window != ROOT_WINDOW
+        && state.resources.window_owner(owner_window) == Some(crate::resources::SERVER_OWNER)
+    {
+        state
+            .server_selection_events
+            .push(crate::server::ServerSelectionEvent::Request {
+                time: time_val,
+                owner: owner_window,
+                requestor,
+                selection,
+                target: target_atom,
+                property,
+            });
+        debug!(
+            "client {} #{} ConvertSelection -> the server's window 0x{:x}",
+            client_id.0, sequence.0, owner_window.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(
@@ -28965,6 +29165,18 @@ fn handle_convert_selection(
             "client {} #{} ConvertSelection -> owner 0x{:x}",
             client_id.0, sequence.0, owner_window.0
         );
+    } else if requestor != ROOT_WINDOW
+        && state.resources.window_owner(requestor) == Some(crate::resources::SERVER_OWNER)
+    {
+        // No owner, and the server asked: its backend hears the refusal.
+        state
+            .server_selection_events
+            .push(crate::server::ServerSelectionEvent::Notify {
+                requestor,
+                selection,
+                target: target_atom,
+                property: AtomId(0),
+            });
     } else {
         // No owner — send SelectionNotify(None) to the requestor.
         let requestor_id = state
@@ -29021,6 +29233,40 @@ fn handle_send_event(
     // Set the sent-event bit (bit 7 of first byte).
     let mut event_copy = *req.event;
     event_copy[0] |= 0x80;
+
+    // A SelectionNotify for a window of the server's own, the answer to a
+    // `convert_selection_for_server`: its backend takes it, as no client
+    // can.
+    if req.event[0] & 0x7f == 31
+        && req.destination != ROOT_WINDOW
+        && state.resources.window_owner(req.destination) == Some(crate::resources::SERVER_OWNER)
+    {
+        let word = |at: usize| {
+            let bytes = [
+                req.event[at],
+                req.event[at + 1],
+                req.event[at + 2],
+                req.event[at + 3],
+            ];
+            match sender_byte_order {
+                ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+                ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            }
+        };
+        state
+            .server_selection_events
+            .push(crate::server::ServerSelectionEvent::Notify {
+                requestor: ResourceId(word(8)),
+                selection: AtomId(word(12)),
+                target: AtomId(word(16)),
+                property: AtomId(word(20)),
+            });
+        debug!(
+            "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",
+            client_id.0, sequence.0, req.destination.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
 
     let mut targets: Vec<ClientId> = if req.destination.0 == 0xffff_ffff {
         subscribers_by_id(state, ROOT_WINDOW, req.event_mask)
@@ -52091,6 +52337,137 @@ mod tests {
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x0040_0030));
         }
         ResourceId(WINDOW_XID)
+    }
+
+    /// A selection the server's own window owns is asked of the server,
+    /// and its answer reaches the client; a client's answer to the
+    /// server's own request is the server's to take.
+    #[test]
+    fn a_selection_the_server_owns_is_asked_of_and_answered_by_the_server() {
+        use crate::server::ServerSelectionEvent;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_window = server_helper_window(&mut state);
+        let clipboard = state.atoms.intern("CLIPBOARD", false);
+        let utf8 = state.atoms.intern("UTF8_STRING", false);
+        let property = state.atoms.intern("PASTE", false);
+
+        let server = selection_window_for_server(&mut state, None);
+        assert_eq!(
+            selection_window_for_server(&mut state, Some(server)),
+            server
+        );
+        assert_eq!(
+            state.resources.window_owner(server),
+            Some(crate::resources::SERVER_OWNER)
+        );
+        set_selection_owner_for_server(&mut state, clipboard, Some(server)).expect("own");
+        assert_eq!(
+            state.selections.get(&clipboard).map(|held| held.0),
+            Some(server)
+        );
+
+        // The client's ConvertSelection is the server's to answer.
+        let mut body = Vec::new();
+        for word in [client_window.0, clipboard.0, utf8.0, property.0, 7] {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        let _ = read_all_available(&mut peer);
+        handle_convert_selection(&mut state, ClientId(1), SequenceNumber(1), &body)
+            .expect("convert");
+        assert_eq!(
+            std::mem::take(&mut state.server_selection_events),
+            vec![ServerSelectionEvent::Request {
+                time: 7,
+                owner: server,
+                requestor: client_window,
+                selection: clipboard,
+                target: utf8,
+                property,
+            }]
+        );
+        change_property_for_server(
+            &mut state,
+            &mut backend,
+            client_window,
+            property,
+            utf8,
+            8,
+            b"hi",
+        )
+        .expect("put");
+        assert_eq!(
+            state
+                .resources
+                .window_property(client_window, property)
+                .map(|value| value.data.clone()),
+            Some(b"hi".to_vec())
+        );
+        send_selection_notify_for_server(&mut state, 7, client_window, clipboard, utf8, property)
+            .expect("notify");
+        let out = read_all_available(&mut peer);
+        let notify = out
+            .chunks(32)
+            .find(|event| event[0] & 0x7f == 31)
+            .expect("a SelectionNotify");
+        assert_eq!(&notify[20..24], &property.0.to_le_bytes());
+
+        // The client owns it now; the server asks, and the client's
+        // SendEvent of the answer is queued for the server.
+        let mut body = Vec::new();
+        for word in [client_window.0, clipboard.0, 0] {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        handle_set_selection_owner(&mut state, ClientId(1), SequenceNumber(2), &body)
+            .expect("the client owns it");
+        convert_selection_for_server(&mut state, server, clipboard, utf8, property)
+            .expect("the server asks");
+        let out = read_all_available(&mut peer);
+        assert!(
+            out.chunks(32).any(|event| event[0] & 0x7f == 30),
+            "the client is sent a SelectionRequest"
+        );
+        let mut body = Vec::new();
+        body.extend_from_slice(&server.0.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let mut event = [0u8; 32];
+        event[0] = 31;
+        event[8..12].copy_from_slice(&server.0.to_le_bytes());
+        event[12..16].copy_from_slice(&clipboard.0.to_le_bytes());
+        event[16..20].copy_from_slice(&utf8.0.to_le_bytes());
+        event[20..24].copy_from_slice(&property.0.to_le_bytes());
+        body.extend_from_slice(&event);
+        let header = RequestHeader {
+            opcode: 25,
+            data: 0,
+            length_units: 11,
+        };
+        handle_send_event(&mut state, ClientId(1), SequenceNumber(3), header, &body).expect("send");
+        assert_eq!(
+            std::mem::take(&mut state.server_selection_events),
+            vec![ServerSelectionEvent::Notify {
+                requestor: server,
+                selection: clipboard,
+                target: utf8,
+                property,
+            }]
+        );
+
+        // With no owner, the server hears the refusal.
+        state.selections.clear();
+        convert_selection_for_server(&mut state, server, clipboard, utf8, property)
+            .expect("the server asks");
+        assert_eq!(
+            state.server_selection_events,
+            vec![ServerSelectionEvent::Notify {
+                requestor: server,
+                selection: clipboard,
+                target: utf8,
+                property: AtomId(0),
+            }]
+        );
     }
 
     /// A compositor's size for a top-level reaches the window and its

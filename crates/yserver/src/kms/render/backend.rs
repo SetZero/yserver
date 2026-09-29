@@ -8161,6 +8161,7 @@ impl KmsBackend {
         link.sync(state, self);
         link.sync_cursor(self);
         let requests = link.take_requests();
+        link.sync_clipboard(state, self);
         self.wayland = Some(link);
         // What the compositor asked of the windows, which only the core,
         // with the state in hand, can carry out.
@@ -18979,9 +18980,20 @@ impl Backend for KmsBackend {
         let rescan_deadline = self
             .hotplug_rescan_deadline
             .map(|until| if now >= until { now } else { until });
+        // A paste between X and the compositor moves a little each
+        // iteration, through pipes the loop does not poll.
+        #[cfg(feature = "wayland")]
+        let clipboard_deadline = self
+            .wayland
+            .as_ref()
+            .filter(|link| link.clipboard_busy())
+            .map(|_| now + std::time::Duration::from_millis(5));
+        #[cfg(not(feature = "wayland"))]
+        let clipboard_deadline = None;
         scene_deadline
             .into_iter()
             .chain(present_deadline)
+            .chain(clipboard_deadline)
             .chain(rescan_deadline)
             .chain(
                 allow_kms_timers
