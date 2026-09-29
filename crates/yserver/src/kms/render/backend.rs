@@ -17219,8 +17219,6 @@ fn read_scanout_region_named(
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<(Vec<u8>, ScanoutReadOrigin)> {
-    use crate::kms::vk::ops::run_one_shot_op_with_wait;
-
     if rect.extent.width == 0 || rect.extent.height == 0 {
         return Ok((Vec::new(), ScanoutReadOrigin::Empty));
     }
@@ -17307,39 +17305,29 @@ fn read_scanout_region_named(
     // Readback must therefore use that local image/staging allocation with A's
     // live Vk context; the external transport is not acquired or synchronized,
     // while display, M2 retention, and pageflip retirement keep using B.
-    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
+    let (image, copied_route) = match pool {
         crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
             let Some(bo) = pool.bos.get(bo_idx) else {
                 return Err(io::Error::other("scanout bo vanished"));
             };
-            if needed_bytes > bo.vk_transfer.staging_size as usize {
-                return Err(io::Error::other("scanout staging buffer too small"));
-            }
-            (
-                bo.vk_image,
-                bo.vk_transfer.staging_buffer,
-                bo.vk_transfer.staging_mapped,
-                false,
-            )
+            (bo.vk_image, false)
         }
         crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
             let Some(source) = pool.sources.get(bo_idx) else {
                 return Err(io::Error::other("copied scanout source vanished"));
             };
-            if needed_bytes > source.transfer.staging_size as usize {
-                return Err(io::Error::other("scanout staging buffer too small"));
-            }
             source.validate_renderer_readback()?;
-            (
-                source.image(),
-                source.transfer.staging_buffer,
-                source.transfer.staging_mapped,
-                true,
-            )
+            (source.image(), true)
         }
     };
+    // The per-BO transfer staging is device-local write-combined memory,
+    // which the CPU reads uncached; copy into the host-cached readback
+    // buffer instead (x11vnc polls root rows at thousands of reads/s).
+    let (staging_buffer, staging_mapped) =
+        ensure_scanout_readback(&mut backend.platform, &vk, needed_bytes)?;
 
-    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, None, |vk, cb| {
+    let op = ensure_scanout_readback_op(&mut backend.platform, &vk, pool_handle)?;
+    let run_result = op.run(|vk, cb| {
         let pre = [ash::vk::ImageMemoryBarrier2::default()
             .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -17408,23 +17396,100 @@ fn read_scanout_region_named(
         Ok(())
     });
 
-    if let Err(e) = run_result {
+    if let Err(crate::kms::vk::ops::OneShotError {
+        result: e,
+        in_flight,
+    }) = run_result
+    {
+        if in_flight {
+            // The copy may still be running: abandon the readback buffer,
+            // command buffer and fence rather than free what the GPU may use.
+            std::mem::forget(backend.platform.scanout_readback.take());
+            std::mem::forget(backend.platform.scanout_readback_op.take());
+        }
         if copied_route || e == ash::vk::Result::ERROR_DEVICE_LOST {
-            // The one-shot helper cannot distinguish a post-submit wait
-            // failure from earlier errors at this boundary. Fail closed: the
-            // copied source may have executed work (including an ownership
-            // acquire) and must not be reused or destroyed under an uncertain
-            // live submission. DEVICE_LOST is fatal on the shared path too.
+            // Deliberately fatal on any copied-route error, even pre-submit
+            // ones `in_flight` would clear: the copied source may have
+            // executed work (including an ownership acquire) and is not
+            // reused under an uncertain state. DEVICE_LOST is fatal on the
+            // shared path too.
             backend.platform.renderer_failed = true;
         }
         return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
     }
 
+    if let Some(readback) = backend.platform.scanout_readback.as_ref() {
+        readback
+            .invalidate_for_read()
+            .map_err(|e| io::Error::other(format!("scanout readback invalidate: {e:?}")))?;
+    }
+    // SAFETY: the buffer is mapped for at least `needed_bytes`, the copy's
+    // fence has signalled, and `invalidate_for_read` made its writes visible.
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
     Ok((
         raw.to_vec(),
         ScanoutReadOrigin::ComposedPool { pool_idx, bo_idx },
     ))
+}
+
+/// Return the platform's reusable scanout-readback command buffer and fence,
+/// recreating them for a new `VkContext` or command pool.
+fn ensure_scanout_readback_op<'a>(
+    platform: &'a mut PlatformBackend,
+    vk: &std::sync::Arc<crate::kms::vk::device::VkContext>,
+    pool: ash::vk::CommandPool,
+) -> io::Result<&'a mut crate::kms::vk::ops::ReusableOneShot> {
+    if !platform
+        .scanout_readback_op
+        .as_ref()
+        .is_some_and(|op| op.matches(vk, pool))
+    {
+        platform.scanout_readback_op = None;
+        let op = crate::kms::vk::ops::ReusableOneShot::new(std::sync::Arc::clone(vk), pool)
+            .map_err(|e| io::Error::other(format!("scanout readback op alloc: {e:?}")))?;
+        platform.scanout_readback_op = Some(op);
+    }
+    Ok(platform
+        .scanout_readback_op
+        .as_mut()
+        .expect("scanout readback op just ensured"))
+}
+
+/// Granularity of [`ensure_scanout_readback`] growth: a full-screen read
+/// allocates once, and the per-row reads that follow fit.
+const SCANOUT_READBACK_GRANULE: u64 = 1024 * 1024;
+
+/// Return the platform's scanout readback buffer, (re)allocating it when it
+/// is missing, smaller than `needed_bytes`, or from another `VkContext`.
+fn ensure_scanout_readback(
+    platform: &mut PlatformBackend,
+    vk: &std::sync::Arc<crate::kms::vk::device::VkContext>,
+    needed_bytes: usize,
+) -> io::Result<(ash::vk::Buffer, std::ptr::NonNull<u8>)> {
+    let needed = needed_bytes as u64;
+    let reusable = platform
+        .scanout_readback
+        .as_ref()
+        .is_some_and(|b| b.size() >= needed && std::sync::Arc::ptr_eq(b.vk(), vk));
+    if !reusable {
+        // Idle: every read waits on its own fence before returning.
+        platform.scanout_readback = None;
+        let size = needed
+            .div_ceil(SCANOUT_READBACK_GRANULE)
+            .max(1)
+            .saturating_mul(SCANOUT_READBACK_GRANULE);
+        let buffer = crate::kms::render::engine::StagingBuffer::new_for_readback(
+            std::sync::Arc::clone(vk),
+            size,
+        )
+        .map_err(|e| io::Error::other(format!("scanout readback alloc: {e:?}")))?;
+        platform.scanout_readback = Some(buffer);
+    }
+    let buffer = platform
+        .scanout_readback
+        .as_ref()
+        .expect("scanout readback just ensured");
+    Ok((buffer.buffer(), buffer.mapped()))
 }
 
 fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
