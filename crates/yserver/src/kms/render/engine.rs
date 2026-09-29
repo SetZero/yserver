@@ -17503,15 +17503,16 @@ mod tests {
         );
         assert_eq!(idle(&engine), 0);
 
-        // Closed but not submitted: the fence cannot have signalled.
+        // Closing submits frame A, whose fence may signal at any time; its
+        // block only goes back on the idle list through the retire walk, so
+        // don't run one until frame B has taken its block.
         engine
             .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
             .expect("close frame A");
-        engine.poll_retired(&platform);
         assert_eq!(
             idle(&engine),
             0,
-            "a frame whose fence has not signalled must not return its blocks"
+            "a closed frame must not return its blocks before retiring"
         );
 
         // Frame B, opened while A is in flight: a block of its own.
