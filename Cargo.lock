@@ -166,7 +166,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 [[package]]
 name = "compositor-protocol"
 version = "0.1.0"
-source = "git+https://github.com/SetZero/ferrix?rev=f1ced5619d7b076ba7c1080f84f1219cb652be4c#f1ced5619d7b076ba7c1080f84f1219cb652be4c"
+source = "git+https://github.com/SetZero/ferrix?rev=ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7#ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7"
 dependencies = [
  "compositor-wire",
 ]
@@ -174,7 +174,7 @@ dependencies = [
 [[package]]
 name = "compositor-shm"
 version = "0.1.0"
-source = "git+https://github.com/SetZero/ferrix?rev=f1ced5619d7b076ba7c1080f84f1219cb652be4c#f1ced5619d7b076ba7c1080f84f1219cb652be4c"
+source = "git+https://github.com/SetZero/ferrix?rev=ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7#ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7"
 dependencies = [
  "libc",
 ]
@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "compositor-socket"
 version = "0.1.0"
-source = "git+https://github.com/SetZero/ferrix?rev=f1ced5619d7b076ba7c1080f84f1219cb652be4c#f1ced5619d7b076ba7c1080f84f1219cb652be4c"
+source = "git+https://github.com/SetZero/ferrix?rev=ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7#ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7"
 dependencies = [
  "compositor-wire",
  "libc",
@@ -191,7 +191,7 @@ dependencies = [
 [[package]]
 name = "compositor-toolkit"
 version = "0.1.0"
-source = "git+https://github.com/SetZero/ferrix?rev=f1ced5619d7b076ba7c1080f84f1219cb652be4c#f1ced5619d7b076ba7c1080f84f1219cb652be4c"
+source = "git+https://github.com/SetZero/ferrix?rev=ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7#ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7"
 dependencies = [
  "compositor-protocol",
  "compositor-shm",
@@ -205,12 +205,12 @@ dependencies = [
 [[package]]
 name = "compositor-wire"
 version = "0.1.0"
-source = "git+https://github.com/SetZero/ferrix?rev=f1ced5619d7b076ba7c1080f84f1219cb652be4c#f1ced5619d7b076ba7c1080f84f1219cb652be4c"
+source = "git+https://github.com/SetZero/ferrix?rev=ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7#ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7"
 
 [[package]]
 name = "compositor-xkb"
 version = "0.1.0"
-source = "git+https://github.com/SetZero/ferrix?rev=f1ced5619d7b076ba7c1080f84f1219cb652be4c#f1ced5619d7b076ba7c1080f84f1219cb652be4c"
+source = "git+https://github.com/SetZero/ferrix?rev=ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7#ec4ce6b25ce0c317debd065ff1a6d8daa8fac0f7"
 
 [[package]]
 name = "crossbeam-channel"

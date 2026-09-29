@@ -167,6 +167,8 @@ struct Toplevel {
     /// The host XID of the window it was last made a dialog of
     /// (`WM_TRANSIENT_FOR`).
     parent: Option<u32>,
+    /// The least and greatest size it was last given (`WM_NORMAL_HINTS`).
+    limits: SizeLimits,
 }
 
 /// The connection, what the compositor has said about its screens, and the
@@ -417,15 +419,20 @@ impl WaylandLink {
             let parent_surface = parent
                 .and_then(|parent| self.toplevels.get(&parent))
                 .map(|parent| parent.surface);
+            let limits = size_limits_of(state, window);
             let toplevel = match self.toplevels.entry(host_xid) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let (title, app_id) = names(state, window);
+                    // Sent before the first commit, where the compositor
+                    // decides whether a window of a fixed size floats.
                     let options = ToplevelOptions {
                         title: title.clone(),
                         app_id: app_id.clone(),
                         size: (u32::from(window.width), u32::from(window.height)),
                         parent: parent_surface,
+                        min_size: limits.min,
+                        max_size: limits.max,
                     };
                     match self.client.toplevel(&options) {
                         Ok(surface) => {
@@ -444,6 +451,7 @@ impl WaylandLink {
                                 resize: None,
                                 close: false,
                                 parent,
+                                limits,
                             })
                         }
                         Err(error) => {
@@ -458,6 +466,13 @@ impl WaylandLink {
             if parent != toplevel.parent {
                 toplevel.parent = parent;
                 self.client.set_parent(toplevel.surface, parent_surface);
+            }
+
+            // Size hints set or changed after it mapped.
+            if limits != toplevel.limits {
+                toplevel.limits = limits;
+                self.client
+                    .set_size_limits(toplevel.surface, limits.min, limits.max);
             }
 
             if self.renamed.contains(&host_xid) {
@@ -582,6 +597,56 @@ fn transient_for(state: &ServerState, window: &Window) -> Option<u32> {
         .map(|host| host.as_raw())
 }
 
+/// The least and greatest size a window may be given, in pixels; 0 is no
+/// limit, as `xdg_toplevel.set_min_size` and `set_max_size` take it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SizeLimits {
+    min: (u32, u32),
+    max: (u32, u32),
+}
+
+/// `window`'s [`SizeLimits`] from `WM_NORMAL_HINTS`.
+fn size_limits_of(state: &ServerState, window: &Window) -> SizeLimits {
+    state
+        .atoms
+        .id_for("WM_NORMAL_HINTS")
+        .and_then(|atom| window.properties.get(&atom))
+        .map(|value| size_limits(&value.data))
+        .unwrap_or_default()
+}
+
+/// The least and greatest size in a `WM_SIZE_HINTS` value (ICCCM 4.1.2.3):
+/// 32-bit words, `flags` first, `min_width` and `min_height` the sixth and
+/// seventh, `max_width` and `max_height` the eighth and ninth, each pair
+/// meant only when its flag (`PMinSize`, `PMaxSize`) is set. A window whose
+/// least size is its greatest is one of a fixed size, which the compositor
+/// floats, as Hyprland does an X window of one.
+fn size_limits(data: &[u8]) -> SizeLimits {
+    const P_MIN_SIZE: u32 = 1 << 4;
+    const P_MAX_SIZE: u32 = 1 << 5;
+    let word = |index: usize| {
+        data.get(index * 4..index * 4 + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    // A size is a positive `INT32`; anything else is no limit.
+    let size = |index: usize| {
+        word(index)
+            .filter(|&value| i32::try_from(value).is_ok())
+            .unwrap_or(0)
+    };
+    let pair = |flag: u32, first: usize| match word(0) {
+        Some(flags) if flags & flag != 0 && word(first + 1).is_some() => {
+            (size(first), size(first + 1))
+        }
+        _ => (0, 0),
+    };
+    SizeLimits {
+        min: pair(P_MIN_SIZE, 5),
+        max: pair(P_MAX_SIZE, 7),
+    }
+}
+
 /// Whether `property` is one [`names`] reads.
 fn is_name(state: &ServerState, property: AtomId) -> bool {
     ["_NET_WM_NAME", "WM_NAME", "WM_CLASS"]
@@ -700,6 +765,33 @@ mod tests {
         assert_eq!(class(b"Xev"), "Xev");
         assert_eq!(class(b"xev\0"), "xev");
         assert_eq!(class(b""), "");
+    }
+
+    /// A `WM_SIZE_HINTS` value of 18 words with `flags`, the least size and
+    /// the greatest.
+    fn hints(flags: u32, min: (u32, u32), max: (u32, u32)) -> Vec<u8> {
+        let mut words = [0_u32; 18];
+        words[0] = flags;
+        (words[5], words[6], words[7], words[8]) = (min.0, min.1, max.0, max.1);
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn size_hints_give_limits_only_where_their_flags_say() {
+        let fixed = size_limits(&hints(0x30, (640, 480), (640, 480)));
+        assert_eq!(fixed.min, (640, 480));
+        assert_eq!(fixed.max, (640, 480));
+        let least = size_limits(&hints(0x10, (200, 100), (900, 900)));
+        assert_eq!((least.min, least.max), ((200, 100), (0, 0)), "PMaxSize unset");
+        assert_eq!(
+            size_limits(&hints(0x0c, (1, 1), (2, 2))),
+            SizeLimits::default(),
+            "USSize and PPosition alone"
+        );
+        let negative = size_limits(&hints(0x30, (u32::MAX, 10), (640, 480)));
+        assert_eq!(negative.min, (0, 10), "a negative size is no limit");
+        assert_eq!(size_limits(&[0x30, 0, 0, 0]), SizeLimits::default(), "cut short");
+        assert_eq!(size_limits(&[]), SizeLimits::default());
     }
 
     #[test]
