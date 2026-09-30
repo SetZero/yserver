@@ -253,6 +253,36 @@ fn the_intermediate_follows_the_transform_lifecycle() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+fn a_same_footprint_rotation_change_repaints_the_output() {
+    use yserver_core::randr::{RR_ROTATE_90, RR_ROTATE_270, crtc_matrix};
+    let rotate =
+        |rotation| crtc_matrix(rotation, MODE.0, MODE.1, &CrtcTransform::identity()).unwrap();
+    let Some(mut b) = transformed_pair(rotate(RR_ROTATE_90), (64 + 48, 64)) else {
+        return;
+    };
+    let (memory, _) = b.scene.intermediate_for_tests(1).expect("allocated");
+    assert!(!b.scene.owes_repaint(), "fresh BOs repaint via `missing`");
+
+    // `xrandr --rotate left` then `--rotate right`: same footprint, so the
+    // root size, output rect and intermediate all stay; only the matrix moves.
+    let key = b.platform.outputs[1].key.clone();
+    b.platform
+        .output_transforms
+        .insert(key, rotate(RR_ROTATE_270));
+    b.scene.sync_output_layouts(&b.platform).unwrap();
+    assert_eq!(
+        b.scene.intermediate_for_tests(1).map(|(m, _)| m),
+        Some(memory),
+        "the intermediate's root pixels are kept"
+    );
+    assert!(
+        b.scene.owes_repaint(),
+        "the BOs hold the previous rotation's pixels"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
 fn root_get_image_reads_the_transformed_output_in_root_space() {
     let root = (192u16, 96u16);
     let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), root) else {

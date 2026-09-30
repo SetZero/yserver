@@ -568,6 +568,9 @@ struct OutputSceneState {
     /// The footprint-sized image a RANDR-transformed output composites into
     /// before the scale pass; `None` at identity (spec D4).
     intermediate: Option<TransformIntermediate>,
+    /// The transform the scanout BOs were laid out for: a same-footprint
+    /// rotation or reflection change keeps every extent but not the pixels.
+    transform: Option<yserver_core::randr::CrtcTransform>,
     /// The pixels under the software cursor in each compose image, for root
     /// reads. Empty while the cursor is on the HW plane.
     cursor_saves: CursorSaves,
@@ -1407,6 +1410,7 @@ impl SceneCompositor {
             last_pieces: std::collections::HashSet::new(),
             presented_epochs: std::collections::HashMap::new(),
             intermediate: None,
+            transform: platform.output_transform(i).cloned(),
             cursor_saves: CursorSaves::default(),
             // Per scanout BO, so in mode (BO) pixels even when transformed.
             damage: ScanoutDamage::new(
@@ -1462,7 +1466,8 @@ impl SceneCompositor {
 
     /// Follow the RANDR transforms in `platform` without a topology rebuild:
     /// an output whose root rect changed gets its scene extent, BO damage and
-    /// intermediate redone; an identity output keeps today's state untouched.
+    /// intermediate redone, one whose matrix alone changed its BO damage; an
+    /// identity output keeps today's state untouched.
     pub(crate) fn sync_output_layouts(
         &mut self,
         platform: &PlatformBackend,
@@ -1474,16 +1479,23 @@ impl SceneCompositor {
         for (i, o) in inner.outputs.iter_mut().enumerate() {
             let (x, y, width, height) = platform.output_root_rect(i);
             let extent = vk::Extent2D { width, height };
-            let wanted = platform.output_transform(i).map(|_| extent);
+            let transform = platform.output_transform(i);
+            let wanted = transform.map(|_| extent);
             let held = o.intermediate.as_ref().map(|im| im.extent);
-            if o.output_origin == (x, y) && o.output_extent == extent && held == wanted {
+            let same_layout = o.output_origin == (x, y) && o.output_extent == extent;
+            if same_layout && held == wanted && o.transform.as_ref() == transform {
                 continue;
             }
             changed = true;
-            release_intermediate(o, &inner.vk);
-            o.output_origin = (x, y);
-            o.output_extent = extent;
-            o.damage_audit = build_output_damage_audit(&inner.vk, extent)?;
+            o.transform = transform.cloned();
+            if !same_layout || held != wanted {
+                // The intermediate holds root pixels: only a new footprint
+                // or origin redoes it.
+                release_intermediate(o, &inner.vk);
+                o.output_origin = (x, y);
+                o.output_extent = extent;
+                o.damage_audit = build_output_damage_audit(&inner.vk, extent)?;
+            }
             // The BOs hold the previous transform's pixels.
             o.damage.invalidate();
             o.prev_presented.clear();
