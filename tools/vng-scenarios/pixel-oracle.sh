@@ -125,10 +125,6 @@ snap = 0
 for tag, outs in steps:
     rc = xrandr(outs)
     time.sleep(1.5)
-    # yserver repaints the root with the default grey after a screen resize
-    # (Xorg keeps the pixmap; root-background-resize covers it): re-apply.
-    root.change_attributes(background_pixmap=tile)
-    root.clear_area(0, 0, 0, 0)
     rep, screen = reported()
     # Vertical boundaries between outputs, in root coordinates.
     edges = sorted({o["pos"][0] for o in outs if o["pos"][0] > 0})

@@ -7551,6 +7551,116 @@ impl KmsBackend {
         }
     }
 
+    /// Tile `host_pixmap_xid` across the whole root extent from (0, 0): the
+    /// root's background pixmap, painted by `set_container_background_pixmap`
+    /// and again whenever the root storage is reallocated for a new screen
+    /// size (Xorg `SetRootClip` exposes the whole resized root and
+    /// `miPaintWindow` tiles its background there).
+    fn tile_root_background_pixmap(&mut self, host_pixmap_xid: u32) {
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
+        // Stage 4a — root paint resolves through redirect routing.
+        let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
+            return;
+        };
+        let dst = dst_target.backing_id();
+        let Some(src) = self.store.lookup(host_pixmap_xid) else {
+            log::debug!(
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
+            );
+            return;
+        };
+        // Stage 3f.14: X11 bg_pixmap tiles across the drawable
+        // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
+        // and left the rest of root unchanged — fvwm3 wallpaper
+        // covered only the top-left of the screen on bee. Route
+        // through `engine.render_composite` with OP_SRC + Repeat::
+        // Normal so the source pixmap tiles across the whole root
+        // extent in a single submit. Same shape as `try_tiled_fill`
+        // (3f.3) but unconditioned by GC clip.
+        if src == dst {
+            // Defensive: a pixmap aliased as bg of its own drawable
+            // is not a meaningful X11 op. v1's path treats it the
+            // same (copy_area with src == dst is logged + skipped).
+            log::debug!("render set_container_background_pixmap: src == root, skipping");
+            return;
+        }
+        let src_format = self.store.get(src).map(|d| d.storage.format);
+        if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            // Tile path requires BGRA8 src (matches `try_tiled_fill`
+            // gate). Other formats fall through with no paint —
+            // v1-parity-ish; rare in practice for root bg.
+            log::debug!(
+                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
+                 {src_format:?} not BGRA8, skipping tile"
+            );
+            return;
+        }
+        let dst_extent = ash::vk::Extent2D {
+            width: u32::from(self.platform.fb_w.max(1)),
+            height: u32::from(self.platform.fb_h.max(1)),
+        };
+        let rects = [CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: dst_target.offset().0,
+            dst_y: dst_target.offset().1,
+            width: dst_extent.width,
+            height: dst_extent.height,
+        }];
+        const OP_SRC: u8 = 1;
+        let composite_result = self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            OP_SRC,
+            ResolvedSource::Drawable(SourceDrawable::whole(src)),
+            ResolvedSource::None,
+            dst_target.dst(),
+            &rects,
+            None,
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
+            // Audit #4: synthesized backing-seed copy, no Picture
+            // context. Engine falls back to depth heuristic.
+            0,
+            0,
+            0,
+        );
+        self.sync_descriptor_pool_telemetry();
+        match composite_result {
+            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
+                self.telemetry.record_paint_submit();
+                self.trace_render(
+                    SubmitKind::RenderComposite,
+                    dst,
+                    s.recorded_draws,
+                    1, // OP_SRC
+                    SrcClass::Direct,
+                    None,
+                    SubmitFlags {
+                        readback: s.used_dst_readback,
+                        alias: s.used_src_alias_scratch,
+                        zero_draws: false,
+                        upload: false,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
+                );
+            }
+        }
+    }
+
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         self.prime_transformed_root_reads();
         // Root space: a transformed output covers its footprint (spec D6).
@@ -13055,6 +13165,12 @@ impl KmsBackend {
                     }
                 }
             }
+        }
+
+        // The fill above is the pixel background; a background pixmap tiles
+        // over it, as Xorg repaints the whole resized root with its tile.
+        if let Some(bg_pixmap) = self.core.bg_pixmap {
+            self.tile_root_background_pixmap(bg_pixmap.as_raw());
         }
 
         // ── 3. Resize COW backing storage (if materialised) ──────────────
@@ -23307,114 +23423,9 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
-        use crate::kms::{
-            render::engine::{ResolvedSource, SourceDrawable},
-            vk::ops::render::CompositeRect,
-        };
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
-        // Stage 4a — root paint resolves through redirect routing.
-        let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
-            self.scene.wake_for_damage();
-            return Ok(());
-        };
-        let dst = dst_target.backing_id();
-        let Some(src) = self.store.lookup(host_pixmap_xid) else {
-            log::debug!(
-                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
-            );
-            self.scene.wake_for_damage();
-            return Ok(());
-        };
-        // Stage 3f.14: X11 bg_pixmap tiles across the drawable
-        // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
-        // and left the rest of root unchanged — fvwm3 wallpaper
-        // covered only the top-left of the screen on bee. Route
-        // through `engine.render_composite` with OP_SRC + Repeat::
-        // Normal so the source pixmap tiles across the whole root
-        // extent in a single submit. Same shape as `try_tiled_fill`
-        // (3f.3) but unconditioned by GC clip.
-        if src == dst {
-            // Defensive: a pixmap aliased as bg of its own drawable
-            // is not a meaningful X11 op. v1's path treats it the
-            // same (copy_area with src == dst is logged + skipped).
-            log::debug!("render set_container_background_pixmap: src == root, skipping");
-            self.scene.wake_for_damage();
-            return Ok(());
-        }
-        let src_format = self.store.get(src).map(|d| d.storage.format);
-        if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
-            // Tile path requires BGRA8 src (matches `try_tiled_fill`
-            // gate). Other formats fall through with no paint —
-            // v1-parity-ish; rare in practice for root bg.
-            log::debug!(
-                "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
-                 {src_format:?} not BGRA8, skipping tile"
-            );
-            self.scene.wake_for_damage();
-            return Ok(());
-        }
-        let dst_extent = ash::vk::Extent2D {
-            width: u32::from(self.platform.fb_w.max(1)),
-            height: u32::from(self.platform.fb_h.max(1)),
-        };
-        let rects = [CompositeRect {
-            src_x: 0,
-            src_y: 0,
-            mask_x: 0,
-            mask_y: 0,
-            dst_x: dst_target.offset().0,
-            dst_y: dst_target.offset().1,
-            width: dst_extent.width,
-            height: dst_extent.height,
-        }];
-        const OP_SRC: u8 = 1;
-        let composite_result = self.engine.render_composite(
-            &mut self.store,
-            &mut self.platform,
-            OP_SRC,
-            ResolvedSource::Drawable(SourceDrawable::whole(src)),
-            ResolvedSource::None,
-            dst_target.dst(),
-            &rects,
-            None,
-            Repeat::Normal,
-            Repeat::None,
-            None,
-            None,
-            false,
-            // Audit #4: synthesized backing-seed copy, no Picture
-            // context. Engine falls back to depth heuristic.
-            0,
-            0,
-            0,
-        );
-        self.sync_descriptor_pool_telemetry();
-        match composite_result {
-            Ok(s) if s.recorded_draws > 0 && !s.deferred_to_batch => {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderComposite,
-                    dst,
-                    s.recorded_draws,
-                    1, // OP_SRC
-                    SrcClass::Direct,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!(
-                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
-                );
-            }
-        }
+        self.tile_root_background_pixmap(host_pixmap_xid);
         self.scene.wake_for_damage();
         Ok(())
     }
@@ -45747,6 +45758,70 @@ mod tests {
             (0x00, 0x00, 0xff, 0xff),
             "the newly covered region must hold the opaque root background \
              (B8G8R8A8), not recycled content",
+        );
+    }
+
+    /// A root background PIXMAP survives the reallocation: the newly covered
+    /// region is tiled from the root origin, not left in the pixel fill
+    /// (Xorg `SetRootClip` exposes the whole resized root, `miPaintWindow`
+    /// tiles it). Measured in the vng scenario `root-bg-resize`.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_resized_root_keeps_its_background_pixmap() {
+        use yserver_core::backend::Backend;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // A 4x4 tile: green, with a blue top-left pixel marking the phase.
+        let tile = b.create_pixmap(None, 32, 4, 4).expect("tile pixmap");
+        b.fill_rectangle(None, tile.as_raw(), 0xFF00_FF00, 0, 0, 4, 4)
+            .expect("tile fill green");
+        b.fill_rectangle(None, tile.as_raw(), 0xFF00_00FF, 0, 0, 1, 1)
+            .expect("tile phase pixel blue");
+        b.set_container_background_pixmap(None, tile.as_raw())
+            .expect("set root bg pixmap");
+
+        let old_w = b.platform.fb_w;
+        let new_w = old_w.saturating_add(1280);
+        b.apply_virtual_screen_extent(new_w, b.platform.fb_h)
+            .expect("growing the virtual extent must not fail");
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close open frame");
+        b.engine_drain_all_for_tests();
+
+        let root_id = b
+            .store
+            .lookup(b.core.window_id)
+            .expect("root must be live after the grow");
+        // A tile-aligned 2x1 read in the newly covered region: the phase
+        // pixel, then plain tile.
+        let x = (i32::from(old_w) + 4) & !3;
+        let bytes = b
+            .engine
+            .get_image(
+                &mut b.store,
+                &mut b.platform,
+                crate::kms::render::target::Src::server_internal(root_id),
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x, y: 4 },
+                    extent: ash::vk::Extent2D {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("readback of the newly covered region");
+        assert_eq!(
+            (&bytes[0..3], &bytes[4..7]),
+            (&[0xff, 0x00, 0x00][..], &[0x00, 0xff, 0x00][..]),
+            "the resized root must be tiled with its background pixmap from \
+             the root origin (B8G8R8A8)",
         );
     }
 
