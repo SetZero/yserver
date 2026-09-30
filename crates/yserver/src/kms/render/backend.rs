@@ -7665,10 +7665,28 @@ impl KmsBackend {
         self.prime_transformed_root_reads();
         // Root space: a transformed output covers its footprint (spec D6).
         let outputs = self.crtc_root_rects();
-        if outputs.is_empty() {
-            return None;
-        }
-        Some(assemble_root_scanout(region, &outputs, |rect| {
+        let root_id = self.store.lookup(self.core.window_id)?;
+        Some(assemble_root_scanout(region, &outputs, |rect, source| {
+            if source == RootReadSource::Background {
+                // No CRTC shows this area, so no scanout holds it. The root
+                // storage does: its background, which is what Xorg's screen
+                // pixmap holds there too (windows over it are not composed
+                // outside the CRTCs, so they are missing from this piece).
+                return self
+                    .engine
+                    .get_image(
+                        &mut self.store,
+                        &mut self.platform,
+                        crate::kms::render::target::Src::server_internal(root_id),
+                        rect,
+                        32,
+                    )
+                    .map_err(|e| log::debug!("render root background readback {rect:?}: {e:?}"))
+                    .ok()
+                    .filter(|bytes| {
+                        bytes.len() == rect.extent.width as usize * rect.extent.height as usize * 4
+                    });
+            }
             // `assemble_root_scanout` zero-fills a piece it cannot read. That
             // degradation is unchanged, but a failure here now also covers an
             // unresolvable direct-scanout source, which previously answered
@@ -17369,6 +17387,15 @@ fn split_root_scanout_reads(
     reads
 }
 
+/// Where `assemble_root_scanout` wants a piece read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootReadSource {
+    /// Inside one output: what that CRTC scans out.
+    Scanout,
+    /// Covered by no output: the root window's own storage.
+    Background,
+}
+
 /// Assemble a root-region `GetImage` ZPixmap buffer from per-output scanout
 /// reads.
 ///
@@ -17379,19 +17406,22 @@ fn split_root_scanout_reads(
 /// came back all-black (ImageMagick `import` screenshots over a dual-head root:
 /// `import` grabs the entire root, then crops client-side). Split the region
 /// per output, read each piece, and blit it into one row-major 4-bytes-per-pixel
-/// buffer. Region area not covered by any output stays zero-filled (X11 leaves
-/// off-screen root pixels undefined).
+/// buffer. Region area not covered by any output is read as
+/// `RootReadSource::Background`: Xorg's root is the whole screen pixmap, so
+/// e.g. the corner a 1280x800 + 1024x768 layout leaves uncovered answers the
+/// root background, not black.
 ///
-/// `read(rect)` returns tightly-packed 4-bpp rows for `rect` (guaranteed by the
-/// splitter to sit fully within one output) or `None` if that read failed — a
-/// failed piece is left zero-filled rather than aborting the whole capture.
+/// `read(rect, source)` returns tightly-packed 4-bpp rows for `rect` (for
+/// `Scanout`, guaranteed by the splitter to sit fully within one output) or
+/// `None` if that read failed — a failed piece is left zero-filled rather than
+/// aborting the whole capture.
 fn assemble_root_scanout<F>(
     region: vk::Rect2D,
     outputs: &[(i32, i32, u32, u32)],
     mut read: F,
 ) -> Vec<u8>
 where
-    F: FnMut(vk::Rect2D) -> Option<Vec<u8>>,
+    F: FnMut(vk::Rect2D, RootReadSource) -> Option<Vec<u8>>,
 {
     let w = region.extent.width as usize;
     let h = region.extent.height as usize;
@@ -17405,8 +17435,30 @@ where
         offset: vk::Offset2D::default(),
         extent: region.extent,
     };
-    for piece in split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs) {
-        let Some(bytes) = read(piece.read) else {
+    let output_rects: Vec<vk::Rect2D> = outputs
+        .iter()
+        .map(|&(x, y, width, height)| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width, height },
+        })
+        .collect();
+    let scanout = split_root_scanout_reads(sub, src_x, src_y, 0, 0, outputs)
+        .into_iter()
+        .map(|piece| (piece, RootReadSource::Scanout));
+    let background = compute_copy_area_dst_rects(region, &output_rects)
+        .into_iter()
+        .map(|rect| {
+            let piece = RootScanoutRead {
+                read: rect,
+                dst_local: vk::Offset2D {
+                    x: rect.offset.x - region.offset.x,
+                    y: rect.offset.y - region.offset.y,
+                },
+            };
+            (piece, RootReadSource::Background)
+        });
+    for (piece, source) in scanout.chain(background) {
+        let Some(bytes) = read(piece.read, source) else {
             continue;
         };
         let pw = piece.read.extent.width as usize;
@@ -44572,7 +44624,7 @@ mod tests {
         // the old single-`read_scanout_region` path returned all-black for
         // (rect spanning two outputs → no matching BO → empty reply).
         let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect| {
+        let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect, _| {
             let px = (rect.extent.width * rect.extent.height) as usize;
             let byte = if rect.offset.x == 0 { 0x11u8 } else { 0x22u8 };
             Some(vec![byte; px * 4])
@@ -44586,11 +44638,38 @@ mod tests {
     }
 
     #[test]
+    fn assemble_root_scanout_reads_uncovered_area_from_the_root_background() {
+        // A 4x2 output over a 6x3 root region: the column right of it and the
+        // row below it are covered by no CRTC and read from the root storage
+        // (Xorg answers the root background there), never from a scanout.
+        let outputs = [(0i32, 0i32, 4u32, 2u32)];
+        let mut background_px = 0;
+        let got = super::assemble_root_scanout(r(0, 0, 6, 3), &outputs, |rect, source| {
+            let px = (rect.extent.width * rect.extent.height) as usize;
+            match source {
+                super::RootReadSource::Scanout => {
+                    assert_eq!(rect, r(0, 0, 4, 2), "scanout read stays on the output");
+                    Some(vec![0x11u8; px * 4])
+                }
+                super::RootReadSource::Background => {
+                    background_px += px;
+                    Some(vec![0x22u8; px * 4])
+                }
+            }
+        });
+        assert_eq!(background_px, 6 * 3 - 4 * 2, "every uncovered pixel, once");
+        let stride = 6 * 4;
+        assert_eq!(&got[0..16], &[0x11u8; 16], "row0 under the output");
+        assert_eq!(&got[16..24], &[0x22u8; 8], "row0 right of the output");
+        assert_eq!(&got[2 * stride..3 * stride], &[0x22u8; 24], "row2 below it");
+    }
+
+    #[test]
     fn assemble_root_scanout_failed_read_is_zero_filled() {
         // A piece whose read fails stays zero (black) instead of aborting the
         // whole capture; the covered output still lands.
         let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect| {
+        let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect, _| {
             if rect.offset.x == 0 {
                 Some(vec![
                     0x11u8;
