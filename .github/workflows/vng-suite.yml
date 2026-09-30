@@ -9,7 +9,7 @@ on:
         default: all
   pull_request:
   push:
-    branches: [master, feat/ci-vng-lavapipe]
+    branches: [master]
   schedule:
     - cron: '17 3 * * *'
 env:
