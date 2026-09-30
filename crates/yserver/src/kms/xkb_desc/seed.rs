@@ -8,13 +8,15 @@
 //! is read from its V1 dump ([`super::text`]) and its API:
 //!
 //! - types in Xorg order (the four required first, then dump order), with
-//!   xkbcomp's own normalisation of their map entries and preserve values
-//!   ([`xkbcomp_type`]);
+//!   xkbcomp's own normalisation of their map entries and preserve values,
+//!   from their source definitions ([`xkbcomp_type`]);
 //! - keysyms, groups and levels from the xkbcommon API; each group's type
 //!   from the dump's `type=`, else xkbcomp's automatic type rule;
 //! - explicit bits as xkbcomp sets them (named types, >2-level and
 //!   alphabetic automatic types, `actions[]`, `repeat=`, `virtualMods=`);
-//! - compat interprets and indicator maps from the dump, in dump order;
+//! - compat interprets and indicator maps from the dump, in dump order,
+//!   the actions with the defaults xkbcomp's includes inherit
+//!   ([`source::compat_actions`]);
 //! - key actions, vmodmap, behaviors and per-key repeat from Xorg's
 //!   `XkbUpdateDescActions` over the whole keycode range, run on the model.
 
@@ -26,8 +28,8 @@ use super::{
     Action, CLAMP_INTO_RANGE, EXPLICIT_AUTO_REPEAT, EXPLICIT_INTERPRET, EXPLICIT_VMODMAP,
     IndicatorMap, KeySyms, KeyType, KtEntry, Mods, NO_MODIFIER, NUM_GROUPS, NUM_INDICATORS,
     NUM_VMODS, REDIRECT_INTO_RANGE, REQUIRED_TYPE_NAMES, SI_ALL_OF, SI_ANY_OF, SI_ANY_OF_OR_NONE,
-    SI_AUTO_REPEAT, SI_EXACTLY, SI_LEVEL_ONE_ONLY, SI_LOCKING_KEY, SI_NONE_OF, SymInterpret,
-    XkbChanges, XkbDesc, action,
+    SI_AUTO_REPEAT, SI_EXACTLY, SI_LEVEL_ONE_ONLY, SI_LOCKING_KEY, SI_NONE_OF, SI_OP_MASK,
+    SymInterpret, XkbChanges, XkbDesc, action, source,
     text::{self, DumpError},
 };
 
@@ -69,9 +71,9 @@ pub(crate) fn vmod_mappings(keymap: &Keymap) -> (Vec<String>, [u8; NUM_VMODS]) {
 /// One `map[]` entry of a dump type: `(real, vmods, level, preserve)`.
 type DumpEntry = (u8, u16, u8, Option<(u8, u16)>);
 
-/// xkbcomp's view of a type: its entries `(real, vmods, level)`, the
-/// preserve per entry (if any) and the level count.
-type XkbcompType = (Vec<(u8, u16, u8)>, Option<Vec<(u8, u16)>>, u8);
+/// xkbcomp's view of a type: its entries `(real, vmods, level)` and the
+/// preserve per entry (if any).
+type XkbcompType = (Vec<(u8, u16, u8)>, Option<Vec<(u8, u16)>>);
 
 /// A key type as the dump writes it.
 #[derive(Debug, Default)]
@@ -199,42 +201,9 @@ pub(crate) fn component_names_from_rmlvo(rmlvo: &crate::kms::core::XkbRmlvo) -> 
     ]
 }
 
-/// xkbcomp's type normalisation (keytypes.c) applied to a dump type:
-///
-/// - `DeleteLevel1MapEntries` drops the entries that map to level 1 — with
-///   its loop bug: after removing an entry it skips the one that moved into
-///   its place, so of two level-1 entries in a row the second survives.
-///   xkbcommon's dump leaves out the sources' leading `map[None]= Level1`,
-///   which is what makes the first real entry the skipped one; it's put
-///   back here.
-/// - `CopyDefToKeyType` then re-adds, in `preserve[]` definition order, a
-///   level-1 entry for each preserve whose entry is gone (at the end), and
-///   fills the preserve array.
-/// - `SetPreserve` takes the preserve value's virtual modifiers from the
-///   wrong bits (`uval >> 16` instead of `>> 8`), so they're always lost;
-///   only the real modifiers survive.
-///
-/// The dump keeps preserves in entry order, not definition order: two
-/// re-added level-1 entries (CTRL+ALT's Control and Alt) can come out in
-/// the other order (the listed seed tolerance of the pristine test).
-fn xkbcomp_type(dt: &DumpType) -> XkbcompType {
-    // The sources' leading `map[None]= Level1`, unless the dump kept it.
-    let mut entries: Vec<(u8, u16, u8)> = Vec::new();
-    if !dt.entries.iter().any(|e| e.0 == 0 && e.1 == 0) {
-        entries.push((0, 0, 0));
-    }
-    // A trailing run of level-1 entries that only carry a preserve are the
-    // ones xkbcommon's `AddPreserve` created for a `preserve[]` without a
-    // map entry: not map entries to xkbcomp, which adds them back itself.
-    let map_len = dt.entries.len()
-        - dt.entries
-            .iter()
-            .rev()
-            .take_while(|e| e.2 == 0 && e.3.is_some())
-            .count();
-    entries.extend(dt.entries[..map_len].iter().map(|&(r, v, l, _)| (r, v, l)));
-    let num_levels = dt
-        .entries
+/// The level count of a dump type: its highest mapped or named level.
+fn dump_levels(dt: &DumpType) -> u8 {
+    dt.entries
         .iter()
         .map(|e| e.2 + 1)
         .chain(
@@ -244,7 +213,26 @@ fn xkbcomp_type(dt: &DumpType) -> XkbcompType {
         )
         .max()
         .unwrap_or(1)
-        .max(1);
+        .max(1)
+}
+
+/// xkbcomp's end of a type compile (keytypes.c) over its map entries
+/// `(real, vmods, level)` and preserves `(index real, index vmods, real,
+/// vmods)`, each in definition order:
+///
+/// - `DeleteLevel1MapEntries` drops the entries that map to level 1 — with
+///   its loop bug: after removing an entry it skips the one that moved into
+///   its place, so of two level-1 entries in a row the second survives.
+/// - `CopyDefToKeyType` then re-adds, in `preserve[]` definition order, a
+///   level-1 entry for each preserve whose entry is gone (at the end), and
+///   fills the preserve array.
+/// - `SetPreserve` takes the preserve value's virtual modifiers from the
+///   wrong bits (`uval >> 16` instead of `>> 8`), so they're always lost;
+///   only the real modifiers survive.
+fn xkbcomp_entries(
+    mut entries: Vec<(u8, u16, u8)>,
+    preserves: &[(u8, u16, u8, u16)],
+) -> XkbcompType {
     let mut i = 0;
     while i < entries.len() {
         if entries[i].2 == 0 {
@@ -252,16 +240,11 @@ fn xkbcomp_type(dt: &DumpType) -> XkbcompType {
         }
         i += 1;
     }
-    let preserves: Vec<(u8, u16, u8, u16)> = dt
-        .entries
-        .iter()
-        .filter_map(|&(r, v, _, p)| p.map(|(pr, pv)| (r, v, pr, pv)))
-        .collect();
     if preserves.is_empty() {
-        return (entries, None, num_levels);
+        return (entries, None);
     }
     let mut pre_at: Vec<(usize, u8, u16)> = Vec::new();
-    for &(ir, iv, pr, pv) in &preserves {
+    for &(ir, iv, pr, pv) in preserves {
         let idx = match entries.iter().position(|e| e.0 == ir && e.1 == iv) {
             Some(i) => i,
             None => {
@@ -275,7 +258,144 @@ fn xkbcomp_type(dt: &DumpType) -> XkbcompType {
     for (idx, r, v) in pre_at {
         preserve[idx] = (r, v);
     }
-    (entries, Some(preserve), num_levels)
+    (entries, Some(preserve))
+}
+
+/// A dump type through xkbcomp's compile, when no source definition of it
+/// matches: the dump keeps neither the sources' level-1 entries nor their
+/// definition order, so this is xkbcomp's result only where they don't
+/// matter. xkbcommon's dump leaves out the sources' leading `map[None]=
+/// Level1` (which is what makes the first real entry the one
+/// `DeleteLevel1MapEntries` skips); it's put back here. A trailing run of
+/// level-1 entries that only carry a preserve are the ones xkbcommon's
+/// `AddPreserve` created for a `preserve[]` without a map entry: not map
+/// entries to xkbcomp, which adds them back itself.
+fn xkbcomp_type_from_dump(dt: &DumpType) -> XkbcompType {
+    let mut entries: Vec<(u8, u16, u8)> = Vec::new();
+    if !dt.entries.iter().any(|e| e.0 == 0 && e.1 == 0) {
+        entries.push((0, 0, 0));
+    }
+    let map_len = dt.entries.len()
+        - dt.entries
+            .iter()
+            .rev()
+            .take_while(|e| e.2 == 0 && e.3.is_some())
+            .count();
+    entries.extend(dt.entries[..map_len].iter().map(|&(r, v, l, _)| (r, v, l)));
+    let preserves: Vec<(u8, u16, u8, u16)> = dt
+        .entries
+        .iter()
+        .filter_map(|&(r, v, _, p)| p.map(|(pr, pv)| (r, v, pr, pv)))
+        .collect();
+    xkbcomp_entries(entries, &preserves)
+}
+
+/// A key type as its source defines it, read as xkbcomp's `SetMapEntry` /
+/// `SetPreserve` do: indices masked to the type's modifiers, a repeated
+/// index updating the earlier entry in place.
+#[derive(Default)]
+struct SourceType {
+    real: u8,
+    vmods: u16,
+    entries: Vec<(u8, u16, u8)>,
+    preserves: Vec<(u8, u16, u8, u16)>,
+}
+
+impl SourceType {
+    fn parse(body: &[String], vmod_bit: &dyn Fn(&str) -> Option<u16>) -> Self {
+        let mut t = Self::default();
+        for f in body {
+            let (key, idx, value) = text::field(f);
+            let value = value.unwrap_or("");
+            match (key.to_ascii_lowercase().as_str(), idx) {
+                ("modifiers", None) => (t.real, t.vmods) = action::parse_mods(value, vmod_bit),
+                ("map", Some(idx)) => {
+                    let (r, v) = action::parse_mods(idx, vmod_bit);
+                    let (r, v) = (r & t.real, v & t.vmods);
+                    let level = text::index_number(value).unwrap_or(1).max(1) - 1;
+                    let level = u8::try_from(level).unwrap_or(0);
+                    match t.entries.iter_mut().find(|e| e.0 == r && e.1 == v) {
+                        Some(e) => e.2 = level,
+                        None => t.entries.push((r, v, level)),
+                    }
+                }
+                ("preserve", Some(idx)) => {
+                    let (r, v) = action::parse_mods(idx, vmod_bit);
+                    let (r, v) = (r & t.real, v & t.vmods);
+                    let (pr, pv) = action::parse_mods(value, vmod_bit);
+                    match t.preserves.iter_mut().find(|p| p.0 == r && p.1 == v) {
+                        Some(p) => (p.2, p.3) = (pr, pv),
+                        None => t.preserves.push((r, v, pr, pv)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        t
+    }
+
+    /// What xkbcommon compiles it to, as its dump writes it: the entries
+    /// that map past level 1 or carry a preserve, sorted.
+    fn xkbcommon_view(&self) -> Vec<(u8, u16, u8, (u8, u16))> {
+        let mut view: Vec<_> = self
+            .entries
+            .iter()
+            .map(|&(r, v, l)| (r, v, l))
+            .chain(
+                self.preserves
+                    .iter()
+                    .filter(|p| !self.entries.iter().any(|e| (e.0, e.1) == (p.0, p.1)))
+                    .map(|p| (p.0, p.1, 0)),
+            )
+            .map(|(r, v, l)| {
+                let p = self
+                    .preserves
+                    .iter()
+                    .find(|p| (p.0, p.1) == (r, v))
+                    .map_or((0, 0), |p| (p.2 & r, p.3 & v));
+                (r, v, l, p)
+            })
+            .filter(|e| e.2 != 0 || e.3 != (0, 0))
+            .collect();
+        view.sort_unstable();
+        view
+    }
+}
+
+/// The dump's side of [`SourceType::xkbcommon_view`].
+fn dump_view(dt: &DumpType) -> Vec<(u8, u16, u8, (u8, u16))> {
+    let mut view: Vec<_> = dt
+        .entries
+        .iter()
+        .map(|&(r, v, l, p)| (r, v, l, p.unwrap_or((0, 0))))
+        .filter(|e| e.2 != 0 || e.3 != (0, 0))
+        .collect();
+    view.sort_unstable();
+    view
+}
+
+/// A dump type's entries and preserves as xkbcomp compiles them: from its
+/// source definition (`definitions`, see [`source::type_definitions`]),
+/// which has the level-1 entries and the definition order the dump lost
+/// (`FOUR_LEVEL_X`'s explicit `map[Shift]= Level1`, CTRL+ALT's preserve
+/// order). Of the definitions by that name, the ones xkbcommon compiles to
+/// the dumped type must all agree; else, or without one, the dump alone.
+fn xkbcomp_type(
+    dt: &DumpType,
+    definitions: Option<&Vec<Vec<String>>>,
+    vmod_bit: &dyn Fn(&str) -> Option<u16>,
+) -> XkbcompType {
+    let view = dump_view(dt);
+    let mut compiled = definitions
+        .into_iter()
+        .flatten()
+        .map(|body| SourceType::parse(body, vmod_bit))
+        .filter(|t| (t.real, t.vmods) == (dt.real, dt.vmods) && t.xkbcommon_view() == view)
+        .map(|t| xkbcomp_entries(t.entries, &t.preserves));
+    match compiled.next() {
+        Some(first) if compiled.all(|c| c == first) => first,
+        _ => xkbcomp_type_from_dump(dt),
+    }
 }
 
 /// The canonical key type for a required slot the dump lacks (XKB
@@ -390,8 +510,8 @@ fn indicator_flags_by_name(name: &str) -> u8 {
 }
 
 impl XkbDesc {
-    /// Seed the model from `keymap` (see the module doc).
-    pub(crate) fn from_keymap(keymap: &Keymap) -> Result<Self, DumpError> {
+    /// Seed the model from `keymap`, compiled in `ctx` (see the module doc).
+    pub(crate) fn from_keymap(keymap: &Keymap, ctx: &xkb::Context) -> Result<Self, DumpError> {
         let dump = text::keymap_text(keymap);
         let (vmod_names, vmod_real) = vmod_mappings(keymap);
         let vmod_bit = |name: &str| {
@@ -507,8 +627,10 @@ impl XkbDesc {
             .enumerate()
             .map(|(i, t)| (t.name.clone(), i))
             .collect();
+        let definitions = source::type_definitions(ctx);
         for dt in &ordered {
-            let (entries, preserve, num_levels) = xkbcomp_type(dt);
+            let (entries, preserve) = xkbcomp_type(dt, definitions.get(&dt.name), &vmod_bit);
+            let num_levels = dump_levels(dt);
             let tmask = dt.real | desc.vmods_to_real(dt.vmods);
             let map = entries
                 .iter()
@@ -632,6 +754,27 @@ impl XkbDesc {
                 };
                 map.flags = indicator_flags_by_name(&name);
                 led_maps.push((name, map));
+            }
+        }
+        // xkbcomp's action defaults, where its includes inherit them and
+        // xkbcommon's don't: an interpret whose dumped action is what
+        // xkbcommon makes of its source takes xkbcomp's.
+        if let Some(section) = section_name(&dump, "xkb_compatibility")
+            && let Some(sources) =
+                source::compat_actions(ctx, &section, &|head: &str| interpret_key(head, &vmod_bit))
+        {
+            let parse = |a: &str| action::parse_action(a, &vmod_bit).ok();
+            for si in &mut desc.compat {
+                let key = (si.sym, si.match_ & SI_OP_MASK, si.mods);
+                let Some((_, xkbcomp, xkbcommon)) = sources.iter().find(|s| s.0 == key) else {
+                    continue;
+                };
+                if let Some(act) = parse(xkbcomp)
+                    && act != si.act
+                    && xkbcommon.iter().any(|a| parse(a) == Some(si.act))
+                {
+                    si.act = act;
+                }
             }
         }
         for (name, map) in led_maps {
@@ -876,14 +1019,11 @@ fn ordered_levels(desc: &XkbDesc, idx: usize) -> u8 {
     desc.types.get(idx).map_or(0, |t| t.num_levels)
 }
 
-/// One `interpret` as Xorg's `XkbSymInterpretRec`.
-fn parse_interpret(
-    head: &str,
-    fields: &[&str],
-    (default_level_one, default_repeat, default_locking): (bool, bool, bool),
-    vmod_bit: &dyn Fn(&str) -> Option<u16>,
-    vmod_names: &[String],
-) -> Option<SymInterpret> {
+/// An interpret's `sym+Predicate(mods)` head → `(keysym, operator,
+/// mods)`, as xkbcomp's `ResolveStateAndPredicate` reads it: no predicate
+/// is `AnyOfOrNone(all)`, a bare `Any` is `AnyOf(all)`, bare modifiers are
+/// `Exactly`.
+fn interpret_key(head: &str, vmod_bit: &dyn Fn(&str) -> Option<u16>) -> Option<(u32, u8, u8)> {
     let (sym_text, pred) = match head.split_once('+') {
         Some((s, p)) => (s.trim(), p.trim()),
         None => (head.trim(), "AnyOfOrNone(all)"),
@@ -896,7 +1036,11 @@ fn parse_interpret(
         log::debug!("xkb: interpret for unknown keysym {sym_text:?} ignored");
         return None;
     }
-    let (op_text, mods_text) = pred.split_once('(').unwrap_or((pred, "all)"));
+    let (op_text, mods_text) = match pred.split_once('(') {
+        Some(split) => split,
+        None if pred.eq_ignore_ascii_case("any") => ("AnyOf", "all)"),
+        None => ("Exactly", pred),
+    };
     let op = match op_text.trim().to_ascii_lowercase().as_str() {
         "noneof" => SI_NONE_OF,
         "anyofornone" => SI_ANY_OF_OR_NONE,
@@ -909,6 +1053,18 @@ fn parse_interpret(
         }
     };
     let (mods, _) = action::parse_mods(mods_text.trim_end_matches(')'), vmod_bit);
+    Some((sym, op, mods))
+}
+
+/// One `interpret` as Xorg's `XkbSymInterpretRec`.
+fn parse_interpret(
+    head: &str,
+    fields: &[&str],
+    (default_level_one, default_repeat, default_locking): (bool, bool, bool),
+    vmod_bit: &dyn Fn(&str) -> Option<u16>,
+    vmod_names: &[String],
+) -> Option<SymInterpret> {
+    let (sym, op, mods) = interpret_key(head, vmod_bit)?;
     let mut level_one = default_level_one;
     let mut repeat = default_repeat;
     let mut locking = default_locking;
@@ -945,4 +1101,56 @@ fn parse_interpret(
         flags: if repeat { SI_AUTO_REPEAT } else { 0 } | if locking { SI_LOCKING_KEY } else { 0 },
         act,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FOUR_LEVEL_X` as xkeyboard-config 2.41 and 2.46 define it (an
+    /// explicit `map[Shift]= Level1`, no preserve) and xkbcommon dumps it
+    /// (without that entry): Xvfb 21.1.24 on either reports
+    /// `map=[1:01/0000->0 1:00/0004->1 1:01/0004->2 1:04/0002->3]`.
+    #[test]
+    fn source_definition_keeps_an_explicit_level_one_entry() {
+        let vmod_bit = |n: &str| match n {
+            "Alt" => Some(0x0002),
+            "LevelThree" => Some(0x0004),
+            _ => None,
+        };
+        let dt = DumpType {
+            name: "FOUR_LEVEL_X".to_owned(),
+            real: 0x05,
+            vmods: 0x0006,
+            entries: vec![
+                (0x00, 0x0004, 1, None),
+                (0x01, 0x0004, 2, None),
+                (0x04, 0x0002, 3, None),
+            ],
+            level_names: Vec::new(),
+        };
+        let source: Vec<String> = [
+            "modifiers = Shift + LevelThree + Control + Alt",
+            "map[None] = Level1",
+            "map[Shift] = Level1",
+            "map[LevelThree] = Level2",
+            "map[Shift+LevelThree] = Level3",
+            "map[Control+Alt] = Level4",
+            "level_name[Level1] = \"Base\"",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let xorg = vec![
+            (0x01, 0x0000, 0),
+            (0x00, 0x0004, 1),
+            (0x01, 0x0004, 2),
+            (0x04, 0x0002, 3),
+        ];
+        assert_eq!(
+            xkbcomp_type(&dt, Some(&vec![source]), &vmod_bit),
+            (xorg, None)
+        );
+        // Without its source the dump can't say the entry was there.
+        assert_eq!(xkbcomp_type(&dt, None, &vmod_bit).0.len(), 3);
+    }
 }

@@ -24,6 +24,7 @@ pub(crate) mod set_compat;
 pub(crate) mod set_geometry;
 pub(crate) mod set_map;
 pub(crate) mod set_names;
+mod source;
 pub(crate) mod text;
 pub(crate) mod writer;
 

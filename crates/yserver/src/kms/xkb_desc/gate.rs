@@ -209,7 +209,9 @@ pub(crate) fn check(desc: &XkbDesc, keymap: &Keymap) -> (Vec<String>, Excluded) 
         }
     }
     check_leds(desc, keymap, &mut out);
-    let reseeded = XkbDesc::from_keymap(keymap).expect("reseed the cooking keymap");
+    // Only its modmap is read: no type sources needed.
+    let no_includes = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+    let reseeded = XkbDesc::from_keymap(keymap, &no_includes).expect("reseed the cooking keymap");
     for kc in desc.min_key_code..=desc.max_key_code {
         let m = desc.modmap[usize::from(kc)];
         let lowest = if m == 0 { 0 } else { 1 << m.trailing_zeros() };

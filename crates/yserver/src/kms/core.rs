@@ -228,7 +228,7 @@ fn cooking_keymap_for(
     keymap: xkbcommon::xkb::Keymap,
     rmlvo: &XkbRmlvo,
 ) -> (XkbDesc, String, xkbcommon::xkb::Keymap) {
-    let mut desc = match XkbDesc::from_keymap(&keymap) {
+    let mut desc = match XkbDesc::from_keymap(&keymap, ctx) {
         Ok(desc) => desc,
         Err(e) => {
             log::error!("xkb: can't read the keymap back ({e}); an empty description");
@@ -2375,7 +2375,8 @@ impl KmsCore {
             rmlvo.options.clone(),
             xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
         )?;
-        Some(self.install_keymap(keymap, rmlvo))
+        let ctx = self.xkb_context.0.clone();
+        Some(self.install_keymap(&ctx, keymap, rmlvo))
     }
 
     /// True when the active keymap is exactly what `rmlvo` compiles to: same
@@ -2384,16 +2385,17 @@ impl KmsCore {
         self.keymap_source == KeymapSource::Rmlvo && self.xkb_rmlvo == *rmlvo
     }
 
-    /// Make `keymap` (compiled from `rmlvo`) the active one: seed the
-    /// description from it and install its cooking keymap. Returns the
+    /// Make `keymap` (compiled from `rmlvo` in `ctx`) the active one: seed
+    /// the description from it and install its cooking keymap. Returns the
     /// keycode bounds. The tail of [`Self::recompile_keymap`], split out so
     /// tests can install a keymap frozen from a known xkeyboard-config.
     pub(crate) fn install_keymap(
         &mut self,
+        ctx: &xkbcommon::xkb::Context,
         keymap: xkbcommon::xkb::Keymap,
         rmlvo: &XkbRmlvo,
     ) -> (u8, u8) {
-        let (desc, text, cooking) = cooking_keymap_for(&self.xkb_context.0, keymap, rmlvo);
+        let (desc, text, cooking) = cooking_keymap_for(ctx, keymap, rmlvo);
         self.xkb_desc = desc;
         self.xkb_text = text;
         self.swap_keymap(cooking, 0);
@@ -2584,7 +2586,11 @@ mod xkb_rmlvo_tests {
     fn install_desc_installs_the_description() {
         // External truth: the frozen de fixture puts `z` on keycode 29.
         let mut core = KmsCore::for_tests();
-        let de = XkbDesc::from_keymap(&crate::kms::xkb::golden_keymap("de", None)).expect("seed");
+        let de = XkbDesc::from_keymap(
+            &crate::kms::xkb::golden_keymap("de", None),
+            &crate::kms::xkb::golden_context(),
+        )
+        .expect("seed");
         let range = core.install_desc(de.clone()).expect("de compiles");
         assert_eq!(range, (8, 255));
         assert_eq!(core.xkb_desc, de);
@@ -2600,6 +2606,7 @@ mod xkb_rmlvo_tests {
     fn edit_keeps_locked_group_locked_mods_and_held_keys() {
         let mut core = KmsCore::for_tests();
         core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap("us,ru", Some("grp:alt_shift_toggle")),
             &usru_rmlvo(),
         );
@@ -2669,11 +2676,16 @@ mod xkb_rmlvo_tests {
     fn edit_clamps_the_locked_group_to_the_new_keymap() {
         let mut core = KmsCore::for_tests();
         core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap("us,ru", Some("grp:alt_shift_toggle")),
             &usru_rmlvo(),
         );
         core.locked_group = 1;
-        let us = XkbDesc::from_keymap(&crate::kms::xkb::golden_keymap("us", None)).expect("seed");
+        let us = XkbDesc::from_keymap(
+            &crate::kms::xkb::golden_keymap("us", None),
+            &crate::kms::xkb::golden_context(),
+        )
+        .expect("seed");
         core.install_desc(us).expect("us compiles");
         assert_eq!(core.keymap_group_count(), 1, "precondition");
         assert_eq!(core.locked_group, 0, "group 2 no longer exists");

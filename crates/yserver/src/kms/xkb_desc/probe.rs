@@ -494,24 +494,3 @@ pub(crate) fn names_lines_with(b: &[u8], atom_name: &dyn Fn(u32) -> String) -> V
     );
     out
 }
-
-/// A `type N …` line's entries, each with its preserve, as a sorted set.
-pub(crate) fn type_entry_set(line: &str) -> (String, Vec<String>) {
-    let head = line.split(" map=").next().unwrap_or("").to_owned();
-    let list = |key: &str| -> Vec<String> {
-        line.split(key)
-            .nth(1)
-            .and_then(|r| r.split(']').next())
-            .map(|r| r.split(' ').map(str::to_owned).collect())
-            .unwrap_or_default()
-    };
-    let map = list("map=[");
-    let pre = list("pre=[");
-    let mut set: Vec<String> = map
-        .iter()
-        .enumerate()
-        .map(|(i, e)| format!("{e}|{}", pre.get(i).map_or("", String::as_str)))
-        .collect();
-    set.sort();
-    (head, set)
-}

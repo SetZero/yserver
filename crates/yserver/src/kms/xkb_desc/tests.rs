@@ -2,7 +2,7 @@
 //! and the cooking gate.
 
 use super::*;
-use crate::kms::xkb::golden_keymap;
+use crate::kms::xkb::{golden_context, golden_keymap};
 
 /// The four frozen fixtures, as `golden_keymap` keys them, with their
 /// `xorg-xkb-pristine.txt` case names.
@@ -14,7 +14,7 @@ pub(crate) const FIXTURES: [(&str, Option<&str>, &str); 4] = [
 ];
 
 pub(crate) fn seeded(layout: &str, options: Option<&str>) -> XkbDesc {
-    XkbDesc::from_keymap(&golden_keymap(layout, options)).expect("seed")
+    XkbDesc::from_keymap(&golden_keymap(layout, options), &golden_context()).expect("seed")
 }
 
 /// Xorg's whole-description lines for one pristine case (`= ` stripped).
@@ -51,12 +51,6 @@ pub(crate) fn pristine_lines(case: &str) -> Vec<String> {
 ///   RepeatKeys only).
 /// - the `geometry` line: geometry is name-only by decision (open question
 ///   1); GetGeometry keeps answering found=False.
-/// - type 9 (`CTRL+ALT`): xkbcomp re-adds the level-1 entries a preserve
-///   needs in `preserve[]` *definition* order (Alt before Control in
-///   xkeyboard-config's types/pc); xkbcommon's dump keeps preserves in
-///   entry order, so those two trailing entries come out swapped. The
-///   entries (each with its preserve) are compared as a set; the level
-///   selection is the same either way, since their masks differ.
 /// - a key whose only symbol is `NoSymbol` (inet(evdev)'s `<I248>`,
 ///   KEY_UNKNOWN): xkbcomp keeps one ONE_LEVEL group of `NoSymbol`,
 ///   xkbcommon drops the group. Cooks the same (nothing).
@@ -79,9 +73,6 @@ pub(crate) fn tolerated(xorg: &str, ours: &str) -> bool {
     }
     if xorg.starts_with("geometry ") || xorg.starts_with("alias ") {
         return true;
-    }
-    if xorg.starts_with("type 9 ") {
-        return super::probe::type_entry_set(xorg) == super::probe::type_entry_set(ours);
     }
     if xorg.starts_with("key ") {
         let nosym = xorg.replace(" gi=0x01 w=1 syms=0 ", " gi=0x00 w=0 syms=- ");
@@ -204,7 +195,8 @@ fn writer_round_trip_keeps_the_cooking_view() {
             uncooked.is_empty(),
             "{case}: nothing uncookable in the defaults"
         );
-        let reseeded = XkbDesc::from_keymap(&gate::compile(&text)).expect("reseed");
+        let reseeded =
+            XkbDesc::from_keymap(&gate::compile(&text), &golden_context()).expect("reseed");
         let (a, b) = (gate::cooking_view(&desc), gate::cooking_view(&reseeded));
         let diff = line_diff(&a, &b, 10);
         assert!(diff.is_empty(), "{case}:\n{}", diff.join("\n"));
@@ -564,7 +556,7 @@ fn get_names_carries_real_atoms_where_xorg_does() {
     .expect("startup keymap");
     let mut descs = vec![(
         "startup".to_owned(),
-        XkbDesc::from_keymap(&startup).expect("seed"),
+        XkbDesc::from_keymap(&startup, &ctx).expect("seed"),
     )];
     for (layout, options, case) in FIXTURES {
         descs.push((case.to_owned(), seeded(layout, options)));
@@ -722,7 +714,7 @@ fn libx11_decodes_the_names_xdotool_asks_for() {
     .expect("startup keymap");
     let mut descs = vec![(
         "startup".to_owned(),
-        XkbDesc::from_keymap(&startup).expect("seed"),
+        XkbDesc::from_keymap(&startup, &ctx).expect("seed"),
     )];
     for (layout, options, case) in FIXTURES {
         descs.push((case.to_owned(), seeded(layout, options)));

@@ -49011,6 +49011,7 @@ mod tests {
     fn kbd_map_backend(layout: &str, options: Option<&str>) -> KmsBackend {
         let mut backend = KmsBackend::for_tests();
         backend.core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap(layout, options),
             &crate::kms::core::XkbRmlvo {
                 rules: "evdev".into(),

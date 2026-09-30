@@ -710,7 +710,8 @@ pub(super) fn reply_get_kbd_by_name(
 /// xkeyboard-config 2.48, the version in the goldens' headers). Compiling
 /// from RMLVO instead reads the host's xkeyboard-config, so a distro with
 /// another version compiles a different keymap and every golden diff fails
-/// on the input, not on our conversion (Ubuntu CI).
+/// on the input, not on our conversion (Ubuntu CI). Compiled in
+/// [`golden_context`], so the seed reads 2.48's type sources too.
 #[cfg(test)]
 pub(crate) fn golden_keymap(layout: &str, options: Option<&str>) -> xkbcommon::xkb::Keymap {
     let text = match (layout, options) {
@@ -720,14 +721,26 @@ pub(crate) fn golden_keymap(layout: &str, options: Option<&str>) -> xkbcommon::x
         ("us,ru", Some("grp:alt_shift_toggle")) => include_str!("testdata/xkb-keymap-usru.xkb"),
         other => panic!("no frozen golden keymap for {other:?}"),
     };
-    let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
     xkbcommon::xkb::Keymap::new_from_string(
-        &ctx,
+        &golden_context(),
         text.to_owned(),
         xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
         xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
     .expect("frozen golden keymap parses")
+}
+
+/// The context [`golden_keymap`]s are compiled in: xkeyboard-config 2.48's
+/// `types/` (vendored) as the only include path, not the host's.
+#[cfg(test)]
+pub(crate) fn golden_context() -> xkbcommon::xkb::Context {
+    let mut ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+    let root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/kms/testdata/xkeyboard-config-2.48"
+    );
+    assert!(ctx.include_path_append(std::path::Path::new(root)));
+    ctx
 }
 #[cfg(test)]
 mod tests {
@@ -751,8 +764,10 @@ mod tests {
         .expect("us,de keymap")
     }
 
+    /// The seed of a keymap compiled from the host's xkeyboard-config.
     fn desc_of(km: &xkbcommon::xkb::Keymap) -> XkbDesc {
-        XkbDesc::from_keymap(km).expect("seed")
+        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        XkbDesc::from_keymap(km, &ctx).expect("seed")
     }
 
     fn names_body(which: u32) -> [u8; 8] {
@@ -1323,7 +1338,7 @@ mod tests {
     /// dump, key by key.
     fn core_map_diffs(layout: &str, options: Option<&str>, golden: &str) -> Vec<String> {
         let (min, width, rows) = parse_core_golden(golden);
-        let ours = desc_of(&golden_keymap(layout, options)).core_map();
+        let ours = crate::kms::xkb_desc::tests::seeded(layout, options).core_map();
         let mut diffs = Vec::new();
         if (ours.min_keycode, ours.width) != (min, width) {
             diffs.push(format!(
@@ -1408,7 +1423,7 @@ mod tests {
                 .enumerate()
                 .collect()
         };
-        let got = desc_of(&golden_keymap(layout, options)).modifier_mapping();
+        let got = crate::kms::xkb_desc::tests::seeded(layout, options).modifier_mapping();
         let want = modmap_golden(case);
         assert_eq!((got.0, rows(&got)), (want.0, rows(&want)), "{case}");
     }
@@ -1450,7 +1465,7 @@ mod tests {
             .map(|i| u8::from_str_radix(&bits[2 * i..2 * i + 2], 16).unwrap())
             .collect();
         assert!(text.contains("query: layout:     us"));
-        let got = desc_of(&golden_keymap("us", None)).per_key_repeat;
+        let got = crate::kms::xkb_desc::tests::seeded("us", None).per_key_repeat;
         let diff: Vec<u8> = (8..=255u8)
             .filter(|&kc| {
                 let (i, b) = (usize::from(kc >> 3), 1u8 << (kc & 7));
