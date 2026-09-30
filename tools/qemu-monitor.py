@@ -13,6 +13,7 @@ terminal, so replies are dropped unless -v is passed.
 """
 
 import argparse
+import os
 import socket
 import sys
 import time
@@ -52,7 +53,8 @@ def main() -> None:
     parser.add_argument("command", nargs="+")
     args = parser.parse_args()
 
-    sock = connect(args.socket, time.monotonic() + args.wait)
+    # A symlink keeps long artifact paths clear of the 107-byte sun_path limit.
+    sock = connect(os.path.realpath(args.socket), time.monotonic() + args.wait)
     sock.settimeout(2)
     drain(sock)
     for command in args.command:

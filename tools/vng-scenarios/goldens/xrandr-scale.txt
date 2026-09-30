@@ -1,0 +1,55 @@
+==> scale.log <==
+===== --scale 1.6x1.6
+Screen 0: minimum 320 x 200, current 2048 x 1280, maximum <max>
+Virtual-1 connected primary 2048x1280+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  1.599991 0.000000 0.000000
+	           filter: bilinear
+Monitors: 1
+ 0: +*Virtual-1 2048/<mm>x1280/<mm>+0+0  Virtual-1
+  Width: 2048
+  Height: 1280
+===== --scale 0.625x0.625
+Screen 0: minimum 320 x 200, current 800 x 500, maximum <max>
+Virtual-1 connected primary 800x500+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  0.625000 0.000000 0.000000
+	           filter: bilinear
+Monitors: 1
+ 0: +*Virtual-1 800/<mm>x500/<mm>+0+0  Virtual-1
+  Width: 800
+  Height: 500
+===== --scale 0.8x0.8
+Screen 0: minimum 320 x 200, current 1024 x 640, maximum <max>
+Virtual-1 connected primary 1024x640+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  0.799988 0.000000 0.000000
+	           filter: bilinear
+Monitors: 1
+ 0: +*Virtual-1 1024/<mm>x640/<mm>+0+0  Virtual-1
+  Width: 1024
+  Height: 640
+===== --scale 2x2
+Screen 0: minimum 320 x 200, current 2560 x 1600, maximum <max>
+Virtual-1 connected primary 2560x1600+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  2.000000 0.000000 0.000000
+	           filter: bilinear
+Monitors: 1
+ 0: +*Virtual-1 2560/<mm>x1600/<mm>+0+0  Virtual-1
+  Width: 2560
+  Height: 1600
+===== --scale 0.5x0.5
+Screen 0: minimum 320 x 200, current 640 x 400, maximum <max>
+Virtual-1 connected primary 640x400+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  0.500000 0.000000 0.000000
+	           filter: bilinear
+Monitors: 1
+ 0: +*Virtual-1 640/<mm>x400/<mm>+0+0  Virtual-1
+  Width: 640
+  Height: 400
+===== --scale 1.333333x1.333333
+Screen 0: minimum 320 x 200, current 1707 x 1067, maximum <max>
+Virtual-1 connected primary 1707x1067+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  1.333328 0.000000 0.000000
+	           filter: bilinear
+Monitors: 1
+ 0: +*Virtual-1 1707/<mm>x1067/<mm>+0+0  Virtual-1
+  Width: 1707
+  Height: 1067

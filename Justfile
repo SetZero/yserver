@@ -1480,6 +1480,23 @@ yserver-wmaker-xterm-hw-trace log="debug":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+# ============================== VNG SUITE ==============================
+
+# Registered vng scenarios (tools/vng-scenarios/suite.list); filter is a name regex.
+#   just vng-suite                 just vng-suite span venus
+vng-suite filter="all" gpu="none" binary="":
+    KERNEL={{KERNEL}} tools/vng-suite.sh --gpu {{gpu}} {{ if binary != "" { "--binary " + binary } else { "" } }} {{filter}}
+
+# Rewrite tools/vng-scenarios/goldens/ from Xorg 21.1 in the guest; review the diff like code.
+#   just vng-goldens xrandr-dpi
+vng-goldens filter="all":
+    KERNEL={{KERNEL}} tools/vng-suite.sh --gpu none --regen-goldens {{filter}}
+
+# The runner's own self-test: fail, crash, timeout and SIGINT must all fail cleanly.
+vng-suite-selftest gpu="none":
+    cargo build --bin yserver
+    KERNEL={{KERNEL}} tools/vng-scenarios/suite-selftest/run.sh {{gpu}} --binary target/debug/yserver
+
 # ============================== RENDERCHECK ==============================
 
 # Run rendercheck against yserver (KMS) inside virtme-ng.

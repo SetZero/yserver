@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Host half of xrandr-rotate-scanout.sh: per step, presses yserver's
 # Ctrl+Alt+Enter scanout dump, then checks each dump against the root capture
-# pushed through the rotation on the CPU.
-#   tools/vng-scenarios/xrandr-rotate-scanout-host.sh
+# pushed through the rotation on the CPU; exits 1 on any differing pixel.
+#   tools/vng-scenarios/xrandr-rotate-scanout-host.sh [name] [vng-shot args...]
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-name=rotate-scanout
-out=$repo/target/vng/$name
+name=${1:-rotate-scanout}
+shift || true
+out=${VNG_OUT:-$repo/target/vng}/$name
 rm -rf "$out"
-"$repo/tools/vng-shot.sh" --dump none --name "$name" --timeout 900 \
+"$repo/tools/vng-shot.sh" --dump none --name "$name" --timeout 900 "$@" \
     --scenario "$repo/tools/vng-scenarios/xrandr-rotate-scanout.sh" &
 shot=$!
 mon=$out/monitor.sock
@@ -45,6 +46,7 @@ maps = {
     "reflect-y": lambda x, y, w, h: (x, h - 1 - y),
     "left-scale2": lambda x, y, w, h: (2 * h - 2 - 2 * y, 2 * x),
 }
+failed = 0
 for tag, m in maps.items():
     scan = Image.open(f"{out}/scanout-{tag}.ppm").convert("RGB")
     root = Image.open(f"{out}/root-{tag}.png").convert("RGB")
@@ -52,4 +54,6 @@ for tag, m in maps.items():
     sp, rp = scan.load(), root.load()
     bad = sum(sp[x, y] != rp[m(x, y, w, h)] for y in range(h) for x in range(w))
     print(f"{tag}: scanout {w}x{h}, root {root.size[0]}x{root.size[1]}, differing pixels: {bad}")
+    failed += bad > 0
+sys.exit(1 if failed else 0)
 PY

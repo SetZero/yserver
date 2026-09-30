@@ -1,9 +1,16 @@
 # Sourced by tools/vng-shot.sh INSIDE the guest (DISPLAY=:7, cwd = artifacts).
 # CRTC rotation/reflection: geometry, GetCrtcInfo, monitors, Xinerama, the
 # SetScreenSize crop rule and a root capture over a known pattern, per step.
-# With --outputs 2 only the second output, right of the first, is rotated.
-#   tools/vng-shot.sh [--outputs 2] --server xorg --dump none --name rotate-xorg \
-#       --scenario tools/vng-scenarios/xrandr-rotate.sh
+# With --outputs 2 only the second output, right of the first, is rotated;
+# they start at 1280x800 and 1024x768 side by side (Xorg would clone them).
+# shellcheck shell=sh
+# golden: rotate.log events.log root-pixels.txt
+# golden-include: masks/randr.txt
+# mask: \(33[89]x21[12] millimeters\) => (<startup mm> millimeters) -- known (docs/status.md 2026-09-29): startup screen mm round to 339x212, Xorg truncates to 338x211
+# mask: \((609|610)x21[12] millimeters\) => (<startup mm> millimeters) -- the two-output screen mm, derived from the startup mm above
+# mask: \bmm 33[89] 21[12]\b => mm <startup mm> -- startup screen mm, as above
+# mask: \bmm 21[12] 33[89]\b => mm <startup mm> -- startup screen mm, as above
+# drop: ^OutputChangeNotify rotation -- known (docs/status.md 2026-09-29): an in-place rotation also sends OutputChangeNotify
 set -u
 # The guest runs with -e; a failed probe must not end the run.
 set +e
@@ -84,12 +91,14 @@ python3 events.py > events.log 2>&1 &
 events=$!
 out1=$(xrandr | awk '/ connected/{print $1; exit}')
 out2=$(xrandr | awk '/ connected/{n++} / connected/ && n==2 {print $1}')
+[ -z "$out2" ] || xrandr --output "$out1" --mode 1280x800 --pos 0x0 \
+    --output "$out2" --mode 1024x768 --right-of "$out1" > layout.log 2>&1 || echo layout >> FAILED
 python3 rot.py pattern > pattern.log 2>&1
 step() {
     tag=$1; shift
     echo "===== $tag: xrandr $*"
     echo "===== $tag" >> events.log
-    xrandr "$@" 2>&1
+    xrandr "$@" 2>&1 || echo "$tag" >> FAILED
     sleep 1
     xrandr --verbose | grep -E '^Screen| connected|Transform|^ {12}[-0-9]|filter:|Rotation|Reflection|^\s+[0-9]+x[0-9]+ .*\*current' 2>&1
     xrandr --listmonitors 2>&1
@@ -100,6 +109,7 @@ step() {
     python3 rot.py crop
     root_clear
     for at in "301 203" "700 500"; do
+        # shellcheck disable=SC2086
         xdotool mousemove $at
         sleep 0.5
         import -window root "root-$tag-${at% *}.png" > /dev/null 2>&1 || true
@@ -122,7 +132,6 @@ d = display.Display(); d.screen().root.clear_area(0, 0, 0, 0); d.sync()"; }
         step left-scale2-pos --output "$out1" --rotate left --scale 2x2 --pos 0x0
         step restore --output "$out1" --rotate normal --scale 1x1
     else
-        xrandr --output "$out1" --pos 0x0 --output "$out2" --right-of "$out1" 2>&1
         step dual-normal --output "$out2" --rotate normal
         step dual-right-left --output "$out2" --rotate left
         step dual-right-inverted --output "$out2" --rotate inverted
@@ -131,3 +140,14 @@ d = display.Display(); d.screen().root.clear_area(0, 0, 0, 0); d.sync()"; }
 } > rotate.log 2>&1
 xrandr --output "$out1" --rotate normal --scale 1x1 > /dev/null 2>&1 || true
 kill $events $hold 2>/dev/null || true
+# Root captures by pixel content (PNG metadata differs between runs).
+python3 - root-*.png > root-pixels.txt 2>&1 <<'PY'
+import hashlib, sys
+from PIL import Image
+for f in sorted(sys.argv[1:]):
+    im = Image.open(f).convert("RGB")
+    print(f, im.size, hashlib.sha256(im.tobytes()).hexdigest()[:16])
+PY
+if [ -e FAILED ]; then echo "fail: xrandr failed: $(paste -sd' ' FAILED)" > RESULT
+elif [ ! -s root-pixels.txt ]; then echo "fail: no root captures" > RESULT
+else echo pass > RESULT; fi

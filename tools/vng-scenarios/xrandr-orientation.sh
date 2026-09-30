@@ -1,15 +1,23 @@
 # Sourced by tools/vng-shot.sh INSIDE the guest (DISPLAY=:7, cwd = artifacts).
 # RANDR 1.0 SetScreenConfig (`xrandr -o`): statuses, errors, what it does to
 # screen/CRTC geometry, timestamps and events.
-#   tools/vng-shot.sh --server xorg --dump none --name orient-xorg \
-#       --scenario tools/vng-scenarios/xrandr-orientation.sh
+# shellcheck shell=sh
+# golden: orient.log events.log
+# golden-include: masks/randr.txt
+# mask: \b(\d+, \d+), (325, 203|320, 200)\) => \1, <mm>) -- output mm in GetScreenInfo sizes, as masks/randr.txt
+# mask: \bts \d+ cts \d+ => ts <t> cts <t> -- server time
+# mask: (old timestamp before any set: status )[02] => \1<known> -- known (docs/status.md 2026-09-29): yserver's initial lastSetTime is 1, so timestamp 1 is not stale yet
+# mask: \bmm 33[89] 21[12]\b => mm <startup mm> -- known (docs/status.md 2026-09-29): startup screen mm round (339x212) where Xorg truncates (338x211)
+# mask: \bmm 21[12] 33[89]\b => mm <startup mm> -- startup screen mm, as above
+# drop: ^CrtcChangeNotify rotation 0x[0-9a-f]+ geom 0 0 0 0$ -- known (docs/status.md 2026-09-29): SetScreenConfig reconfigures the CRTC in place, Xorg's intermediate disable notifies are not sent
+# drop: ^(Screen|Output)ChangeNotify -- the same known divergence: Xorg adds intermediate Screen/Output notifies, yserver an OutputChangeNotify per rotation
 set -u
 set +e
 xprop -root -spy > /dev/null 2>&1 &
 hold=$!
 sleep 1
 cat > orient.py <<'PY'
-import sys
+import sys, time
 from Xlib import display, error
 from Xlib.ext import randr
 d = display.Display()
@@ -31,6 +39,8 @@ def screen_info():
     print("  screen", g.width, g.height)
     return i
 def call(label, **kw):
+    # Timestamps have millisecond resolution: keep calls apart.
+    time.sleep(0.02)
     i = root.xrandr_get_screen_info()
     args = dict(size_id=0, rotation=1, config_timestamp=i.config_timestamp, rate=0, timestamp=0)
     args.update(kw)
@@ -47,7 +57,7 @@ if cmd == "info":
 elif cmd == "probe":
     i = screen_info()
     call("stale config timestamp", config_timestamp=i.config_timestamp + 1)
-    call("old timestamp", timestamp=1)
+    call("old timestamp" + (" before any set" if sys.argv[2:] == ["first"] else ""), timestamp=1)
     call("size_id 1", size_id=1)
     call("rotation 3", rotation=3)
     call("rotation 0x41", rotation=0x41)
@@ -88,7 +98,7 @@ python3 events.py >> events.log 2>&1 &
 events=$!
 {
     echo "===== probe"
-    python3 orient.py probe
+    python3 orient.py probe first
     for o in left right inverted normal 1 left; do
         echo "===== xrandr -o $o"
         timeout 30 xrandr -o "$o" 2>&1; echo "rc $?"
@@ -99,6 +109,8 @@ events=$!
     done
     echo "===== probe while left"
     python3 orient.py probe
+    echo "===== end"
 } > orient.log 2>&1
 xrandr -o normal > /dev/null 2>&1
 kill $events $hold 2>/dev/null || true
+if grep -q '^===== end' orient.log; then echo pass > RESULT; else echo "fail: orient.log incomplete" > RESULT; fi

@@ -11,7 +11,7 @@
 #     tools/border-pixmap-check.py <scanout.ppm>
 set -u
 src=$(dirname "$0")/border-pixmap-client.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/vng-scenarios/border-pixmap-client.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/vng-scenarios/border-pixmap-client.c
 
 cc -O1 -o border-pixmap-client "$src" -lX11 > cc.log 2>&1 || {
     echo "border-pixmap: compile failed" >&2

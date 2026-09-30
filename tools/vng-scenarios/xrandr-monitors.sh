@@ -1,8 +1,13 @@
 # Sourced by tools/vng-shot.sh INSIDE the guest (DISPLAY=:7, cwd = artifacts).
 # RANDR 1.5 SetMonitor/DeleteMonitor: merged monitor list, Xinerama, errors, notifies.
-#   tools/vng-shot.sh [--outputs 2] --server xorg --dump none --name monitors-xorg \
-#       --scenario tools/vng-scenarios/xrandr-monitors.sh
+# With two outputs they start at 1280x800 and 1024x768 side by side (Xorg would clone them).
+# shellcheck shell=sh
+# golden: monitors.log
+# golden-include: masks/randr.txt
+# mask: (Value in failed request:\s+)0x[0-9a-f]+ => \1<atom> -- the failing value is a monitor-name atom
+# mask: \('BadLength', 16, '(root|0x0)', 43\) => ('BadLength', 16, <stale>, 43) -- Xorg's BadLength carries a stale errorValue, yserver 0 (the policy in docs/status.md, RECORD entry)
 set -u
+set +e
 # Hold a connection: Xorg resets (dropping client monitors) when its last client leaves.
 xprop -root -spy > /dev/null 2>&1 &
 hold=$!
@@ -133,6 +138,8 @@ elif cmd == "events":
 PY
 out1=$(xrandr | awk '/ connected/{print $1; exit}')
 out2=$(xrandr | awk '/ connected/{n++} / connected/ && n==2 {print $1}')
+[ -z "$out2" ] || xrandr --output "$out1" --mode 1280x800 --pos 0x0 \
+    --output "$out2" --mode 1024x768 --right-of "$out1" > layout.log 2>&1 || echo layout > FAILED
 w=$(xwininfo -root | awk '/Width:/{print $2}')
 h=$(xwininfo -root | awk '/Height:/{print $2}')
 half=$((w / 2))
@@ -173,14 +180,14 @@ half=$((w / 2))
     python3 mon.py dump autogeo
     if [ -n "${out2:-}" ]; then
         echo "=== two outputs: automatic geometry across both, then CRTC changes"
-        xrandr --output "$out1" --pos 0x0 --output "$out2" --auto --right-of "$out1"
+        xrandr --output "$out1" --pos 0x0 --output "$out2" --mode 1024x768 --right-of "$out1"
         xrandr --setmonitor both auto "$out1,$out2"
         python3 mon.py dump both
         xrandr --setmonitor on2 "300/80x200/50+5+5" "$out2"
         python3 mon.py dump on2
         xrandr --output "$out2" --off
         python3 mon.py dump out2-off
-        xrandr --output "$out2" --auto --right-of "$out1"
+        xrandr --output "$out2" --mode 1024x768 --right-of "$out1"
         python3 mon.py dump out2-back
         xrandr --output "$out2" --primary
         python3 mon.py dump out2-primary
@@ -203,5 +210,9 @@ half=$((w / 2))
     sleep 1
     python3 mon.py dump persist
     xrandr --delmonitor persist
+    echo "=== end"
 } > monitors.log 2>&1 || true
 kill $hold 2>/dev/null || true
+if [ -e FAILED ]; then echo "fail: initial two-output layout failed (layout.log)" > RESULT
+elif ! grep -q '^=== end' monitors.log; then echo "fail: monitors.log incomplete" > RESULT
+else echo pass > RESULT; fi

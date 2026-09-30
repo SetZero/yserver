@@ -1,0 +1,1190 @@
+==> xtest.log <==
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# basic
+> p38
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# duplicate press, non-modifier
+> p38
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> p38
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# duplicate press, modifier (Shift_L)
+> p50
+m22 RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+> p50
+> r50
+m22 RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# release of a key that is not down
+> r38
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G1 core GrabKeyboard async
+> grabkbd:async
+drv GrabKeyboard status=0
+> p38
+drv core-event type=2
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv core-event type=3
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> ungrabkbd
+> p38
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# C1 core GrabKeyboard, grabber selects raw on root
+> drvsel:1
+drv select on root devs=1 -> ok
+> grabkbd:async
+drv GrabKeyboard status=0
+> p38
+drv core-event type=2
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv core-event type=3
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> ungrabkbd
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G2 XIGrabDevice(3) root, raw in grab mask, grabber selects
+> drvsel:1
+drv select on root devs=1 -> ok
+> xigrab:3
+drv XIGrabDevice dev=3 window=root status=0
+> p38
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyPress      dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G3 XIGrabDevice(3) child, raw in grab mask, grabber selects
+> drvsel:1
+drv select on root devs=1 -> ok
+> xigrab:3:win
+drv XIGrabDevice dev=3 window=child status=0
+> p38
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyPress      dev=3 src=<kbd> detail=38 event=child flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=child flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G3b XIGrabDevice(3) root, raw in grab mask
+> xigrab:3
+drv XIGrabDevice dev=3 window=root status=0
+> p38
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyPress      dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# O1 XIGrabDevice(3) child owner_events, no raw in mask, grabber selects
+> drvsel:1
+drv select on root devs=1 -> ok
+> xigrab:3:win:oe:noraw
+drv XIGrabDevice dev=3 window=child status=0
+> p38
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyPress      dev=3 src=<kbd> detail=38 event=child flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=child flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# O2 XIGrabDevice(3) child, no raw in mask, grabber selects
+> drvsel:1
+drv select on root devs=1 -> ok
+> xigrab:3:win:noraw
+drv XIGrabDevice dev=3 window=child status=0
+> p38
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyPress      dev=3 src=<kbd> detail=38 event=child flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=child flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# O3 XIGrabDevice(3) root owner_events, no raw in mask, grabber selects
+> drvsel:1
+drv select on root devs=1 -> ok
+> xigrab:3:oe:noraw
+drv XIGrabDevice dev=3 window=root status=0
+> p38
+drv RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyPress      dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+drv   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# O4 XIGrabDevice(3) root, no raw in mask, grabber selects
+> drvsel:1
+drv select on root devs=1 -> ok
+> xigrab:3:noraw
+drv XIGrabDevice dev=3 window=root status=0
+> p38
+drv KeyPress      dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv KeyRelease    dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22
+drv   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> xiungrab:3
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G4 core GrabKeyboard sync, AllowEvents(AsyncKeyboard)
+> grabkbd:sync
+drv GrabKeyboard status=0
+> p38
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> allow:async
+drv core-event type=2
+drv core-event type=3
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> p39
+drv core-event type=2
+m22 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r39
+drv core-event type=3
+m22 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+> ungrabkbd
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G5 passive GrabKey sync, AllowEvents(ReplayKeyboard)
+> grabkey:38:sync
+drv GrabKey -> ok
+> p38
+drv core-event type=2
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> allow:replay
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> p39
+m22 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r39
+m22 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:m22:2:1
+m22 xi-version asked=2.2 got=2.2
+m22 select on root devs=1 -> ok
+> mon:a22:2:0
+a22 xi-version asked=2.2 got=2.2
+a22 select on root devs=0 -> ok
+> mon:vck:2:3
+vck xi-version asked=2.2 got=2.2
+vck select on root devs=3 -> ok
+> mon:xtk:2:5
+xtk xi-version asked=2.2 got=2.2
+xtk select on root devs=5 -> ok
+> mon:m20:0:1
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+> mon:a20:0:0
+a20 xi-version asked=2.0 got=2.0
+a20 select on root devs=0 -> ok
+# G6 passive GrabKey async
+> grabkey:38:async
+drv GrabKey -> ok
+> p38
+drv core-event type=2
+m22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv core-event type=3
+m22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> p39
+m22 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyPress   dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0d000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r39
+m22 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a22 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a22   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+vck RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+vck   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+xtk RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+xtk   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+m20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=<kbd> src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+a20 RawKeyRelease dev=3 src=<kbd> detail=39 flags=0x0 vlen=2 len=2
+a20   wire 23...... 02000000 0e000<d>00 ........ 27000000 <kbd>000200 00000000 00000000 00000000 00000000
+======
+drv xi-version asked=2.2 got=2.2
+> mon:none:-:1
+none select on root devs=1 -> ok
+> mon:v20then22:0,2:1
+v20then22 xi-version asked=2.0 got=2.0
+v20then22 xi-version asked=2.2 got=<known>
+v20then22 select on root devs=1 -> ok
+> mon:v22then20:2,0:1
+v22then20 xi-version asked=2.2 got=2.2
+v22then20 xi-version asked=2.0 <known>
+v22then20 select on root devs=1 -> ok
+> mon:v23then22:3,2:1
+v23then22 xi-version asked=2.3 got=2.3
+v23then22 xi-version asked=2.2 got=2.2
+v23then22 select on root devs=1 -> ok
+# V1 stored XI version under a core grab
+> grabkbd:async
+drv GrabKeyboard status=0
+> p38
+drv core-event type=2
+none RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+none   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+v22then20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+v22then20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+v23then22 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+v23then22   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> r38
+drv core-event type=3
+none RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+none   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+v22then20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+v22then20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+v23then22 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2
+v23then22   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+> ungrabkbd
+==> physical-by-client.log <==
+> mon:mk:2:1k
+> mon:ak:2:0
+> mon:m20:0:1
+> listen:25
+ak xi-version asked=2.2 got=2.2
+ak select on root devs=0 -> ok
+ak RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=<kbd> src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=3 src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=<kbd> src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=3 src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=<kbd> src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=<kbd> src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=<kbd> src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyPress   dev=3 src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0d000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=<kbd> src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+ak RawKeyRelease dev=3 src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+ak   wire 23...... 02000000 0e000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+drv xi-version asked=2.2 got=2.2
+m20 xi-version asked=2.0 got=2.0
+m20 select on root devs=1 -> ok
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0d000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0e000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyPress   dev=3 src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0d000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+m20 RawKeyRelease dev=3 src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+m20   wire 23...... 02000000 0e000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk xi-version asked=2.2 got=2.2
+mk select on root devs=1k -> ok
+mk RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyPress      dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyRelease    dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyPress   dev=3 src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0d000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyPress      dev=3 src=<kbd> detail=71 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 02000300 ........ 47000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyRelease dev=3 src=<kbd> detail=71 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0e000<d>00 ........ 47000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyRelease    dev=3 src=<kbd> detail=71 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 03000300 ........ 47000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyPress   dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0d000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyPress      dev=3 src=<kbd> detail=50 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 02000300 ........ 32000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyPress   dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0d000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyPress      dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 02000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 01000000 00000000 00000000 01000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyRelease dev=3 src=<kbd> detail=38 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0e000<d>00 ........ 26000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyRelease    dev=3 src=<kbd> detail=38 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 03000300 ........ 26000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 01000000 00000000 00000000 01000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyRelease dev=3 src=<kbd> detail=50 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0e000<d>00 ........ 32000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk KeyRelease    dev=3 src=<kbd> detail=50 event=root flags=0x0 len=22 dt=<t>
+mk   wire 23...... 16000000 03000300 ........ 32000000 <root> <event> <child> 00008002 00009001 <ex> <ey> 08000200 <kbd>000000 00000000 01000000 00000000 00000000 01000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+mk RawKeyPress   dev=3 src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0d000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000
+mk RawKeyRelease dev=3 src=<kbd> detail=56 flags=0x0 vlen=2 len=2 dt=<t>
+mk   wire 23...... 02000000 0e000<d>00 ........ 38000000 <kbd>000200 00000000 00000000 00000000 00000000

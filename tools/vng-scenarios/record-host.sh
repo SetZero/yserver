@@ -3,18 +3,16 @@
 # yserver or Xorg, waits for the in-guest recorder, then presses real keys on
 # the guest's PS/2 keyboard through the QEMU monitor, one held past the
 # auto-repeat delay.
-#   tools/vng-scenarios/record-host.sh yserver|xorg
-# Artifacts: target/vng/record-<server>/{record,physical}.log (Xorg: physical only)
+#   tools/vng-scenarios/record-host.sh [name] [vng-shot args...]   # e.g. --server xorg
+# Artifacts: target/vng/<name>/{record,physical}.log
 set -euo pipefail
-server=${1:?usage: record-host.sh yserver|xorg}
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-name=record-$server
-out=$repo/target/vng/$name
+name=${1:-record}
+shift || true
+out=${VNG_OUT:-$repo/target/vng}/$name
 rm -rf "$out"
-env=()
-[ "$server" = xorg ] && env=(--env RECORD_PHYSICAL_ONLY=1)
-"$repo/tools/vng-shot.sh" --server "$server" --dump none --hold 20 --name "$name" \
-    ${env+"${env[@]}"} --scenario "$repo/tools/vng-scenarios/record.sh" &
+"$repo/tools/vng-shot.sh" --dump none --hold 20 --name "$name" "$@" \
+    --scenario "$repo/tools/vng-scenarios/record.sh" &
 shot=$!
 for _ in $(seq 1 600); do
     [ -e "$out/LISTENING" ] && break

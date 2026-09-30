@@ -7,7 +7,7 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 name=${1:-span-paint}
 shift || true
-out=$repo/target/vng/$name
+out=${VNG_OUT:-$repo/target/vng}/$name
 rounds=${SPAN_ROUNDS:-10}
 rm -rf "$out"
 "$repo/tools/vng-shot.sh" --outputs 2 --dump none --name "$name" --settle 0 --timeout 900 \

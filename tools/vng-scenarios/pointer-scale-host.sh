@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Host half of pointer-scale.sh: per phase, moves the guest's PS/2 mouse by a
 # fixed relative delta through the QEMU monitor.
-#   tools/vng-scenarios/pointer-scale-host.sh yserver|xorg
+#   tools/vng-scenarios/pointer-scale-host.sh [name] [vng-shot args...]   # e.g. --server xorg
 set -euo pipefail
-server=${1:?usage: pointer-scale-host.sh yserver|xorg}
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-name=pointer-scale-$server
-out=$repo/target/vng/$name
+name=${1:-pointer-scale}
+shift || true
+out=${VNG_OUT:-$repo/target/vng}/$name
 rm -rf "$out"
-"$repo/tools/vng-shot.sh" --server "$server" --dump none --hold 20 --name "$name" \
+"$repo/tools/vng-shot.sh" --dump none --name "$name" "$@" \
     --scenario "$repo/tools/vng-scenarios/pointer-scale.sh" &
 shot=$!
 mon=$out/monitor.sock

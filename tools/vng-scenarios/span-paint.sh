@@ -38,3 +38,4 @@ for r in range(int(os.environ.get("SPAN_ROUNDS", "10"))):
         time.sleep(0.2)
 open("ROUNDS-DONE", "w").close()
 PY
+if [ -e ROUNDS-DONE ]; then echo pass > RESULT; else echo "fail: span client stopped early (span.log)" > RESULT; fi

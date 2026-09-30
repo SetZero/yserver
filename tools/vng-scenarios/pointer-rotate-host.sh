@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Host half of pointer-rotate.sh: per phase, moves the guest's PS/2 mouse by a
 # fixed relative delta through the QEMU monitor.
-#   tools/vng-scenarios/pointer-rotate-host.sh yserver|xorg
+#   tools/vng-scenarios/pointer-rotate-host.sh [name] [vng-shot args...]   # e.g. --server xorg
 set -euo pipefail
-server=${1:?usage: pointer-rotate-host.sh yserver|xorg}
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-name=pointer-rotate-$server
-out=$repo/target/vng/$name
+name=${1:-pointer-rotate}
+shift || true
+out=${VNG_OUT:-$repo/target/vng}/$name
 rm -rf "$out"
-"$repo/tools/vng-shot.sh" --server "$server" --dump none --hold 30 --name "$name" \
+"$repo/tools/vng-shot.sh" --dump none --name "$name" "$@" \
     --scenario "$repo/tools/vng-scenarios/pointer-rotate.sh" &
 shot=$!
 mon=$out/monitor.sock

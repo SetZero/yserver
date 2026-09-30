@@ -8,7 +8,7 @@
 #   tools/vng-shot.sh --server xorg --dump none --name xtest-super-xorg \
 #       --scenario tools/vng-scenarios/xtest-super-stuck.sh
 set -u
-src=/home/jos/Projects/yserver/tools/vng-scenarios/xtest-super-probe.c
+src=${YSERVER_REPO:?}/tools/vng-scenarios/xtest-super-probe.c
 cc -O1 -o probe "$src" -lX11 > cc.log 2>&1 || cat cc.log >&2
 if [ "${YS_NO_WM:-0}" != 1 ]; then
     awesome -c /etc/xdg/awesome/rc.lua > awesome.log 2>&1 &

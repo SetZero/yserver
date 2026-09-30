@@ -1,0 +1,39 @@
+==> crop.log <==
+outputs: Virtual-1 Virtual-2
+Screen 0: minimum 320 x 200, current 2304 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (normal left inverted right x axis y axis) <mm>
+Virtual-2 connected 1024x768+1280+0 (normal left inverted right x axis y axis) <mm>
+=== scale Virtual-2 2x2
+Screen 0: minimum 320 x 200, current 3328 x 1536, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (normal left inverted right x axis y axis) <mm>
+Virtual-2 connected 2048x1536+1280+0 (normal left inverted right x axis y axis) <mm>
+CRTCs after the scale
+  screen 3328 x 1536
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode>
+  crtc <crtc> pos 1280 0 size 2048 1536 mode <mode>
+=== SetScreenSize probes from 3328 x 1536
+  3328x1536: applied (screen 3328x1536)
+  3327x1536: applied (screen 3327x1536)
+  2305x1536: applied (screen 2305x1536)
+  2304x1536: applied (screen 2304x1536)
+  2303x1536: rejected (screen 3328x1536)
+  3328x801: applied (screen 3328x801)
+  3328x800: applied (screen 3328x800)
+  3328x799: rejected (screen 3328x1536)
+  2304x800: applied (screen 2304x800)
+  2304x799: rejected (screen 3328x1536)
+=== control: Virtual-2 back to 1x1 (identity), right of Virtual-1
+Screen 0: minimum 320 x 200, current 2304 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (normal left inverted right x axis y axis) <mm>
+Virtual-2 connected 1024x768+1280+0 (normal left inverted right x axis y axis) <mm>
+=== SetScreenSize probes from 2304 x 800
+  2304x800: applied (screen 2304x800)
+  2303x800: rejected (screen 2304x800)
+  2305x800: applied (screen 2305x800)
+  2304x800: applied (screen 2304x800)
+  2303x800: rejected (screen 2304x800)
+  2304x801: applied (screen 2304x801)
+  2304x800: applied (screen 2304x800)
+  2304x799: rejected (screen 2304x800)
+  2304x800: applied (screen 2304x800)
+  2304x799: rejected (screen 2304x800)

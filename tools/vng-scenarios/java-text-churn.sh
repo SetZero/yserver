@@ -17,7 +17,7 @@ set -u
 : "${YS_XRENDER:=true}"
 : "${YS_CHURN_SECS:=20}"
 src=$(dirname "$0")/JavaTextChurn.java
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/vng-scenarios/JavaTextChurn.java
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/vng-scenarios/JavaTextChurn.java
 javac -d . "$src" > javac.log 2>&1 || cat javac.log >&2
 
 # The JVM sometimes dies with SIGILL in C1-compiled code in this guest

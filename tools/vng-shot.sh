@@ -10,14 +10,21 @@
 #   tools/vng-shot.sh --dump drawables       # per-drawable storage too
 #   tools/vng-shot.sh --server xorg --dump none    # the Xorg baseline
 #   tools/vng-shot.sh --outputs 2                 # dual-head guest
+#   tools/vng-shot.sh --gpu none                  # 2D virtio-gpu + lavapipe, no host GPU
 #   CPUS=8 tools/vng-shot.sh                      # wider guest (default 4)
+#   LVP_ICD=/path/lvp_icd.json tools/vng-shot.sh --gpu none   # other lavapipe ICD
+#   VNG_OUT=target/elsewhere tools/vng-shot.sh    # artifacts in $VNG_OUT/<name>/
+#   tools/vng-shot.sh --root-hook hook.sh         # sourced as guest root once :7 listens
 #
-# The guest boots the host's rootfs read-write (vng --rw), so the artifact
-# directory is the same path inside and out and the handshake is plain
-# files: the guest touches READY when the scenario has settled, the host
-# presses Ctrl+Alt+Enter through the emulated PS/2 keyboard (a real evdev
-# device to the guest, so the dump travels yserver's actual input path),
-# then touches GO to release the guest.
+# The host root is read-only in the guest behind discarded overlays; only the
+# artifact directory is shared writable, at the same path inside and out, so
+# the handshake is plain files: the guest touches READY when the scenario has
+# settled, the host presses Ctrl+Alt+Enter through the emulated PS/2 keyboard
+# (a real evdev device to the guest, so the dump travels yserver's actual
+# input path), then touches GO to release the guest. The server runs as guest
+# root; the scenario runs as a throwaway user `ysuite` with a tmpfs home.
+# A guest that did not run under KVM fails the run. Before stopping the server
+# the guest records SERVER-ALIVE, or SERVER-DEAD with its exit status.
 #
 # QEMU's own `screendump` does NOT work here: `-display egl-headless` has
 # no surface, so it answers "Error: no surface". yserver's dump is the
@@ -28,8 +35,10 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 kernel=${KERNEL:-/boot/vmlinuz-linux-zen}
 cpus=${CPUS:-4}
+gpu=${GPU:-venus}
 name=shot
 scenario=
+root_hook=
 log=info
 settle=5
 hold=0
@@ -49,6 +58,7 @@ while [ $# -gt 0 ]; do
     case $1 in
         --name) name=$2; shift 2;;
         --scenario) scenario=$2; shift 2;;
+        --root-hook) root_hook=$2; shift 2;;
         --log) log=$2; shift 2;;
         --settle) settle=$2; shift 2;;
         --hold) hold=$2; shift 2;;
@@ -58,6 +68,7 @@ while [ $# -gt 0 ]; do
         --server) server=$2; shift 2;;
         --outputs) outputs=$2; shift 2;;
         --env) extra_env+=("$2"); shift 2;;
+        --gpu) gpu=$2; shift 2;;
         -h|--help) usage 0;;
         *) echo "vng-shot: unknown argument $1" >&2; usage 1;;
     esac
@@ -65,13 +76,25 @@ done
 
 command -v vng >/dev/null || { echo "vng-shot: virtme-ng (vng) not on PATH" >&2; exit 1; }
 [ -e "$kernel" ] || { echo "vng-shot: kernel $kernel not found (set KERNEL=)" >&2; exit 1; }
-# Without vulkan-virtio the guest picks RADV and fails amdgpu init.
-[ -e /usr/share/vulkan/icd.d/virtio_icd.json ] || {
-    echo "vng-shot: /usr/share/vulkan/icd.d/virtio_icd.json missing (pacman -S vulkan-virtio)" >&2
-    exit 1; }
+case $gpu in
+    # Without vulkan-virtio the guest picks RADV and fails amdgpu init.
+    venus) icd=/usr/share/vulkan/icd.d/virtio_icd.json; icd_pkg=vulkan-virtio;;
+    none)
+        icd=/usr/share/vulkan/icd.d/lvp_icd.json
+        [ -e "$icd" ] || icd=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        icd=${LVP_ICD:-$icd}; icd_pkg="vulkan-swrast or mesa-vulkan-drivers, or set LVP_ICD";;
+    *) echo "vng-shot: --gpu must be venus or none" >&2; exit 1;;
+esac
+[ -e "$icd" ] || { echo "vng-shot: $icd missing (pacman -S $icd_pkg)" >&2; exit 1; }
+[ "$gpu" = venus ] || [ -w /dev/udmabuf ] || {
+    echo "vng-shot: --gpu none needs a writable /dev/udmabuf" >&2; exit 1; }
 if [ -n "$scenario" ]; then
     [ -r "$scenario" ] || { echo "vng-shot: scenario $scenario not readable" >&2; exit 1; }
     scenario=$(cd -- "$(dirname -- "$scenario")" && pwd)/$(basename -- "$scenario")
+fi
+if [ -n "$root_hook" ]; then
+    [ -r "$root_hook" ] || { echo "vng-shot: root hook $root_hook not readable" >&2; exit 1; }
+    root_hook=$(cd -- "$(dirname -- "$root_hook")" && pwd)/$(basename -- "$root_hook")
 fi
 
 case $server in
@@ -88,7 +111,8 @@ if [ "$server" = xorg ]; then
     # non-composited X server the root window IS the framebuffer).
     dump=none
     listen_tries=600
-    xorg_bin=/usr/lib/Xorg
+    xorg_bin=/usr/lib/Xorg                                  # Arch
+    [ -x "$xorg_bin" ] || xorg_bin=/usr/lib/xorg/Xorg       # Debian/Ubuntu
     [ -x "$xorg_bin" ] || xorg_bin=$(command -v Xorg) || {
         echo "vng-shot: no Xorg on PATH" >&2; exit 1; }
 elif [ -n "$binary" ]; then
@@ -104,10 +128,16 @@ fi
 
 listen_tries=${listen_tries:-150}
 
-out=$repo/target/vng/$name
+out_root=${VNG_OUT:-$repo/target/vng}
+mkdir -p "$out_root"
+out=$(cd -- "$out_root" && pwd)/$name
 rm -rf "$out"
 mkdir -p "$out"
-mon=$out/monitor.sock
+# sun_path holds 107 bytes: the socket lives in a short directory, linked
+# from the artifacts as monitor.sock.
+mon_dir=$(mktemp -d "${TMPDIR:-/tmp}/vng-mon.XXXXXX")
+mon=$mon_dir/monitor.sock
+ln -s "$mon" "$out/monitor.sock"
 
 if [ "$server" = xorg ]; then
     # AccelMethod none: the shadow-fb path. Nothing here depends on glamor,
@@ -124,30 +154,75 @@ EndSection
 CONF
 fi
 
-# The guest runs exactly one command, so materialise the guest side as a
-# script next to its own artifacts. `env` cannot carry the handshake, and a
-# here-doc through `vng --` would be re-split by the guest shell.
+# The guest runs exactly one command, so materialise the guest side as
+# scripts next to their own artifacts. `env` cannot carry the handshake, and a
+# here-doc through `vng --` would be re-split by the guest shell. guest.sh runs
+# as guest root (DRM master, input); client.sh runs the scenario as ysuite.
 guest=$out/guest.sh
+client=$out/client.sh
 {
     echo '#!/bin/sh'
     echo 'set -eu'
     echo "cd '$out'"
-    echo 'export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json'
-    echo "export RUST_LOG='$log'"
-    echo 'export RUST_BACKTRACE=1'
-    # Xorg compiles its keymap into XKM_OUTPUT_DIR (/var/lib/xkb); without a
-    # writable one it dies with "Failed to activate virtual core keyboard: 2".
-    # An --overlay-rwdir gives the guest a writable /var/lib (see below).
-    # XDG_RUNTIME_DIR is Xorg's documented fallback and wezterm wants one too.
-    echo "export XDG_RUNTIME_DIR='$out'"
+    echo "export VK_DRIVER_FILES=$icd"
+    echo "export LANG='${LANG:-C.UTF-8}'"
+    echo "export HOME=/run/ysuite USER=ysuite LOGNAME=ysuite SHELL=/bin/sh"
+    echo 'export XDG_CONFIG_HOME=$HOME/.config XDG_DATA_HOME=$HOME/.local/share'
+    echo 'export XDG_CACHE_HOME=$HOME/.cache XDG_STATE_HOME=$HOME/.local/state'
+    echo 'export XDG_RUNTIME_DIR=/run/ysuite-runtime DISPLAY=:7'
+    echo "export YSERVER_REPO='$repo'"
     for kv in ${extra_env+"${extra_env[@]}"}; do
         echo "export ${kv%%=*}='${kv#*=}'"
     done
-    # The guest shares the host's /tmp/.X11-unix. A guest killed mid-run
-    # leaves X7 and its lock behind, so the listen wait below would pass on
-    # a dead socket, and the next server trips over it. The guest runs as
-    # root, so it can clear what the host user can't.
+    if [ -n "$scenario" ]; then
+        echo ". '$scenario'"
+    else
+        echo 'xterm -geometry 60x20+80+60 > xterm.log 2>&1 &'
+    fi
+    echo "sleep $settle"
+    echo 'touch READY'
+    # Host captures now; GO releases us. Bounded so a dead host cannot
+    # strand the VM holding DRM master.
+    echo 'i=0'
+    echo 'while [ ! -e GO ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.5; done'
+} > "$client"
+{
+    echo '#!/bin/sh'
+    echo 'set -eu'
+    echo "cd '$out'"
+    # virtme-ng asks for accel=kvm:tcg, and the TCG fallback is silent.
+    echo 'dmesg | grep -q "Hypervisor detected: KVM" || {'
+    echo '    echo "vng-shot: guest is not running under KVM" > NOT-KVM; exit 1; }'
+    # ysuite takes the uid that owns the share: 9p checks modes guest-side
+    # against the host owner, so any other uid could not chmod its own files
+    # (cc's output would not be executable). /etc and /run are guest-only
+    # (overlay, tmpfs), so the host user's entry is only hidden in the guest.
+    echo 'uid=$(stat -c %u .) gid=$(stat -c %g .)'
+    echo '[ "$uid" != 0 ] || { uid=4242 gid=4242; chown $uid:$gid .; }'
+    echo 'sed -i "/^[^:]*:[^:]*:$uid:/d" /etc/passwd; sed -i "/^[^:]*:[^:]*:$gid:/d" /etc/group'
+    echo 'echo "ysuite:x:$uid:$gid:vng suite:/run/ysuite:/bin/sh" >> /etc/passwd'
+    echo 'echo "ysuite:x:$gid:" >> /etc/group'
+    echo 'for d in /run/ysuite /run/ysuite/.config /run/ysuite/.cache /run/ysuite/.local \'
+    echo '    /run/ysuite/.local/share /run/ysuite/.local/state /run/ysuite-runtime; do'
+    echo '    install -d -m 0700 -o $uid -g $gid "$d"'
+    echo 'done'
+    echo "export VK_DRIVER_FILES=$icd"
+    # yserver refuses KMS scanout off a CPU Vulkan device unless told.
+    if [ "$gpu" = none ]; then echo 'export YSERVER_ALLOW_SOFTWARE_VULKAN=1'; fi
+    echo "export RUST_LOG='$log'"
+    echo 'export RUST_BACKTRACE=1'
+    # XDG_RUNTIME_DIR is Xorg's documented fallback; /var/lib/xkb (Xorg's
+    # XKM_OUTPUT_DIR) is writable through vng's /var overlay.
+    echo 'install -d -m 0700 /run/user/0'
+    echo 'export XDG_RUNTIME_DIR=/run/user/0'
+    for kv in ${extra_env+"${extra_env[@]}"}; do
+        echo "export ${kv%%=*}='${kv#*=}'"
+    done
+    # The guest /tmp overlays the host's, so a host :7 would show through.
     echo 'rm -f /tmp/.X11-unix/X7 /tmp/.X7-lock'
+    # Without vmport the PS/2 mouse probes as ImExPS/2 ~1.5 s into boot.
+    echo 'i=0'
+    echo 'while ! grep -q "Mouse" /proc/bus/input/devices && [ $i -lt 50 ]; do i=$((i+1)); sleep 0.1; done'
     if [ "$server" = xorg ]; then
         # /usr/bin/Xorg is a shim onto the setuid Xorg.wrap, which drops root
         # when the caller is not sitting on a console — and then the real
@@ -165,32 +240,26 @@ guest=$out/guest.sh
     # Xorg on a software stack needs far longer than yserver to come up.
     echo "while [ ! -S /tmp/.X11-unix/X7 ] && [ \$i -lt $listen_tries ]; do i=\$((i+1)); sleep 0.2; done"
     echo '[ -S /tmp/.X11-unix/X7 ] || { echo "server never listened on :7" >&2; touch FAILED; }'
-    echo 'export DISPLAY=:7'
-    if [ -n "$scenario" ]; then
-        echo ". '$scenario'"
-    else
-        echo 'xterm -geometry 60x20+80+60 > xterm.log 2>&1 &'
-    fi
-    echo "sleep $settle"
-    echo 'touch READY'
-    # Host captures now; GO releases us. Bounded so a dead host cannot
-    # strand the VM holding DRM master.
-    echo 'i=0'
-    echo 'while [ ! -e GO ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.5; done'
-    echo 'kill -TERM $server 2>/dev/null || true'
-    echo 'wait $server 2>/dev/null || true'
-    echo 'rm -f /tmp/.X11-unix/X7 /tmp/.X7-lock'
+    if [ -n "$root_hook" ]; then echo ". '$root_hook'"; fi
+    echo 'set -- sh ./client.sh'
+    echo 'command -v dbus-run-session > /dev/null && set -- dbus-run-session -- "$@"'
+    echo "setpriv --reuid=\$uid --regid=\$gid --clear-groups env -i PATH=\"\$PATH\" \"\$@\" \\"
+    echo '    || echo "vng-shot: client.sh exited $?" >&2'
+    echo 'if kill -0 $server 2>/dev/null; then'
+    echo '    touch SERVER-ALIVE'
+    echo '    kill -TERM $server 2>/dev/null || true'
+    # Xorg can hang in its shutdown; the results are already written.
+    echo '    ( sleep 15; kill -KILL $server 2>/dev/null ) & reaper=$!'
+    echo '    wait $server 2>/dev/null || true'
+    echo '    kill $reaper 2>/dev/null || true'
+    echo 'else'
+    echo '    st=0; wait $server 2>/dev/null || st=$?'
+    echo '    echo "exit status $st" > SERVER-DEAD'
+    echo 'fi'
+    echo 'dmesg > guest-dmesg.log'
     echo 'touch DONE'
 } > "$guest"
 chmod +x "$guest"
-
-# Xorg compiles its keymap to XKM_OUTPUT_DIR and reads it straight back, and
-# that path is /var/lib/xkb — the ONE directory outside the repo it needs to
-# write. It is read-only here, and the guest cannot mount anything itself (no
-# privileges in vng's namespace), so hand it an overlay: writable in the guest,
-# host filesystem untouched, nothing persisted between runs.
-overlay=()
-[ "$server" = xorg ] && overlay=(--overlay-rwdir /var/lib/xkb)
 
 # A second head needs BOTH halves: `max_outputs` on the device, and
 # `video=Virtual-2:...e` on the kernel cmdline. The `e` suffix forces the
@@ -205,18 +274,27 @@ if [ "$outputs" -gt 1 ]; then
     done
 fi
 
-qemu_opts="-display egl-headless"
-qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G,max_outputs=$outputs"
-qemu_opts="$qemu_opts -monitor unix:$mon,server=on,wait=off"
+if [ "$gpu" = none ]; then
+    # 2D virtio-gpu, nothing from the host GPU. Without blob=on the guest
+    # cannot PRIME-import lavapipe's dma-bufs (ENODEV); QEMU backs blobs
+    # with the host's /dev/udmabuf.
+    qemu_opts="-device virtio-gpu-pci,blob=on,max_outputs=$outputs"
+else
+    qemu_opts="-display egl-headless"
+    qemu_opts="$qemu_opts -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G,max_hostmem=4G,max_outputs=$outputs"
+fi
+# vmport=off: the VMware VMMouse ignores relative mouse_move; plain PS/2 doesn't.
+qemu_opts="$qemu_opts -machine vmport=off -monitor unix:$mon,server=on,wait=off"
 
 echo "vng-shot: booting guest ($name) with ${binary:-Xorg}; artifacts in $out"
-timeout "$timeout_s" vng -r "$kernel" --cpus "$cpus" --disable-microvm --rw \
-    ${overlay+"${overlay[@]}"} ${appends+"${appends[@]}"} \
+timeout "$timeout_s" vng -r "$kernel" --cpus "$cpus" --disable-microvm --rwdir "$out" \
+    ${appends+"${appends[@]}"} \
     --qemu-opts="$qemu_opts" -- "$guest" > "$out/vng.log" 2>&1 < /dev/null &
 vm=$!
 
 release() { touch "$out/GO" 2>/dev/null || true; }
-trap release EXIT
+drop_monitor() { rm -rf "$mon_dir"; rm -f "$out/monitor.sock"; }
+trap 'release; drop_monitor' EXIT
 
 waited=0
 while [ ! -e "$out/READY" ]; do
@@ -225,6 +303,12 @@ while [ ! -e "$out/READY" ]; do
     waited=$((waited + 1))
     [ "$waited" -lt $((timeout_s * 2)) ] || { echo "vng-shot: timed out waiting for READY" >&2; break; }
 done
+
+if [ -e "$out/NOT-KVM" ]; then
+    wait "$vm" 2>/dev/null || true
+    cat "$out/NOT-KVM" >&2
+    exit 1
+fi
 
 if [ -e "$out/READY" ]; then
     case $dump in
@@ -250,6 +334,7 @@ fi
 
 release
 wait "$vm" 2>/dev/null || true
+drop_monitor
 trap - EXIT
 
 echo "vng-shot: artifacts:"

@@ -52,7 +52,7 @@ xdotool getdisplaygeometry > geometry.txt 2>&1 || true
 # setter does: background pixmap over the whole root, plus a clear.
 if [ "${YS_REPAINT_ROOT:-0}" = 1 ]; then
     src=$(dirname "$0")/root-wallpaper-client.c
-    [ -r "$src" ] || src=/home/jos/Projects/yserver/tools/vng-scenarios/root-wallpaper-client.c
+    [ -r "$src" ] || src=${YSERVER_REPO:?}/tools/vng-scenarios/root-wallpaper-client.c
     cc -O1 -o root-wallpaper-client "$src" -lX11 > cc-root.log 2>&1 \
         && { ./root-wallpaper-client > repaint.log 2>&1 & sleep 4; } \
         || cat cc-root.log >&2

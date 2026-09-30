@@ -21,7 +21,7 @@ set -u
 # kaaduu's probe, compiled to a gitignored directory (gist
 # 0d4ee5b733a623c64c37e948263fcc1a). The guest shares the host rootfs, so the
 # host's build is right there.
-: "${YS_PROBE_CP:=/home/jos/Projects/yserver/target/diag137}"
+: "${YS_PROBE_CP:=${YSERVER_REPO:?}/target/diag137}"
 # YS_JAVA_AA picks the text antialiasing, which selects the GLYPH format and
 # is a second, independent axis from the source-picture kind that #137 is
 # about. `gasp`/`on` give grayscale AA and Java uploads A8 glyphs; `lcd` gives

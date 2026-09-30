@@ -7,7 +7,7 @@
 # (`--server xorg`), so Xorg supplies the expected pixels.
 set -u
 src=$(dirname "$0")/render-root-source-client.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/vng-scenarios/render-root-source-client.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/vng-scenarios/render-root-source-client.c
 cc -O1 -o render-root-source-client "$src" -lX11 -lXrender > cc.log 2>&1 || {
     echo "render-root-source: compile failed" >&2; cat cc.log >&2; }
 if [ -x ./render-root-source-client ]; then

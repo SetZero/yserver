@@ -3,20 +3,19 @@
 # on yserver or Xorg, waits for the in-guest raw-key listener, then presses
 # real keys on the guest's emulated PS/2 keyboard through the QEMU monitor.
 #
-#   KERNEL=/usr/lib/modules/$(uname -r)/vmlinuz \
-#       tools/vng-scenarios/xi2-raw-keys-host.sh yserver|xorg
+#   tools/vng-scenarios/xi2-raw-keys-host.sh [name] [vng-shot args...]   # e.g. --server xorg
 #
-# Artifacts: target/vng/xi2-raw-keys-<server>/{xtest,physical,devices}.log
+# Artifacts: target/vng/<name>/{xtest,physical,devices}.log
 set -euo pipefail
-server=${1:?usage: xi2-raw-keys-host.sh yserver|xorg}
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-name=xi2-raw-keys-$server
-out=$repo/target/vng/$name
+name=${1:-xi2-raw-keys}
+shift || true
+out=${VNG_OUT:-$repo/target/vng}/$name
 
 # vng-shot recreates $out, but only once it gets going: a previous run's
 # LISTENING would otherwise send the keys before this guest is listening.
 rm -rf "$out"
-"$repo/tools/vng-shot.sh" --server "$server" --dump none --hold 30 --name "$name" \
+"$repo/tools/vng-shot.sh" --dump none --hold 30 --name "$name" "$@" \
     --scenario "$repo/tools/vng-scenarios/xi2-raw-keys.sh" &
 shot=$!
 

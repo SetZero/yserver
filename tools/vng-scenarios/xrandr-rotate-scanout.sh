@@ -29,11 +29,12 @@ root.clear_area(0, 0, 0, 0)
 d.sync()
 PY
 out=$(xrandr | awk '/ connected/{print $1; exit}')
+failed=
 shot() {
     tag=$1; shift
-    xrandr --output "$out" "$@" >> xrandr.log 2>&1
+    xrandr --output "$out" "$@" >> xrandr.log 2>&1 || failed="$failed xrandr-$tag"
     sleep 2
-    import -window root "root-$tag.png" > /dev/null 2>&1 || true
+    import -window root "root-$tag.png" > /dev/null 2>&1 || failed="$failed import-$tag"
     touch "READY-$tag"
     for _ in $(seq 1 120); do [ -e "DONE-$tag" ] && break; sleep 0.5; done
 }
@@ -46,3 +47,6 @@ shot reflect-y --reflect y
 shot left-scale2 --reflect normal --rotate left --scale 2x2 --filter nearest
 xrandr --output "$out" --rotate normal --scale 1x1 > /dev/null 2>&1 || true
 kill $hold 2>/dev/null || true
+if [ -z "$out" ]; then echo "fail: no connected output" > RESULT
+elif [ -n "$failed" ]; then echo "fail:$failed" > RESULT
+else echo pass > RESULT; fi

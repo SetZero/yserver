@@ -20,8 +20,14 @@
 # probe.log is the load-bearing artifact (no ids or timestamps, so the Xorg
 # and yserver runs diff directly); roundtrip.diff and edit.diff are the dump
 # diffs.
+# shellcheck shell=sh
+# golden: probe.log
+# drop: ^listen:after-mapnotify  -- Xorg notifies once per keyboard device (VCK, XTEST, PS/2 ...), yserver has one; these reads race the rest of the change
+# drop: ^listen: Xkb(Map|NewKeyboard)Notify device= -- the per-device notifies, as above
+# mask: ^\d+(,\d+)?([acd])\d+(,\d+)?$ => <hunk \2> -- dump line numbers: yserver's dump has no geometry and no <I248> (docs/status.md #171 4e: geometry name only)
 set -u
-src=/home/jos/Projects/yserver/tools/vng-scenarios/xmodmap-caps-control-probe.c
+set +e
+src=${YSERVER_REPO:?}/tools/vng-scenarios/xmodmap-caps-control-probe.c
 cc -O1 -o probe "$src" -lX11 -lxcb -lxkbcommon -lxkbcommon-x11 > cc.log 2>&1 \
     || cat cc.log >&2
 
@@ -108,3 +114,6 @@ wait "$listener" "$keeper" 2>/dev/null || true
     cat reread.diff
 } >> probe.log
 cat probe.log
+if [ ! -x probe ]; then echo "fail: probe did not build (cc.log)" > RESULT
+elif ! grep -q '^listen: done' probe.log; then echo "fail: the listener did not finish (probe.log)" > RESULT
+else echo pass > RESULT; fi

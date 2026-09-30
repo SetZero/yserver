@@ -15,9 +15,7 @@
 #               covers auto-repeat). Needs tools/vng-scenarios/xi2-raw-keys-host.sh,
 #               which runs vng-shot and presses the keys:
 #
-#   tools/vng-scenarios/xi2-raw-keys-host.sh yserver
-#   tools/vng-scenarios/xi2-raw-keys-host.sh xorg
-#   diff target/vng/xi2-raw-keys-xorg/xtest.log target/vng/xi2-raw-keys-yserver/xtest.log
+#   tools/vng-scenarios/xi2-raw-keys-host.sh [name] [vng-shot args...]
 #
 # Expected differences outside the raw events (2026-09-26 run): xtest.log —
 # XIGrabDevice(keyboard) sends the grabber XI_FocusIn/Out it never selected,
@@ -27,8 +25,23 @@
 # device, 7 here; yserver: slave 5) and auto-repeat (Xorg: XI2 KeyPress with
 # XIKeyRepeat and no release; yserver: release+press pairs). Raw events agree:
 # none for repeats on either server.
+# shellcheck shell=sh
+# golden: xtest.log physical-by-client.log
+# mask: \bdt=-?\d+ => dt=<t> -- inter-event time
+# mask: ^(\S+   wire \S+ 16000000 0[23]000300 \S+ \S+) \S+ \S+ \S+ (\S+ \S+) \S+ \S+ => \1 <root> <event> <child> \2 <ex> <ey> -- window ids are server-assigned; event_x/y differ (known, see above)
+# drop: ^\S+ \?\s+dev=3 src=0 detail=\d+ event=\w+ flags=0x0 len=11$ -- known (see above): XIGrabDevice(keyboard) sends XI_FocusIn/Out the grabber never selected
+# drop: ^\S+   wire \S+ 0b000000 0[9a]000300 -- the same focus events' wire bytes
+# mask: ^(v20then22 xi-version asked=2.2) got=2\.[02]$ => \1 got=<known> -- known (see above): XIQueryVersion answers a changed request with the new version
+# mask: ^(v22then20 xi-version asked=2.0) (error=2|got=2\.0)$ => \1 <known> -- known (see above): the same XIQueryVersion divergence
+# drop: core-event type=34$ -- MappingNotify: Xorg switches the master's classes between slaves, yserver has one slave
+# mask: \b(dev|src)=[57]\b => \1=<kbd> -- known (see above): the physical keyboard is its own slave 7 on Xorg, slave 5 on yserver
+# mask: ^(\S+   wire \S+ 02000000 0[de]000)[357](00 \S+ \S+) 0[57]000200 => \1<d>\2 <kbd>000200 -- the same slave ids in the raw events' wire bytes
+# drop: ^\S+ Key(Press|Release)\s+dev=\S+ src=\S+ detail=56 -- known (see above): the held b auto-repeats as XIKeyRepeat presses on Xorg, release+press pairs on yserver
+# drop: ^\S+   wire \S+ 16000000 0[23]000300 \S+ 38000000 -- the same repeats' wire bytes (detail 56)
+# mask: (<ex> <ey> 08000200 )0[57]000000 => \1<kbd>000000 -- the slave id as sourceid in the device events' wire bytes
 set -u
-src=/home/jos/Projects/yserver/tools/vng-scenarios/xi2-raw-keys-probe.c
+set +e
+src=${YSERVER_REPO:?}/tools/vng-scenarios/xi2-raw-keys-probe.c
 cc -O1 -o probe "$src" -lxcb -lxcb-xinput -lxcb-xtest > cc.log 2>&1 || cat cc.log >&2
 
 ./probe list > devices.log 2>&1 || true
@@ -38,6 +51,7 @@ run() {
     # MappingNotify (core event 34) is Xorg switching the master keyboard's
     # classes to the XTEST slave; yserver has one slave, so none. Not part of
     # the raw-event comparison.
+    # shellcheck disable=SC2086
     ./probe $M "$@" 2>&1 | grep -v 'core-event type=34' | sed -E 's/ dt=-?[0-9]+//'
     echo "======"
 }
@@ -65,6 +79,14 @@ run() {
 cat xtest.log
 
 # Physical phase: listen while the host presses keys during the hold.
-./probe mon:mk:2:1k mon:ak:2:0 mon:m20:0:1 listen:45 > physical.log 2>&1 &
+# Ends before the host's 30 s hold does, so RESULT is written in time.
+(
+    ./probe mon:mk:2:1k mon:ak:2:0 mon:m20:0:1 listen:25 > physical.log 2>&1; rc=$?
+    # The three listeners interleave by arrival: group them, each in order.
+    sort -s -k1,1 physical.log > physical-by-client.log
+    if [ ! -x probe ]; then echo "fail: probe did not build (cc.log)"
+    elif [ "$rc" -ne 0 ]; then echo "fail: the raw-key listener exited $rc (physical.log)"
+    else echo pass; fi > RESULT
+) &
 sleep 2
 touch LISTENING

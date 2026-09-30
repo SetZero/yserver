@@ -28,7 +28,7 @@
 # probe's own stdout is the artifact.
 set -u
 src=$(dirname "$0")/../resize-expose-probe.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/resize-expose-probe.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/resize-expose-probe.c
 
 cc -O1 -o resize-expose-probe "$src" -lX11 > cc.log 2>&1 || {
     echo "resize-expose: compile failed" >&2
