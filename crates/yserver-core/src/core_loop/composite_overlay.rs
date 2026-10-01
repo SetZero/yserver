@@ -105,6 +105,8 @@ pub(crate) fn materialize_overlay(
     // the top. Must run AFTER materialize_cow_resource — the backend COW
     // hook no longer pushes to top_level_order itself.
     backend.sync_top_level_order(state);
+    // The MapWindow ends in WindowsRestructured (`dix/window.c:2695`).
+    backend.windows_restructured(state);
     Ok(())
 }
 
@@ -124,6 +126,7 @@ pub(crate) fn teardown_overlay(
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
 ) -> std::io::Result<()> {
+    let cow_host_xid = backend.cow_host_xid();
     if !backend.release_overlay_window(origin)? {
         // Backend never materialized a COW (v1, ynest, trait default):
         // nothing to mirror down either, because nothing ever reached
@@ -154,6 +157,10 @@ pub(crate) fn teardown_overlay(
                 );
             });
         }
+        // DeleteWindow's UnmapWindow re-evaluates the pointer while the
+        // overlay still exists (`dix/window.c:2871`).
+        let _ = state.resources.unmap_window(COMPOSITE_OVERLAY_WINDOW);
+        backend.windows_restructured(state);
     }
     for (event_window, mask) in targets {
         let _dropped = emit_window_event_to_state(state, event_window, mask, |buf, seq, o| {
@@ -179,6 +186,10 @@ pub(crate) fn teardown_overlay(
         &[COMPOSITE_OVERLAY_WINDOW],
     );
     state.resources.destroy_cow_resource();
+    // Unregistered only now: the unmap's crossings above still name the COW.
+    if let Some(xid) = cow_host_xid {
+        backend.unregister_host_window(xid);
+    }
     state.destroy_cow_input_shape();
     // The COW is no longer a core root child; reproject so it leaves the
     // backend top-level order.

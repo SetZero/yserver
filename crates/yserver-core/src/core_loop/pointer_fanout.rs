@@ -243,8 +243,10 @@ fn pointer_event_fanout_to_state_inner(
     // Pointer confinement (Xorg CheckPhysLimits): while a confined
     // grab is active, motion outside the confine rectangle is
     // replaced by a warp to the nearest inside point; press/release
-    // coordinates clamp in place.
+    // coordinates clamp in place. A tree-change crossing is no motion:
+    // the request that moved the confine window re-clamps after it.
     if !is_replay
+        && !event.tree_change
         && state.pointer_confine_to.0 != 0
         && let Some(w) = state.resources.window(state.pointer_confine_to)
         && w.map_state == crate::resources::MapState::Viewable
@@ -488,61 +490,65 @@ fn pointer_event_fanout_to_state_inner(
             }
         }
     }
-    let now = std::time::Instant::now();
-    // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
-    #[allow(clippy::cast_possible_truncation)]
-    let prior_global = now
-        .duration_since(state.dpms.last_activity)
-        .as_millis()
-        .min(u128::from(u32::MAX)) as i64;
-    // XI2 master device IDs are always small (2 here); cast u16 → u8 is safe.
-    // Per-device prior: fall back to global if no per-device entry yet.
-    // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
-    // this, the very first input event for a device whose baseline isn't
-    // recorded would compute prior_device=0 and a per-device Negative
-    // alarm (whose wait_value > 0) would not see the `old > wait` half of
-    // its trigger.
-    let prior_device = state
-        .per_device_last_activity
-        .get(&(XI2_MASTER_POINTER_DEVICE_ID as u8))
-        .copied()
-        .map(|t| {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64;
-            v
-        })
-        .unwrap_or(prior_global);
+    // A tree-change crossing is not user input: it neither resets the idle
+    // clocks nor wakes DPMS or the screen saver.
+    if !event.tree_change {
+        let now = std::time::Instant::now();
+        // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
+        #[allow(clippy::cast_possible_truncation)]
+        let prior_global = now
+            .duration_since(state.dpms.last_activity)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as i64;
+        // XI2 master device IDs are always small (2 here); cast u16 → u8 is safe.
+        // Per-device prior: fall back to global if no per-device entry yet.
+        // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
+        // this, the very first input event for a device whose baseline isn't
+        // recorded would compute prior_device=0 and a per-device Negative
+        // alarm (whose wait_value > 0) would not see the `old > wait` half of
+        // its trigger.
+        let prior_device = state
+            .per_device_last_activity
+            .get(&(XI2_MASTER_POINTER_DEVICE_ID as u8))
+            .copied()
+            .map(|t| {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64;
+                v
+            })
+            .unwrap_or(prior_global);
 
-    state.dpms.last_activity = now;
-    state
-        .per_device_last_activity
-        .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
+        state.dpms.last_activity = now;
+        state
+            .per_device_last_activity
+            .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
 
-    // IDLETIME wake: fires Negative-* alarms before the input event itself
-    // reaches clients (predictable ordering).
-    crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
-        state,
-        XI2_MASTER_POINTER_DEVICE_ID as u8,
-        prior_global,
-        prior_device,
-    );
-
-    if state.dpms.enabled && state.dpms.power_level != 0 {
-        crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
-        // DPMS coupling tail already flipped SS Off if it was On.
-    }
-    if matches!(
-        state.screensaver.active,
-        crate::server::ScreenSaverActive::On
-    ) {
-        // Standalone SS activation (DPMS was On already; SS came up
-        // via idle timer or ForceScreenSaver) — input wakes it.
-        crate::core_loop::process_request::apply_screen_saver_transition(
+        // IDLETIME wake: fires Negative-* alarms before the input event itself
+        // reaches clients (predictable ordering).
+        crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
             state,
-            backend,
-            crate::server::ScreenSaverActive::Off,
-            /*forced=*/ false,
+            XI2_MASTER_POINTER_DEVICE_ID as u8,
+            prior_global,
+            prior_device,
         );
+
+        if state.dpms.enabled && state.dpms.power_level != 0 {
+            crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+            // DPMS coupling tail already flipped SS Off if it was On.
+        }
+        if matches!(
+            state.screensaver.active,
+            crate::server::ScreenSaverActive::On
+        ) {
+            // Standalone SS activation (DPMS was On already; SS came up
+            // via idle timer or ForceScreenSaver) — input wakes it.
+            crate::core_loop::process_request::apply_screen_saver_transition(
+                state,
+                backend,
+                crate::server::ScreenSaverActive::Off,
+                /*forced=*/ false,
+            );
+        }
     }
 
     let mut dropped = Vec::new();
@@ -794,6 +800,7 @@ fn pointer_event_fanout_to_state_inner(
         let redirect_to_grab = !owner_events || natural_for_grab_client.is_none();
         if let Some((natural_window, natural_x, natural_y, child)) = natural_for_grab_client {
             if !via_xi2 {
+                let focus = state.crossing_has_focus(natural_window);
                 let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
                     encode_pointer_event(
                         buf,
@@ -807,6 +814,7 @@ fn pointer_event_fanout_to_state_inner(
                         event,
                         natural_x,
                         natural_y,
+                        focus,
                     );
                 });
                 merge_dropped(&mut dropped, extras);
@@ -856,6 +864,7 @@ fn pointer_event_fanout_to_state_inner(
             // (handled_core_via_grab below) — never leaked to the natural
             // target.
             if !via_xi2 && grab_event_mask & mask_bit != 0 {
+                let focus = state.crossing_has_focus(grab_window);
                 let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
                     encode_pointer_event(
                         buf,
@@ -869,6 +878,7 @@ fn pointer_event_fanout_to_state_inner(
                         event,
                         event_x,
                         event_y,
+                        focus,
                     );
                 });
                 merge_dropped(&mut dropped, extras);
@@ -997,6 +1007,7 @@ fn pointer_event_fanout_to_state_inner(
         };
         let mut delivered = false;
         if let Some((natural_window, event_x, event_y, child)) = natural {
+            let focus = state.crossing_has_focus(natural_window);
             let extras = fanout_event_to_clients(state, &[grab.owner], |buf, seq, order| {
                 encode_pointer_event(
                     buf,
@@ -1010,6 +1021,7 @@ fn pointer_event_fanout_to_state_inner(
                     event,
                     event_x,
                     event_y,
+                    focus,
                 );
             });
             merge_dropped(&mut dropped, extras);
@@ -1028,6 +1040,7 @@ fn pointer_event_fanout_to_state_inner(
             let (gx, gy) = state.resources.window_absolute_position(grab.grab_window);
             let event_x = clamp_grab_coord(event.root_x, gx);
             let event_y = clamp_grab_coord(event.root_y, gy);
+            let focus = state.crossing_has_focus(grab.grab_window);
             let extras = fanout_event_to_clients(state, &[grab_target], |buf, seq, order| {
                 encode_pointer_event(
                     buf,
@@ -1041,6 +1054,7 @@ fn pointer_event_fanout_to_state_inner(
                     event,
                     event_x,
                     event_y,
+                    focus,
                 );
             });
             merge_dropped(&mut dropped, extras);
@@ -1118,7 +1132,15 @@ fn pointer_event_fanout_to_state_inner(
         } else {
             (target, target_x, target_y)
         };
-        let (nested_id, event_x, event_y, mut core_targets, propagation_child) =
+        let (nested_id, event_x, event_y, mut core_targets, propagation_child) = if is_crossing {
+            (
+                cross_start,
+                cross_x,
+                cross_y,
+                core_crossing_targets(state, cross_start, mask_bit),
+                ResourceId(0),
+            )
+        } else {
             pointer_propagation_target_by_id(
                 state,
                 cross_start,
@@ -1127,7 +1149,8 @@ fn pointer_event_fanout_to_state_inner(
                 mask_bit,
                 xi2_absorbing_evtype(event.kind),
             )
-            .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)));
+            .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)))
+        };
 
         // XI2 shadows core per client (Xorg behaviour, mirrors
         // `deliver_key_to_window`): a client that receives the XI2
@@ -1196,6 +1219,8 @@ fn pointer_event_fanout_to_state_inner(
             );
         }
 
+        let focus = state.crossing_has_focus(nested_id);
+
         let extras = fanout_event_to_clients(state, &core_targets, |buf, seq, order| {
             encode_pointer_event(
                 buf,
@@ -1209,6 +1234,7 @@ fn pointer_event_fanout_to_state_inner(
                 event,
                 event_x,
                 event_y,
+                focus,
             );
         });
         // Capture the core candidate. The final resolver compares it with
@@ -1352,7 +1378,7 @@ fn pointer_event_fanout_to_state_inner(
         event_x = clamp_grab_coord(event.root_x, ox);
         event_y = clamp_grab_coord(event.root_y, oy);
         (
-            compute_xi2_exact_targets(state, crossing_win, xi2_evtype),
+            xi2_crossing_targets(state, crossing_win, xi2_evtype),
             Vec::new(),
         )
     } else {
@@ -1671,6 +1697,7 @@ fn pointer_event_fanout_to_state_inner(
                     )
                 }
             });
+            let focus = state.crossing_has_focus(ev_win);
             let extras =
                 fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
                     if is_crossing_evt {
@@ -1691,7 +1718,12 @@ fn pointer_event_fanout_to_state_inner(
                             event.state,
                             event.crossing_mode,
                             event.detail,
-                            XI2_SLAVE_POINTER_DEVICE_ID,
+                            if event.tree_change {
+                                XI2_MASTER_POINTER_DEVICE_ID
+                            } else {
+                                XI2_SLAVE_POINTER_DEVICE_ID
+                            },
+                            focus,
                         );
                     } else {
                         if let Some((axis, value)) = scroll_axis_info {
@@ -1889,6 +1921,7 @@ pub fn emit_scroll_stop_to_state(
         child: 0,
         raw_dx: 0,
         raw_dy: 0,
+        tree_change: false,
     };
     let root_hit = resolve_pointer_hit(state, xid_map, &probe);
     let top_level_id = root_hit
@@ -2566,6 +2599,35 @@ fn translate_host_event(
     }
 }
 
+/// Recipients of a core Enter/Leave on `window` — Xorg `CoreEnterLeaveEvent`
+/// (`dix/events.c:4748`). A crossing never propagates. Under a pointer grab
+/// only the grab client gets it: on the grab window through the grab's mask,
+/// and with `owner_events` through its own selection on `window`.
+fn core_crossing_targets(state: &ServerState, window: ResourceId, mask_bit: u32) -> Vec<ClientId> {
+    let Some((grab_window, grab_client, _, _, owner_events, via_xi2, grab_mask)) =
+        active_grab_target(state)
+    else {
+        return crate::core_loop::fanout::subscribers_by_id(state, window, mask_bit);
+    };
+    let mut mask = if window == grab_window && !via_xi2 {
+        grab_mask
+    } else {
+        0
+    };
+    if owner_events {
+        mask |= state
+            .clients
+            .get(&grab_client.0)
+            .and_then(|c| c.event_masks.get(&window).copied())
+            .unwrap_or(0);
+    }
+    if mask & mask_bit == 0 {
+        Vec::new()
+    } else {
+        vec![grab_client]
+    }
+}
+
 fn active_grab_target(
     state: &ServerState,
 ) -> Option<(
@@ -2991,6 +3053,29 @@ fn xi2_form_targets(
         .collect()
 }
 
+/// Recipients of an XI2 Enter/Leave on `window` — Xorg
+/// `DeviceEnterLeaveEvent` (`dix/events.c:4866`): under an XI2 grab only the
+/// grab client, through the grab's mask; otherwise the selections on
+/// `window`, never propagated.
+fn xi2_crossing_targets(state: &ServerState, window: ResourceId, evtype: u16) -> Vec<ClientId> {
+    match state.active_pointer_grab {
+        Some(grab) if grab.via_xi2 => client_target_id(state, grab.owner)
+            .filter(|_| grab.xi2_mask & (1 << evtype) != 0)
+            .into_iter()
+            .collect(),
+        _ => compute_xi2_exact_targets(state, window, evtype),
+    }
+}
+
+/// The clients that selected the master pointer's XI2 `evtype` on `window`.
+pub(crate) fn xi2_master_selectors(
+    state: &ServerState,
+    window: ResourceId,
+    evtype: u16,
+) -> Vec<ClientId> {
+    xi2_form_targets(state, window, Xi2PointerForm::Master, evtype)
+}
+
 fn compute_xi2_exact_targets(
     state: &ServerState,
     window: ResourceId,
@@ -3209,6 +3294,7 @@ fn encode_pointer_event(
     event: HostPointerEvent,
     event_x: i16,
     event_y: i16,
+    focus: bool,
 ) {
     let pointer = x11::PointerEvent {
         sequence: seq,
@@ -3261,6 +3347,7 @@ fn encode_pointer_event(
                 state: event.state,
                 detail: event.detail,
                 mode: event.crossing_mode,
+                focus,
             },
         ),
         PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3279,6 +3366,7 @@ fn encode_pointer_event(
                 state: event.state,
                 detail: event.detail,
                 mode: event.crossing_mode,
+                focus,
             },
         ),
     }
@@ -3439,6 +3527,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         }
     }
 
@@ -3825,6 +3914,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4051,6 +4141,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
 
         // Precondition: A is on top; the press resolves to A.
@@ -4531,6 +4622,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4684,6 +4776,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4818,6 +4911,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4924,6 +5018,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4946,6 +5041,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -5144,6 +5240,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let dropped =
@@ -5283,6 +5380,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -5319,6 +5417,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -5357,6 +5456,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let dropped =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

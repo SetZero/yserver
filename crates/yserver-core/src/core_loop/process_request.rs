@@ -427,7 +427,7 @@ pub fn process_request(
         94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
         // ── window queries / circulation ──
         3 => handle_get_window_attributes(state, client_id, sequence, body),
-        13 => handle_circulate_window(state, client_id, sequence, header, body),
+        13 => handle_circulate_window(state, backend, client_id, sequence, header, body),
         // ── extension extension-protocol arms (standalone, not full
         //    extension dispatchers) ──
         138 => handle_ge_request(state, client_id, sequence, header), // GE
@@ -1741,23 +1741,18 @@ fn collect_destroy_order(
     let Some(w) = table.window(root) else {
         return;
     };
-    for child in w.children.clone() {
+    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
+    for child in w.children.clone().into_iter().rev() {
         collect_destroy_order(table, child, out);
     }
     out.push(root);
 }
 
+/// DestroyNotify only: the destroyed window's UnmapNotify went out before the
+/// teardown, and its inferiors get none (Xorg CrushTree).
 fn fanout_destroy_sequence_to_state(state: &mut ServerState, pending: &PendingDestroy) {
     let window = pending.window;
     let parent = pending.parent;
-    if pending.was_mapped {
-        let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
-        });
-        let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
-        });
-    }
     let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
         x11::encode_destroy_notify_event(buf, seq, order, window, window);
     });
@@ -1952,6 +1947,23 @@ fn destroy_window_subtree(
             on_window,
             on_parent,
         });
+    }
+    // Xorg DeleteWindow unmaps the window first (`dix/window.c:1075`):
+    // UnmapNotify, then WindowsRestructured while the subtree still exists,
+    // so the pointer's Leave reaches the dying windows before any
+    // DestroyNotify. `order` ends with `root`.
+    if let Some(top) = pending.last()
+        && top.was_mapped
+    {
+        let (window, parent) = (top.window, top.parent);
+        let _dropped = fanout_event_to_clients(state, &top.on_window, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped = fanout_event_to_clients(state, &top.on_parent, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
+        });
+        let _ = state.resources.unmap_window(window);
+        backend.windows_restructured(state);
     }
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
     free_pictures_on_destroyed_windows(state, backend, origin, &order);
@@ -6900,6 +6912,9 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg miSetShape re-evaluates the pointer before ShapeNotify
+                // goes out (`mi/miwindow.c:680`); so do the other SHAPE ops.
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -6915,6 +6930,7 @@ fn handle_shape_request(
                 if req.src == 0 {
                     let changed = crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                    backend.windows_restructured(state);
                     if changed {
                         emit_shape_notify(state, window, req.dest_kind);
                     }
@@ -6986,6 +7002,7 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -7027,6 +7044,7 @@ fn handle_shape_request(
                 );
                 let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
@@ -7045,6 +7063,7 @@ fn handle_shape_request(
                 }
                 if translated {
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                    backend.windows_restructured(state);
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
             }
@@ -8109,6 +8128,8 @@ fn handle_xfixes_request(
                     crate::nested::set_shape_rects(state, window, req.dest_kind, source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg SetWindowShapeRegion goes through miSetShape too.
+                backend.windows_restructured(state);
             }
         }
         x11xfixes::SET_PICTURE_CLIP_REGION => {
@@ -18436,6 +18457,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -18456,6 +18479,7 @@ fn handle_xi2_request(
                                 1, // mode = NotifyGrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -18597,6 +18621,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -18617,6 +18643,7 @@ fn handle_xi2_request(
                                 2, // mode = NotifyUngrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -22580,6 +22607,39 @@ fn handle_reparent_window(
     let Some(request) = x11::reparent_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    // Xorg ReparentWindow unmaps a mapped window first (`dix/window.c:2519`):
+    // UnmapNotify, and the pointer leaves it while it is still in the old
+    // place. Its map state is only hidden for that hit-test; the reparent
+    // below keeps the window mapped, and the MapNotify after ReparentNotify
+    // stands for Xorg's MapWindow.
+    let unmapped = if state.resources.check_reparent_window(request).is_ok() {
+        state.resources.window(request.window).and_then(|w| {
+            (w.map_state != MapState::Unmapped).then_some((
+                w.parent,
+                w.map_state,
+                w.override_redirect,
+            ))
+        })
+    } else {
+        None
+    };
+    if let Some((old_parent, map_state, _)) = unmapped {
+        let window = request.window;
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, old_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, old_parent, window, false);
+            });
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = MapState::Unmapped;
+        }
+        backend.windows_restructured(state);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = map_state;
+        }
+    }
     let result = match state.resources.reparent_window(request) {
         Ok(result) => result,
         Err(crate::resources::ReparentWindowError::BadWindow) => {
@@ -22756,6 +22816,25 @@ fn handle_reparent_window(
             override_redirect,
         );
     });
+    if let Some((_, _, override_redirect)) = unmapped {
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_map_notify_event(buf, seq, order, window, window, override_redirect);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, new_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_map_notify_event(
+                    buf,
+                    seq,
+                    order,
+                    new_parent,
+                    window,
+                    override_redirect,
+                );
+            });
+    }
+    // The window moved in the tree; Xorg's ReparentWindow re-evaluates the
+    // pointer through its MapWindow (`dix/window.c:2695`).
+    backend.windows_restructured(state);
     Ok(RequestOutcome::Handled)
 }
 
@@ -23971,6 +24050,9 @@ fn handle_configure_window(
             }
         }
     }
+    // Xorg miMoveWindow / miResizeWindow / ReflectStackChange end in
+    // WindowsRestructured (`mi/miwindow.c:302,620`, `dix/window.c:2179`).
+    backend.windows_restructured(state);
     // A confined pointer follows its confine window — re-clamp after
     // any geometry change (Xorg ConfineCursorToWindow on configure;
     // XGrabButton-25 moves confine_to and expects the pointer pulled
@@ -26975,6 +27057,9 @@ fn handle_map_window(
         }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
+    // Xorg MapWindow ends in WindowsRestructured (`dix/window.c:2695`): the
+    // pointer's crossings follow MapNotify and Expose within the request.
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} MapWindow 0x{:x} viewable+{}",
         client_id.0,
@@ -27098,6 +27183,9 @@ fn map_subwindows_with_delta(
             let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
+    // Xorg MapSubwindows: one WindowsRestructured after the batch
+    // (`dix/window.c:2775`).
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} MapSubwindows viewable+{}",
         client_id.0,
@@ -27189,6 +27277,8 @@ fn handle_unmap_window(
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
             release_core_grabs_for_unviewable(state, backend);
+            // Then WindowsRestructured (`dix/window.c:2871`).
+            backend.windows_restructured(state);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -27269,6 +27359,8 @@ fn unmap_subwindows_with_delta(
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
+    // Xorg UnmapSubwindows: one WindowsRestructured (`dix/window.c:2939`).
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} UnmapSubwindows viewable-{}",
         client_id.0,
@@ -27432,6 +27524,7 @@ fn window_attributes(
 
 fn handle_circulate_window(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -27459,41 +27552,51 @@ fn handle_circulate_window(
             13,
         );
     }
-    let chosen_child = {
-        let kids = state.resources.children(container);
-        match (direction, kids.first(), kids.last()) {
-            (0, _, Some(&back)) => Some(back),
-            (1, Some(&front), _) => Some(front),
-            _ => None,
-        }
-    };
-    let Some(child) = chosen_child else {
+    let Some(child) = state.circulate_candidate(container, direction) else {
         return Ok(RequestOutcome::Handled);
     };
-    // SubstructureRedirect on container takes priority — redirect the
-    // request to the first subscriber instead of performing the
-    // circulate.
+    // SubstructureRedirect on the container by another client turns it into
+    // a CirculateRequest (Xorg MaybeDeliverEventsToClient skips the
+    // requester).
     let redirect_target = subscribers_by_id(state, container, 0x0010_0000)
         .into_iter()
-        .next();
+        .find(|c| *c != client_id);
     if let Some(target) = redirect_target {
         let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
             let _ =
                 x11::write_circulate_request_event(buf, order, seq, container, child, direction);
         });
     } else {
-        let _ = state.resources.circulate_window(container, direction);
-        let on_child = subscribers_by_id(state, child, 0x0002_0000);
-        let on_container = subscribers_by_id(state, container, 0x0008_0000);
-        let mut targets = on_child;
-        for cid in on_container {
-            if !targets.contains(&cid) {
-                targets.push(cid);
-            }
+        state.resources.circulate_child(child, direction == 0);
+        if let Some(xid) = state.resources.window(child).and_then(|w| w.host_xid) {
+            let _ = backend.configure_subwindow(
+                None,
+                xid.as_raw(),
+                crate::host_x11::HostSubwindowConfig {
+                    x: None,
+                    y: None,
+                    width: None,
+                    height: None,
+                    border_width: None,
+                    sibling: None,
+                    stack_mode: Some(if direction == 0 { 0 } else { 1 }),
+                },
+            );
         }
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        backend.sync_top_level_order(state);
+        // CirculateNotify to the window's StructureNotify and the parent's
+        // SubstructureNotify selectors, each with its own event window; the
+        // place (OnTop 0 / OnBottom 1) equals the direction.
+        let _dropped = emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
             let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
         });
+        let _dropped =
+            emit_window_event_to_state(state, container, 0x0008_0000, |buf, seq, order| {
+                let _ =
+                    x11::write_circulate_notify_event(buf, order, seq, container, child, direction);
+            });
+        // Xorg ReflectStackChange (`dix/window.c:2179`).
+        backend.windows_restructured(state);
     }
     debug!("client {} #{} CirculateWindow", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -28320,8 +28423,11 @@ pub(crate) fn emit_core_focus_transition(
                     buf, seq, order, e.focus_in, e.window, mode, e.detail,
                 );
             });
-        // XI2 mirrors only the real FocusIn/FocusOut pairs (evtype
-        // 9/10) on the windows the core chain touches.
+    }
+    // Xorg DoFocusEvents: the whole core sequence, then the XI2 one
+    // (DeviceFocusEvents), which has its own windows.
+    for e in crate::crossings::device_focus_transition_events(state, from_raw, to_raw, pointer_win)
+    {
         let evtype = if e.focus_in { 9 } else { 10 };
         let _dropped = emit_xi2_focus_event_to_state(
             state,
@@ -32477,7 +32583,8 @@ pub(crate) fn confine_pointer_now(state: &mut ServerState, backend: &mut dyn Bac
 /// Xorg `ActivatePointerGrab`/`DeactivatePointerGrab` →
 /// `DoEnterLeaveEvents(sprite.win ↔ grab window, NotifyGrab/Ungrab)`.
 /// Events flow through the normal per-window mask filter (EnterWindow
-/// 0x10 / LeaveWindow 0x20) to every selecting client.
+/// 0x10 / LeaveWindow 0x20) to every selecting client, then the same chain
+/// in XI2 form (`DeviceEnterLeaveEvents`), from the master pointer.
 pub(crate) fn emit_core_pointer_grab_chain(
     state: &mut ServerState,
     from_win: ResourceId,
@@ -32490,7 +32597,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
     let chain = crate::crossings::normal_mode_crossings(state, from_win, to_win);
     let (root_x, root_y) = state.pointer_root;
     let server_time = state.timestamp_now();
-    for e in chain {
+    for e in &chain {
         let (mask, enter) = match e.kind {
             crate::crossings::CrossingKind::Enter => (0x10u32, true),
             crate::crossings::CrossingKind::Leave => (0x20u32, false),
@@ -32498,6 +32605,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let (ox, oy) = state.resources.window_absolute_position(e.window);
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
         let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
             let crossing = yserver_protocol::x11::CrossingEvent {
                 sequence: seq,
@@ -32512,12 +32620,52 @@ pub(crate) fn emit_core_pointer_grab_chain(
                 state: 0,
                 detail: e.detail,
                 mode,
+                focus,
             };
             if enter {
                 x11::encode_enter_notify_event(buf, order, crossing);
             } else {
                 x11::encode_leave_notify_event(buf, order, crossing);
             }
+        });
+    }
+    for e in chain {
+        let evtype: u16 = match e.kind {
+            crate::crossings::CrossingKind::Enter => 7,
+            crate::crossings::CrossingKind::Leave => 8,
+        };
+        // Xorg sends these before the grab is installed and after it is
+        // gone, so the window's selections get them, whatever the grab.
+        let targets =
+            crate::core_loop::pointer_fanout::xi2_master_selectors(state, e.window, evtype);
+        if targets.is_empty() {
+            continue;
+        }
+        let (ox, oy) = state.resources.window_absolute_position(e.window);
+        let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
+        let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
+        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            x11::encode_xi2_crossing_event(
+                buf,
+                order,
+                seq,
+                XI2_MAJOR_OPCODE,
+                evtype,
+                2,
+                server_time,
+                ROOT_WINDOW,
+                e.window,
+                root_x,
+                root_y,
+                event_x,
+                event_y,
+                0,
+                mode,
+                e.detail,
+                2,
+                focus,
+            );
         });
     }
 }
@@ -46312,40 +46460,23 @@ mod tests {
         let bytes = read_all_available(&mut peer);
 
         assert_eq!(bytes.len(), 216, "expected core + XI2 focus out/in");
+        // Xorg DoFocusEvents: the core sequence first, then the XI2 one.
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
         assert_eq!(bytes[0], 10, "first event should be core FocusOut");
         assert_eq!(bytes[1], 2, "parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            TOP
-        );
-        assert_eq!(bytes[32], 35, "second event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[40], bytes[41]]),
-            10,
-            "XI2 FocusOut evtype"
-        );
-        assert_eq!(bytes[51], 2, "XI2 parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]),
-            TOP
-        );
-        assert_eq!(bytes[108], 9, "third event should be core FocusIn");
-        assert_eq!(bytes[109], 0, "child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[112], bytes[113], bytes[114], bytes[115]]),
-            CHILD
-        );
+        assert_eq!(word(4), TOP);
+        assert_eq!(bytes[32], 9, "second event should be core FocusIn");
+        assert_eq!(bytes[33], 0, "child FocusIn should be NotifyAncestor");
+        assert_eq!(word(36), CHILD);
+        assert_eq!(bytes[64], 35, "third event should be XI2 GenericEvent");
+        assert_eq!(half(72), 10, "XI2 FocusOut evtype");
+        assert_eq!(bytes[83], 2, "XI2 parent FocusOut should be NotifyInferior");
+        assert_eq!(word(88), TOP);
         assert_eq!(bytes[140], 35, "fourth event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[148], bytes[149]]),
-            9,
-            "XI2 FocusIn evtype"
-        );
+        assert_eq!(half(148), 9, "XI2 FocusIn evtype");
         assert_eq!(bytes[159], 0, "XI2 child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[164], bytes[165], bytes[166], bytes[167]]),
-            CHILD
-        );
+        assert_eq!(word(164), CHILD);
         assert_eq!(
             state.core_focus.raw, CHILD,
             "keyboard focus should track child"
@@ -59306,6 +59437,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -59484,6 +59616,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _ =
@@ -59621,6 +59754,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -59847,6 +59981,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -60128,6 +60263,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -60246,6 +60382,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -60367,6 +60504,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut state,
@@ -60509,6 +60647,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -60662,6 +60801,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -60777,6 +60917,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -60904,6 +61045,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61080,6 +61222,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61232,6 +61375,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61350,6 +61494,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -78687,6 +78832,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -78993,6 +79139,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -79185,6 +79332,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -79378,6 +79526,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             };
             let _ = pointer_event_fanout_to_state(
                 &mut state,
@@ -79600,6 +79749,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -79735,6 +79885,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -79993,6 +80144,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

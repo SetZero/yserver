@@ -2562,6 +2562,111 @@ impl ServerState {
             .map(|(child, _, _)| child)
     }
 
+    /// The child CirculateWindow restacks — Xorg `CirculateWindow`
+    /// (`dix/window.c:2443`): RaiseLowest (0) takes the lowest mapped child a
+    /// mapped sibling above overlaps, LowerHighest (1) the highest mapped
+    /// child that overlaps a mapped sibling below. The overlay window stays
+    /// out of it, capped on top.
+    #[must_use]
+    pub fn circulate_candidate(&self, parent: ResourceId, direction: u8) -> Option<ResourceId> {
+        let kids: Vec<ResourceId> = self
+            .resources
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|w| *w != crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .collect();
+        let mapped = |w: ResourceId| {
+            self.resources
+                .window(w)
+                .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped)
+        };
+        let overlaps_any = |w: ResourceId, others: &[ResourceId]| {
+            others
+                .iter()
+                .any(|s| mapped(*s) && self.siblings_overlap(w, *s))
+        };
+        if direction == 0 {
+            (0..kids.len())
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[i + 1..]))
+                .map(|i| kids[i])
+        } else {
+            (0..kids.len())
+                .rev()
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[..i]))
+                .map(|i| kids[i])
+        }
+    }
+
+    /// Xorg `BOXES_OVERLAP` of two siblings' border-inclusive extents, cut by
+    /// their bounding shapes (`ShapeOverlap`, `dix/window.c:1975`).
+    fn siblings_overlap(&self, a: ResourceId, b: ResourceId) -> bool {
+        let (ra, rb) = (self.sibling_region(a), self.sibling_region(b));
+        ra.iter().any(|p| {
+            rb.iter()
+                .any(|q| p.0 < q.2 && q.0 < p.2 && p.1 < q.3 && q.1 < p.3)
+        })
+    }
+
+    /// A window's bounding region in its parent's coordinates, as
+    /// `(x1, y1, x2, y2)` boxes.
+    fn sibling_region(&self, window: ResourceId) -> Vec<(i32, i32, i32, i32)> {
+        let Some(w) = self.resources.window(window) else {
+            return Vec::new();
+        };
+        let bw = i32::from(w.border_width);
+        let (x1, y1) = (i32::from(w.x), i32::from(w.y));
+        let (x2, y2) = (
+            x1 + i32::from(w.width) + 2 * bw,
+            y1 + i32::from(w.height) + 2 * bw,
+        );
+        let Some(shape) = self
+            .shape_windows
+            .get(&window)
+            .and_then(|s| s.bounding.as_ref())
+        else {
+            return vec![(x1, y1, x2, y2)];
+        };
+        let (ox, oy) = (x1 + bw, y1 + bw);
+        shape
+            .iter()
+            .map(|r| {
+                let (rx, ry) = (ox + i32::from(r.x), oy + i32::from(r.y));
+                (
+                    rx.max(x1),
+                    ry.max(y1),
+                    (rx + i32::from(r.width)).min(x2),
+                    (ry + i32::from(r.height)).min(y2),
+                )
+            })
+            .filter(|b| b.0 < b.2 && b.1 < b.3)
+            .collect()
+    }
+
+    /// The `focus` flag of a crossing on `window` (core and XI2): the core
+    /// focus is PointerRoot, or `window` or one of its ancestors (Xorg
+    /// `CoreEnterLeaveEvent` / `DeviceEnterLeaveEvent`, `dix/events.c:4772`).
+    #[must_use]
+    pub fn crossing_has_focus(&self, window: ResourceId) -> bool {
+        match self.core_focus.raw {
+            0 => false,
+            1 => true,
+            focus => {
+                let mut current = window;
+                for _ in 0..256 {
+                    if current.0 == focus {
+                        return true;
+                    }
+                    match self.resources.window(current) {
+                        Some(w) if w.parent != current => current = w.parent,
+                        _ => return false,
+                    }
+                }
+                false
+            }
+        }
+    }
+
     #[must_use]
     pub fn top_level_for_target(&self, target: ResourceId) -> ResourceId {
         let mut current = target;
@@ -2657,23 +2762,26 @@ impl ServerState {
         Some((child_id, child_x, child_y))
     }
 
+    /// Xorg `miSpriteTrace` (`mi/miwindow.c:767`): a set bounding shape
+    /// (`PointInBorderSize`) and a set input shape must both hold the point.
     fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
-        let Some(rects) = self
-            .shape_windows
-            .get(&window)
-            .and_then(|state| state.input.as_ref())
-        else {
+        let Some(shape) = self.shape_windows.get(&window) else {
             return true;
         };
-        rects.iter().any(|rect| {
-            let rx = i32::from(rect.x);
-            let ry = i32::from(rect.y);
-            let rr = rx + i32::from(rect.width);
-            let rb = ry + i32::from(rect.height);
-            let px = i32::from(x);
-            let py = i32::from(y);
-            px >= rx && py >= ry && px < rr && py < rb
-        })
+        let holds = |rects: &Option<Vec<xfixes::RegionRect>>| {
+            rects.as_ref().is_none_or(|rects| {
+                rects.iter().any(|rect| {
+                    let rx = i32::from(rect.x);
+                    let ry = i32::from(rect.y);
+                    let rr = rx + i32::from(rect.width);
+                    let rb = ry + i32::from(rect.height);
+                    let px = i32::from(x);
+                    let py = i32::from(y);
+                    px >= rx && py >= ry && px < rr && py < rb
+                })
+            })
+        };
+        holds(&shape.bounding) && holds(&shape.input)
     }
 
     /// Diagnostic label for a window: `0x<id>[<WM_CLASS>]`. WM_CLASS is
@@ -3483,6 +3591,7 @@ fn pointer_event_fanout_inner(
         }
         Err(_) => return,
     };
+    let focus = state.lock().is_ok_and(|g| g.crossing_has_focus(nested_id));
 
     for target in core_targets {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
@@ -3555,6 +3664,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
             PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3573,6 +3683,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
         }
@@ -3631,6 +3742,7 @@ fn pointer_event_fanout_inner(
                 0,
                 0,
                 2,
+                focus,
             );
         } else {
             // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the
@@ -4455,6 +4567,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4618,6 +4731,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4782,6 +4896,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4903,6 +5018,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -5027,6 +5143,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -5062,6 +5179,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -5125,6 +5243,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
