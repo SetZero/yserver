@@ -2967,16 +2967,24 @@ fn reconcile_client_writable_interest(
             continue;
         }
         let raw = std::os::fd::AsRawFd::as_raw_fd(&*client.writer.lock().unwrap());
-        let interest = if needs_writable {
-            Interest::READABLE | Interest::WRITABLE
+        // The writer fd is in the poller only while output waits for room:
+        // the reader thread owns reads, so a READABLE registration would
+        // only wake this loop for every byte the client sends -- and on a
+        // kernel whose edge-triggered readiness also counts the other
+        // direction's traffic, for every byte the server sends too.
+        let changed = if needs_writable {
+            let token = client_token(yserver_protocol::x11::ClientId(*id));
+            match registry.register(&mut SourceFd(&raw), token, Interest::WRITABLE) {
+                // Registered by somebody else meanwhile: take it over.
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    registry.reregister(&mut SourceFd(&raw), token, Interest::WRITABLE)
+                }
+                other => other,
+            }
         } else {
-            Interest::READABLE
+            registry.deregister(&mut SourceFd(&raw))
         };
-        match registry.reregister(
-            &mut SourceFd(&raw),
-            client_token(yserver_protocol::x11::ClientId(*id)),
-            interest,
-        ) {
+        match changed {
             Ok(()) => client.watching_writable = needs_writable,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // fd already deregistered (disconnect path); nothing
@@ -3288,16 +3296,12 @@ fn handle_client_setup_complete(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
 
-    // Initial interest is READABLE — mio doesn't accept empty interest.
-    // I2 reregisters WRITABLE-only when `client.outbound` becomes
-    // non-empty and back to READABLE when it drains. The reader thread
-    // already polls the peer fd directly, so this registration's only
-    // wake-up role today is the eventual WRITABLE-on-drain edge.
-    registry.register(
-        &mut SourceFd(&writer_fd),
-        crate::core_loop::poll_tokens::client_token(id),
-        Interest::READABLE,
-    )?;
+    // Not registered with the poller until output waits for room: the
+    // reader thread polls the peer fd directly, so the registration's only
+    // wake-up role is the WRITABLE-on-drain edge, and the outbound
+    // reconciliation registers it (WRITABLE) and deregisters it as the
+    // outbound buffer fills and drains.
+    let _ = (&registry, &writer_fd);
 
     const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
     // Read the transport off the stream before it is moved into the
@@ -4169,15 +4173,13 @@ mod tests {
         use yserver_protocol::x11::{ClientByteOrder, ClientId as Cid};
 
         let poll = Poll::new().unwrap();
-        // We just need a real fd registered with the poller.
+        // A client's writer fd is in the poller only while output waits:
+        // a new client's is not.
         let (mut peer, writer) = UnixStream::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
         let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
         let raw = writer_arc.lock().unwrap().as_raw_fd();
         let token = client_token(Cid(7));
-        poll.registry()
-            .register(&mut SourceFd(&raw), token, Interest::READABLE)
-            .unwrap();
 
         let mut state = ServerState::new();
         state.clients.insert(
@@ -4290,6 +4292,10 @@ mod tests {
         assert!(disc.is_empty());
         assert!(state.clients[&7].outbound.is_empty());
         assert!(!state.clients[&7].watching_writable);
+        // And out of the poller again: registering it anew succeeds.
+        poll.registry()
+            .register(&mut SourceFd(&raw), token, Interest::READABLE)
+            .expect("the drained writer was deregistered");
 
         drop(peer);
     }
