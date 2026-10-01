@@ -1,0 +1,34 @@
+==> probe.log <==
+listener selects SubstructureNotify on root: ok
+RedirectSubwindows(root, Manual): ok
+other client RedirectSubwindows(root, Manual): error code=10
+GetOverlayWindow: ok
+QueryTree(root) with the COW: COW not listed
+create W (override-redirect, fullscreen): ok
+map W: ok
+NameWindowPixmap(W) redirected by root: ok centre=3060c0
+UnredirectWindow(W, Manual): ok
+UnredirectWindow(W, Manual) again: error code=2
+NameWindowPixmap(W) unredirected: error code=8
+RedirectWindow(W, Manual): ok
+other client RedirectWindow(W, Manual): error code=10
+other client RedirectWindow(W, Automatic): ok
+other client UnredirectWindow(W, Automatic): ok
+NameWindowPixmap(W) redirected again: ok centre=3060c0
+NameWindowPixmap(W) after W painted: ok centre=c08020
+NameWindowPixmap(W) after W painted again: ok centre=20a040
+UnredirectSubwindows(root, Manual): ok
+NameWindowPixmap(W) after UnredirectSubwindows(root): error code=8
+UnredirectWindow(W, Manual) after UnredirectSubwindows(root): error code=2
+UnmapSubwindows(root): ok
+COW map_state after UnmapSubwindows(root): viewable
+ReleaseOverlayWindow: ok
+QueryTree(root) after release: COW not listed
+event CreateNotify parent=root window=COW geometry=screen border=0 override=1
+event MapNotify event=root window=COW override=1
+event CreateNotify parent=root window=W geometry=screen border=0 override=1
+event MapNotify event=root window=W override=1
+event UnmapNotify event=root window=W from_configure=0
+event UnmapNotify event=root window=COW from_configure=0
+event DestroyNotify event=root window=COW
+done
