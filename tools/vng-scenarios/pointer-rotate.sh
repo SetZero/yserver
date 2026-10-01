@@ -7,18 +7,18 @@
 # mask: \bwindow:\d+ => window:<xid> -- window ids are server-assigned
 set -u
 set +e
+if ! command -v xinput > /dev/null; then
+    echo "fail: xinput missing, cannot make pointer acceleration flat" > RESULT
+    return 0
+fi
 xprop -root -spy > /dev/null 2>&1 &
 hold=$!
 sleep 1
 out=$(xrandr | awk '/ connected/{print $1; exit}')
-if command -v xinput > /dev/null; then
-    for id in $(xinput list --id-only); do
-        xinput set-prop "$id" 'libinput Accel Profile Enabled' 0 1 2>/dev/null || true
-    done
-    echo "accel: flat" >> pointer.log
-else
-    echo "accel: default (no xinput)" >> pointer.log
-fi
+for id in $(xinput list --id-only); do
+    xinput set-prop "$id" 'libinput Accel Profile Enabled' 0 1 2>/dev/null || true
+done
+echo "accel: flat" >> pointer.log
 phase() {
     xdotool mousemove 400 400
     sleep 0.5

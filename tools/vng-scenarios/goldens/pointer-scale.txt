@@ -1,7 +1,7 @@
 ==> pointer.log <==
-accel: default (no xinput)
+accel: flat
 === identity start x:200 y:200 screen:0 window:<xid>
-=== identity end   x:253 y:221 screen:0 window:<xid>
+=== identity end   x:300 y:240 screen:0 window:<xid>
 Screen 0: minimum 320 x 200, current 2560 x 1600, maximum <max>
 === scale2 start x:200 y:200 screen:0 window:<xid>
-=== scale2 end   x:256 y:222 screen:0 window:<xid>
+=== scale2 end   x:300 y:240 screen:0 window:<xid>

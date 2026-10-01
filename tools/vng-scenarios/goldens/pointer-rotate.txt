@@ -1,15 +1,15 @@
 ==> pointer.log <==
-accel: default (no xinput)
+accel: flat
 === normal start x:400 y:400 screen:0 window:<xid>
-=== normal end   x:453 y:421 screen:0 window:<xid>
+=== normal end   x:500 y:440 screen:0 window:<xid>
 Screen 0: minimum 320 x 200, current 800 x 1280, maximum <max>
 === left start x:400 y:400 screen:0 window:<xid>
-=== left end   x:456 y:422 screen:0 window:<xid>
+=== left end   x:500 y:440 screen:0 window:<xid>
 Screen 0: minimum 320 x 200, current 800 x 1280, maximum <max>
 === right start x:400 y:400 screen:0 window:<xid>
-=== right end   x:456 y:422 screen:0 window:<xid>
+=== right end   x:500 y:440 screen:0 window:<xid>
 Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
 === inverted start x:400 y:400 screen:0 window:<xid>
-=== inverted end   x:456 y:422 screen:0 window:<xid>
+=== inverted end   x:500 y:440 screen:0 window:<xid>
 === reflectx start x:400 y:400 screen:0 window:<xid>
-=== reflectx end   x:456 y:422 screen:0 window:<xid>
+=== reflectx end   x:500 y:440 screen:0 window:<xid>
