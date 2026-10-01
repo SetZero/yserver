@@ -634,11 +634,7 @@ pub struct ActivePointerGrab {
     pub xi2_mask: u64,
 }
 
-/// XComposite redirect mode. Both wire constants are accepted —
-/// `Automatic` (update=0) and `Manual` (update=1) — but the
-/// redirected-backing pixmap path is unimplemented, so no code
-/// currently branches on the variant. The record's presence is what
-/// `NameWindowPixmap` and the disconnect-cleanup paths consult.
+/// XComposite redirect mode: `Automatic` (update=0) or `Manual` (update=1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeRedirectMode {
     Manual,
@@ -889,13 +885,11 @@ impl Default for PointerControlState {
     }
 }
 
-/// Per-window XComposite redirect record stored in
-/// [`ServerState::composite_redirects`]. The `owner` is the client
-/// that issued the `RedirectWindow` / `RedirectSubwindows` — used
-/// by the dispatch layer for `BadAccess` conflict detection and by
-/// `process_disconnect` to tear down redirects belonging to a
-/// departing client (L2 task B.1b).
-#[derive(Debug, Clone, Copy)]
+/// One client's XComposite redirect (Xorg `CompClientWindowRec`), kept in
+/// [`ServerState::composite_redirects`]. The `owner` is the client that
+/// issued the `RedirectWindow` / `RedirectSubwindows`; its records go with
+/// it at disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedirectRecord {
     pub mode: CompositeRedirectMode,
     pub owner: ClientId,
@@ -1228,7 +1222,7 @@ pub struct ServerState {
     /// output is allowed to drain, the core asks the backend to submit that
     /// drawing so an external compositor cannot sample ahead of it.
     pub damage_notify_flush_pending: bool,
-    pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
+    pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
     /// pageflip advances past their target (`drain_present_completions`).
@@ -1637,7 +1631,7 @@ impl ServerState {
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
             damage_notify_flush_pending: false,
-            composite_redirects: HashMap::new(),
+            composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
             present_next_id: 1,

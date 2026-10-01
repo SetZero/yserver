@@ -44459,7 +44459,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            state.composite_redirects.contains_key(&(window, false)),
+            state.composite_redirects.window_mode(window).is_some(),
             "redirect stays"
         );
         assert_eq!(backend.test_host_window_to_backing(host.as_raw()), None);
@@ -45126,13 +45126,17 @@ mod tests {
         // is a redirected direct child. socket is a child of mate-
         // panel (not directly redirected). nm-applet is currently
         // a direct child of root (and therefore inherits redirect).
-        state.composite_redirects.insert(
-            (root_xid, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root_xid,
+                &[],
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_state_window(
             &mut state,
@@ -45144,6 +45148,10 @@ mod tests {
             2560,
             28,
         );
+        // As CreateWindow does for a child of a subwindows-redirected parent.
+        state
+            .composite_redirects
+            .redirect_new_subwindow(root_xid, mate_panel_xid);
         seed_redirected_backing(&mut state, &mut backend, mate_panel_xid);
         let mate_panel_backing_id =
             backing_drawable_id(&backend, mate_panel_xid).expect("mate-panel backing drawable id");
@@ -45167,6 +45175,9 @@ mod tests {
             26,
             27,
         );
+        state
+            .composite_redirects
+            .redirect_new_subwindow(root_xid, nm_applet_xid);
         seed_redirected_backing(&mut state, &mut backend, nm_applet_xid);
 
         dispatch_reparent_window(
