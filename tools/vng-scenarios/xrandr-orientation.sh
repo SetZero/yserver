@@ -74,16 +74,22 @@ elif cmd == "probe":
         print(f"  1.0-sized request: error {type(e).__name__} code {e.code}")
 PY
 cat > events.py <<'PY'
-from Xlib import display
+from Xlib import X, display
 from Xlib.ext import randr
 d = display.Display()
 root = d.screen().root
+end = d.intern_atom("_YSUITE_EVENTS_END")
+root.change_attributes(event_mask=X.PropertyChangeMask)
 root.xrandr_select_input(randr.RRScreenChangeNotifyMask | randr.RRCrtcChangeNotifyMask
                          | randr.RROutputChangeNotifyMask)
-d.flush()
+d.sync()
+open("events.ready", "w").close()
 while True:
     e = d.next_event()
     n = e.__class__.__name__
+    # Set after the last request: everything that request generated is ahead of it.
+    if n == "PropertyNotify" and e.atom == end:
+        break
     if n == "ScreenChangeNotify":
         print(n, "rotation", hex(e.rotation), "size", e.width_in_pixels, e.height_in_pixels,
               "mm", e.width_in_millimeters, e.height_in_millimeters, flush=True)
@@ -96,6 +102,7 @@ while True:
 PY
 python3 events.py >> events.log 2>&1 &
 events=$!
+for _ in $(seq 1 100); do [ -e events.ready ] && break; sleep 0.1; done
 {
     echo "===== probe"
     python3 orient.py probe first
@@ -112,5 +119,9 @@ events=$!
     echo "===== end"
 } > orient.log 2>&1
 xrandr -o normal > /dev/null 2>&1
-kill $events $hold 2>/dev/null || true
-if grep -q '^===== end' orient.log; then echo pass > RESULT; else echo "fail: orient.log incomplete" > RESULT; fi
+xprop -root -f _YSUITE_EVENTS_END 8s -set _YSUITE_EVENTS_END 1
+for _ in $(seq 1 100); do kill -0 $events 2>/dev/null || break; sleep 0.1; done
+if kill $events 2>/dev/null; then echo "fail: event listener never saw the end marker" > RESULT
+elif [ ! -e events.ready ]; then echo "fail: event listener never started" > RESULT
+elif grep -q '^===== end' orient.log; then echo pass > RESULT; else echo "fail: orient.log incomplete" > RESULT; fi
+kill $hold 2>/dev/null || true
