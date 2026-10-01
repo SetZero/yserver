@@ -26268,7 +26268,13 @@ fn handle_query_tree(
     } else {
         window_state.parent
     };
-    let children = window_state.children.clone();
+    // Xorg's QueryTree stops at RealChildHead (dix/dispatch.c:1078), which
+    // Composite points at the overlay window while it tops the root
+    // (composite/compwindow.c:762): the COW is a root child nobody lists.
+    let mut children = window_state.children.clone();
+    if window == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
     debug!(
         "client {} #{} QueryTree reply 0x{:x}: parent=0x{:x} children={}",
         client_id.0,
@@ -27218,7 +27224,7 @@ fn unmap_subwindows_with_delta(
         child: ResourceId,
         host_xid: Option<crate::backend::WindowHandle>,
     }
-    let Some(children) = state.resources.mapped_children_bottom_to_top(parent) else {
+    let Some(mut children) = state.resources.mapped_children_bottom_to_top(parent) else {
         return emit_x11_error(
             state,
             client_id,
@@ -27229,6 +27235,11 @@ fn unmap_subwindows_with_delta(
         )
         .map(|outcome| (outcome, delta));
     };
+    // UnmapSubwindows stops at RealChildHead too (dix/window.c:2897): the
+    // overlay window stays mapped.
+    if parent == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
@@ -65492,6 +65503,64 @@ mod tests {
         .expect("UnmapSubwindows");
         assert!(delta.became_viewable.is_empty());
         assert_eq!(delta.became_unviewable, vec![a1, a, b1, b, c]);
+    }
+
+    #[test]
+    fn query_tree_of_the_root_hides_the_overlay_window() {
+        // Xorg CompositeRealChildHead (composite/compwindow.c:762), measured
+        // on Xvfb 21.1 (tools/vng-scenarios/composite-reredirect).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let child = ResourceId(0x0010_0001);
+        create_root_child(&mut state, child.0);
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
+        handle_query_tree(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("QueryTree");
+        let reply = read_all_available(&mut peer);
+        let listed: Vec<u32> = reply[32..]
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(u16::from_le_bytes([reply[16], reply[17]]), 1);
+        assert_eq!(listed, vec![child.0]);
+    }
+
+    #[test]
+    fn unmap_subwindows_of_the_root_leaves_the_overlay_window_mapped() {
+        // dix/window.c:2897 stops at RealChildHead; measured on Xvfb 21.1.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let child = ResourceId(0x0010_0001);
+        create_root_child(&mut state, child.0);
+        let _ = state.resources.map_window(child);
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
+        let (_, delta) = unmap_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("UnmapSubwindows");
+        assert_eq!(delta.became_unviewable, vec![child]);
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|w| w.map_state),
+            Some(MapState::Viewable)
+        );
     }
 
     #[test]
