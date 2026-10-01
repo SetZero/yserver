@@ -20,9 +20,13 @@ use yserver_protocol::x11::ClientId;
 
 use crate::{
     backend::{Backend, OriginContext},
-    resources::COMPOSITE_OVERLAY_WINDOW,
+    core_loop::fanout::emit_window_event_to_state,
+    resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW},
     server::ServerState,
 };
+
+const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
 
 /// Ask the backend to materialize the overlay, then mirror it on the
 /// resources side. Called on the 0 → 1 claim edge only.
@@ -54,6 +58,47 @@ pub(crate) fn materialize_overlay(
             cow_host_xid,
         ));
     state.materialize_cow_input_shape();
+    // Xorg compCreateOverlayWindow (composite/compoverlay.c:125-141) is a
+    // CreateWindow and a MapWindow of an override-redirect root child, so
+    // root's SubstructureNotify listeners see CreateNotify then MapNotify.
+    if let Some(geometry) =
+        state
+            .resources
+            .window(COMPOSITE_OVERLAY_WINDOW)
+            .map(|w| yserver_protocol::x11::Geometry {
+                root: ROOT_WINDOW,
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+                border_width: w.border_width,
+                depth: w.depth,
+            })
+    {
+        let _dropped =
+            emit_window_event_to_state(state, ROOT_WINDOW, SUBSTRUCTURE_NOTIFY, |buf, seq, o| {
+                yserver_protocol::x11::encode_create_notify_event(
+                    buf,
+                    seq,
+                    o,
+                    ROOT_WINDOW,
+                    COMPOSITE_OVERLAY_WINDOW,
+                    geometry,
+                    true,
+                );
+            });
+        let _dropped =
+            emit_window_event_to_state(state, ROOT_WINDOW, SUBSTRUCTURE_NOTIFY, |buf, seq, o| {
+                yserver_protocol::x11::encode_map_notify_event(
+                    buf,
+                    seq,
+                    o,
+                    ROOT_WINDOW,
+                    COMPOSITE_OVERLAY_WINDOW,
+                    true,
+                );
+            });
+    }
     // The COW is now a core root child (capped on top); reproject the
     // backend top-level order from core so it enters the projection at
     // the top. Must run AFTER materialize_cow_resource — the backend COW
@@ -83,6 +128,42 @@ pub(crate) fn teardown_overlay(
         // nothing to mirror down either, because nothing ever reached
         // `materialize_cow_resource`.
         return Ok(());
+    }
+    // Xorg frees the overlay through DeleteWindow (dix/window.c:1070): an
+    // UnmapNotify then a DestroyNotify, each to the COW's StructureNotify
+    // and root's SubstructureNotify listeners.
+    let cow_mapped = state
+        .resources
+        .window(COMPOSITE_OVERLAY_WINDOW)
+        .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped);
+    let targets = [
+        (COMPOSITE_OVERLAY_WINDOW, STRUCTURE_NOTIFY),
+        (ROOT_WINDOW, SUBSTRUCTURE_NOTIFY),
+    ];
+    if cow_mapped {
+        for (event_window, mask) in targets {
+            let _dropped = emit_window_event_to_state(state, event_window, mask, |buf, seq, o| {
+                yserver_protocol::x11::encode_unmap_notify_event(
+                    buf,
+                    seq,
+                    o,
+                    event_window,
+                    COMPOSITE_OVERLAY_WINDOW,
+                    false,
+                );
+            });
+        }
+    }
+    for (event_window, mask) in targets {
+        let _dropped = emit_window_event_to_state(state, event_window, mask, |buf, seq, o| {
+            yserver_protocol::x11::encode_destroy_notify_event(
+                buf,
+                seq,
+                o,
+                event_window,
+                COMPOSITE_OVERLAY_WINDOW,
+            );
+        });
     }
     // Xorg frees the overlay through DeleteWindow, so its Pictures die with it.
     crate::core_loop::process_request::free_pictures_on_destroyed_windows(

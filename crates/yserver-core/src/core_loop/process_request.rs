@@ -55452,6 +55452,71 @@ mod tests {
     }
 
     #[test]
+    fn overlay_window_create_and_release_notify_root_substructure_listeners() {
+        // Xorg compCreateOverlayWindow / DeleteWindow, measured on Xvfb 21.1
+        // (tools/vng-scenarios/composite-reredirect): CreateNotify, MapNotify;
+        // then UnmapNotify, DestroyNotify after the last release.
+        const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+        const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+        let mut state = ServerState::new();
+        let _compositor = install_client(&mut state, 1);
+        let mut listener = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&2)
+            .expect("listener")
+            .event_masks
+            .insert(ROOT_WINDOW, SUBSTRUCTURE_NOTIFY);
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let events = |bytes: &[u8]| -> Vec<(u8, u32, u32)> {
+            let word =
+                |e: &[u8], at: usize| u32::from_le_bytes([e[at], e[at + 1], e[at + 2], e[at + 3]]);
+            bytes
+                .chunks_exact(32)
+                .map(|e| (e[0], word(e, 4), word(e, 8)))
+                .collect()
+        };
+        let root_body = ROOT_WINDOW.0.to_le_bytes();
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &root_body,
+        );
+        assert_eq!(
+            events(&read_all_available(&mut listener)),
+            vec![(16, ROOT_WINDOW.0, cow.0), (19, ROOT_WINDOW.0, cow.0)],
+            "CreateNotify(parent=root, window=COW), MapNotify(event=root)"
+        );
+        state
+            .clients
+            .get_mut(&2)
+            .expect("listener")
+            .event_masks
+            .insert(cow, STRUCTURE_NOTIFY);
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &root_body,
+        );
+        assert_eq!(
+            events(&read_all_available(&mut listener)),
+            vec![
+                (18, cow.0, cow.0),
+                (18, ROOT_WINDOW.0, cow.0),
+                (17, cow.0, cow.0),
+                (17, ROOT_WINDOW.0, cow.0),
+            ],
+        );
+    }
+
+    #[test]
     fn release_overlay_window_destroys_cow_resource_on_final_release() {
         // Final release (backend returns Ok(true)) must DESTROY the COW
         // resource record entirely (record removed from `windows`, edge
