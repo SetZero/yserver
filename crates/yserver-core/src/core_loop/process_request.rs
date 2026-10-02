@@ -24347,12 +24347,13 @@ fn handle_configure_window(
             && !resized
             && let Some((old_x, old_y, _, _, _)) = before_geom
             && (old_x, old_y) != (geometry.x, geometry.y)
-            && has_redirected_ancestor(state, window_id)
+            && (has_redirected_ancestor(state, window_id)
+                || parent.is_some_and(|p| p != crate::resources::ROOT_WINDOW))
         {
-            // A pure move of an UNREDIRECTED window inside a redirected
-            // ancestor: the backend carries its pixels to the new
-            // position in the ancestor's backing (Xorg `fbCopyWindow`),
-            // and Xorg reports that copy through `damageCopyWindow`
+            // A pure move of an UNREDIRECTED subwindow (inside a
+            // redirected ancestor, the backend also carries its pixels to the new
+            // position in the ancestor's backing, Xorg `fbCopyWindow`):
+            // Xorg reports that copy through `damageCopyWindow`
             // (`miext/damage/damage.c`); a damage object on any ancestor
             // sees it, since window damage includes inferiors. (The
             // vacated area is reported by its exposure paint below.)
@@ -24419,9 +24420,8 @@ fn handle_configure_window(
             // the translated old `borderClip`. MATE: dragging the
             // workspace switcher under the (higher) notification area
             // left a tray-sized hole in the switcher.
-            // A resize already exposes the whole window (below); a window
-            // with storage of its own keeps its pixels.
-            if !resized && shared {
+            // A resize already exposes the whole window (below).
+            if !resized {
                 let (dx, dy) = (
                     geometry.x.saturating_sub(old_x),
                     geometry.y.saturating_sub(old_y),
