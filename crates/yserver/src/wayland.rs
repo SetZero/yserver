@@ -250,6 +250,21 @@ impl WaylandLink {
         Some((width, height))
     }
 
+    /// How often the compositor's first screen refreshes, in whole hertz:
+    /// the rate the root's RandR output reports, which an X client that
+    /// paces itself -- Chromium -- takes its frame clock from. `None` while
+    /// there is no screen or it gave no rate.
+    #[must_use]
+    pub fn screen_refresh_hz(&self) -> Option<u32> {
+        let output = self
+            .client
+            .outputs()
+            .into_iter()
+            .find(|output| output.done)?;
+        let hz = (output.refresh_mhz + 500) / 1000;
+        u32::try_from(hz).ok().filter(|&hz| hz > 0)
+    }
+
     /// Read what the compositor sent, without blocking, and act on it.
     ///
     /// # Errors
