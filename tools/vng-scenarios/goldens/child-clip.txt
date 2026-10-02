@@ -1,0 +1,226 @@
+==> direct.log <==
+reset
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+V: red band at 60, moved from y=10 to y=-40
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-35 blue 40-55 red 60-95 blue 100-115 gray 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+V: red band at 60, moved from y=10 to y=40
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-55 gray 60-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: PolyFillRectangle -50,-50 400x400 ClipByChildren
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: PolyFillRectangle -50,-50 400x400 IncludeInferiors
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-190 orange 195-195 frame
+  y=137: 0-195 green
+V: PolyFillRectangle -50,-50 400x400
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 orange 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 orange 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: PolyFillRectangle -50,-50 400x400, clip 20,50 40x200
+  x=50:  0-15 magenta 20-65 gray 70-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: PutImage -20,-20 230x140
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: ShmPutImage -20,-20 230x140
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: RENDER FillRectangles -50,-50 400x400
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: RENDER FillRectangles -50,-50 400x400, clip 0,0 40x200 at 20,50
+  x=50:  0-15 magenta 20-65 gray 70-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: RENDER Composite -30,-30 300x300
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: RENDER Composite -30,-30 300x300, clip 0,0 40x40 at 20,70
+  x=50:  0-15 magenta 20-85 gray 90-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: CopyArea 0,0 -> 0,40 100x200 (scroll down)
+  x=50:  0-15 magenta 20-45 red 50-55 gray 60-85 red 90-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-100 red 105-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
+  x=50:  0-15 magenta 20-35 gray 40-65 red 70-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: CopyArea 0,0 -> -20,-40 100x140
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-80 gray 85-100 red 105-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+==> probe.log <==
+reset
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+V: red band at 60, moved from y=10 to y=-40
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-35 blue 40-55 red 60-95 blue 100-115 gray 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+V: red band at 60, moved from y=10 to y=40
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-55 gray 60-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: PolyFillRectangle -50,-50 400x400 ClipByChildren
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: PolyFillRectangle -50,-50 400x400 IncludeInferiors
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-190 orange 195-195 frame
+  y=137: 0-195 green
+V: PolyFillRectangle -50,-50 400x400
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 orange 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 orange 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: PolyFillRectangle -50,-50 400x400, clip 20,50 40x200
+  x=50:  0-15 magenta 20-65 gray 70-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: PutImage -20,-20 230x140
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: ShmPutImage -20,-20 230x140
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: RENDER FillRectangles -50,-50 400x400
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: RENDER FillRectangles -50,-50 400x400, clip 0,0 40x200 at 20,50
+  x=50:  0-15 magenta 20-65 gray 70-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: RENDER Composite -30,-30 300x300
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 orange 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 orange 195-195 frame
+  y=60:  0-0 frame 5-100 orange 105-180 blue 185-190 orange 195-195 frame
+  y=137: 0-195 green
+C: RENDER Composite -30,-30 300x300, clip 0,0 40x40 at 20,70
+  x=50:  0-15 magenta 20-85 gray 90-115 orange 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: CopyArea 0,0 -> 0,40 100x200 (scroll down)
+  x=50:  0-15 magenta 20-45 red 50-55 gray 60-85 red 90-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-100 red 105-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
+  x=50:  0-15 magenta 20-35 gray 40-65 red 70-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: CopyArea 0,0 -> -20,-40 100x140
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-15 magenta 20-25 gray 30-115 blue 120-120 frame 125-145 green
+  y=10:  0-195 magenta
+  y=25:  0-0 frame 5-80 gray 85-100 red 105-190 gray 195-195 frame
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
