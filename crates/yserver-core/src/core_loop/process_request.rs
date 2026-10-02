@@ -1765,12 +1765,7 @@ fn expose_vacated_area(
     let Some(p) = state.resources.window(parent) else {
         return;
     };
-    let content = x11::xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: p.width,
-        height: p.height,
-    };
+    let content = content_within_ancestors(state, parent);
     let mut region = crate::nested::intersect_regions(&vacated, &[content]);
     // Top-most first; `children` is bottom-to-top.
     let siblings: Vec<ResourceId> = p.children.iter().rev().copied().collect();
@@ -1921,6 +1916,61 @@ fn expose_own_region(
             );
         });
     }
+}
+
+/// `window`'s content rect in its own content space, intersected with
+/// each ancestor's up to the nearest redirected one: what of it can be
+/// in a clip list at all, since a child's never leaves its parent's
+/// (`mi/mivaltree.c:390`) and a redirected window's is not clipped by
+/// ITS parent (`mi/mivaltree.c:233-239`, `SetWinSize` `dix/window.c:1716`).
+fn content_within_ancestors(state: &ServerState, window: ResourceId) -> x11::xfixes::RegionRect {
+    let Some(w) = state.resources.window(window) else {
+        return x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    };
+    let mut clip = vec![x11::xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: w.width,
+        height: w.height,
+    }];
+    // The current ancestor's content origin, in `window`'s content space.
+    let (mut ox, mut oy) = (0i32, 0i32);
+    let mut cur = window;
+    while state.composite_redirects.window_mode(cur).is_none() {
+        let Some(c) = state.resources.window(cur) else {
+            break;
+        };
+        let Some(p) = state.resources.window(c.parent).filter(|_| cur != c.parent) else {
+            break;
+        };
+        let bw = i32::from(c.border_width);
+        ox -= i32::from(c.x) + bw;
+        oy -= i32::from(c.y) + bw;
+        let (Ok(x), Ok(y)) = (i16::try_from(ox), i16::try_from(oy)) else {
+            break;
+        };
+        clip = crate::nested::intersect_regions(
+            &clip,
+            &[x11::xfixes::RegionRect {
+                x,
+                y,
+                width: p.width,
+                height: p.height,
+            }],
+        );
+        cur = c.parent;
+    }
+    clip.first().copied().unwrap_or(x11::xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    })
 }
 
 /// Whether any proper ancestor of `window` is redirected, i.e. the
@@ -24247,15 +24297,24 @@ fn handle_configure_window(
             && let Some(parent) = parent
             && has_redirected_ancestor(state, window_id)
         {
-            let old_outer = outer_rect(old_x, old_y, old_w, old_h, old_bw);
-            let new_outer = outer_rect(
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-                geometry.border_width,
+            // Both ends as far as the parent's clip reaches: the part of
+            // the window outside it was never drawn, nor carried.
+            let inside = content_within_ancestors(state, parent);
+            let old_outer = crate::nested::intersect_regions(
+                &[outer_rect(old_x, old_y, old_w, old_h, old_bw)],
+                &[inside],
             );
-            let vacated = crate::nested::subtract_regions(&[old_outer], &[new_outer]);
+            let new_outer = crate::nested::intersect_regions(
+                &[outer_rect(
+                    geometry.x,
+                    geometry.y,
+                    geometry.width,
+                    geometry.height,
+                    geometry.border_width,
+                )],
+                &[inside],
+            );
+            let vacated = crate::nested::subtract_regions(&old_outer, &new_outer);
             if !vacated.is_empty() {
                 expose_vacated_area(state, backend, origin, parent, window_id, vacated);
             }
@@ -24274,10 +24333,10 @@ fn handle_configure_window(
                     geometry.x.saturating_sub(old_x),
                     geometry.y.saturating_sub(old_y),
                 );
-                let mut carried = crate::nested::subtract_regions(&[old_outer], &higher_before);
+                let mut carried = crate::nested::subtract_regions(&old_outer, &higher_before);
                 crate::nested::translate_region(&mut carried, dx, dy);
                 let higher_now = higher_sibling_rects(state, window_id);
-                let visible_now = crate::nested::subtract_regions(&[new_outer], &higher_now);
+                let visible_now = crate::nested::subtract_regions(&new_outer, &higher_now);
                 let holes = crate::nested::subtract_regions(&visible_now, &carried);
                 if !holes.is_empty() {
                     let _rest = expose_child_share(state, backend, origin, window_id, holes, true);
@@ -81252,5 +81311,53 @@ mod tests {
             vec![(x11::error::BAD_DRAWABLE, 0x00DE_AD00)],
         );
         assert!(state.resources.picture(ResourceId(PIC)).is_none());
+    }
+
+    /// A GTK bin window taller than its viewport, inside an xfwm4 frame
+    /// under the compositor: frame F (756x534, Manual-redirected through
+    /// root), client C at (5,29) 746x500, bin window V at (8,8) 730x531.
+    /// Xorg clips a child's clip list to its parent's
+    /// (`mi/mivaltree.c:390`), so V can hold only its rows above C's
+    /// bottom edge, 500 - 8 = 492 of them; a redirected window stops the
+    /// walk, being clipped to itself only.
+    #[test]
+    fn content_within_ancestors_stops_at_the_parents_edge() {
+        use crate::server::{CompositeRedirectMode, RedirectRecord};
+        let mut state = make_test_state();
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                &[],
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
+        let (f, c, v) = (
+            ResourceId(0x0040_0001),
+            ResourceId(0x0040_0002),
+            ResourceId(0x0040_0003),
+        );
+        seed_window(&mut state, f, ROOT_WINDOW, 756, 534);
+        seed_window(&mut state, c, f, 746, 500);
+        seed_window(&mut state, v, c, 730, 531);
+        for (w, x, y) in [(f, 900, 400), (c, 5, 29), (v, 8, 8)] {
+            let w = state.resources.window_mut(w).unwrap();
+            (w.x, w.y) = (x, y);
+        }
+        let rect = |width, height| x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
+        assert_eq!(content_within_ancestors(&state, c), rect(746, 500));
+        // F's own redirect ends the walk before the root's edge.
+        state.resources.window_mut(f).unwrap().x = 32000;
+        assert_eq!(content_within_ancestors(&state, f), rect(756, 534));
+        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
     }
 }

@@ -6690,6 +6690,14 @@ impl KmsBackend {
         {
             clip.intersect(super::target::content_rect(offset, g.width, g.height));
         }
+        // The window's own content intersected with every ancestor's,
+        // bordered or not: its clip in an ANCESTOR's backing, which it
+        // shares with its parent and siblings (see
+        // `PaintTarget::within_window_bounds`). Same frames as `clip`.
+        let mut bounds = ContentClipAccum::default();
+        if let Some(g) = self.windows.get(&host_xid) {
+            bounds.intersect(super::target::content_rect(offset, g.width, g.height));
+        }
         loop {
             if let Some(cur_id) = self.store.lookup(cur_xid)
                 && let Some(b_id) = self.store.redirected_target(cur_id)
@@ -6712,6 +6720,8 @@ impl KmsBackend {
                 let delta = layout_bw - geom_bw;
                 let mut clip = clip;
                 clip.shift(delta, delta);
+                let mut bounds = bounds;
+                bounds.shift(delta, delta);
                 if layout_bw > 0 && geom_bw == 0 {
                     // The owner's own content term was never folded in
                     // (its geometry says `bw == 0`), but its backing is
@@ -6725,12 +6735,16 @@ impl KmsBackend {
                         ));
                     }
                 }
-                return Some(PaintTarget::new(
+                let target = PaintTarget::new(
                     b_id,
                     (offset.0 + delta, offset.1 + delta),
                     self.finish_content_clip(clip, b_id),
                     leaf_depth,
-                ));
+                );
+                if cur_xid == host_xid {
+                    return Some(target);
+                }
+                return Some(target.within_window_bounds(self.finish_content_clip(bounds, b_id)));
             }
             // No `windows` entry means we've stepped onto root
             // (parent = `core.window_id`, not tracked) or onto an
@@ -6760,6 +6774,7 @@ impl KmsBackend {
                     offset.0 += i32::from(geom.x);
                     offset.1 += i32::from(geom.y);
                     clip.shift(i32::from(geom.x), i32::from(geom.y));
+                    bounds.shift(i32::from(geom.x), i32::from(geom.y));
                     // The root window has no border (spec §Invariants), so
                     // its content origin IS its backing origin: no further
                     // shift and no clip term.
@@ -6770,12 +6785,15 @@ impl KmsBackend {
                         // here: the accumulated offset already ends in
                         // the root's content frame, which IS its
                         // backing origin.
-                        return Some(PaintTarget::new(
-                            b_id,
-                            offset,
-                            self.finish_content_clip(clip, b_id),
-                            leaf_depth,
-                        ));
+                        return Some(
+                            PaintTarget::new(
+                                b_id,
+                                offset,
+                                self.finish_content_clip(clip, b_id),
+                                leaf_depth,
+                            )
+                            .within_window_bounds(self.finish_content_clip(bounds, b_id)),
+                        );
                     }
                     // No root redirect: paint stays on the leaf
                     // at its own CONTENT origin if the leaf storage is
@@ -6788,6 +6806,7 @@ impl KmsBackend {
                     offset.0 += i32::from(geom.x);
                     offset.1 += i32::from(geom.y);
                     clip.shift(i32::from(geom.x), i32::from(geom.y));
+                    bounds.shift(i32::from(geom.x), i32::from(geom.y));
                     // …intersect the parent's own content rect (a child
                     // may not reach its parent's border,
                     // `mi/mivaltree.c:386`), then step into the parent's
@@ -6799,9 +6818,13 @@ impl KmsBackend {
                     {
                         clip.intersect(super::target::content_rect((0, 0), pg.width, pg.height));
                     }
+                    if let Some(pg) = self.windows.get(&parent_xid) {
+                        bounds.intersect(super::target::content_rect((0, 0), pg.width, pg.height));
+                    }
                     offset.0 += parent_bw;
                     offset.1 += parent_bw;
                     clip.shift(parent_bw, parent_bw);
+                    bounds.shift(parent_bw, parent_bw);
                     cur_xid = parent_xid;
                 }
             }
@@ -7243,11 +7266,21 @@ impl KmsBackend {
             },
         };
         let new_occluders = self.copy_area_shared_backing_occluders(host_xid, &target);
-        let still_visible = compute_copy_area_dst_rects(outer, &new_occluders);
-        let pieces: Vec<ash::vk::Rect2D> = compute_copy_area_dst_rects(outer, &source.occluders)
-            .into_iter()
-            .flat_map(|r| intersect_rect_with_clip(r, &still_visible))
-            .collect();
+        // The parent's paint target carries its clip, its own and every
+        // ancestor's, in backing coordinates.
+        let parent_bounds = geom
+            .parent
+            .and_then(|p| self.resolve_paint_target(p))
+            .filter(|t| t.backing_id() == backing)
+            .and_then(PaintTarget::content_bounds);
+        let pieces = shared_backing_move_pieces(
+            outer,
+            &source.occluders,
+            &new_occluders,
+            parent_bounds,
+            old_origin,
+            new_origin,
+        );
         let delta = (new_origin.0 - old_origin.0, new_origin.1 - old_origin.1);
         for piece in order_pieces_for_in_place_move(pieces, delta) {
             let src_rect = ash::vk::Rect2D {
@@ -24653,19 +24686,27 @@ impl Backend for KmsBackend {
                 self.core.current_clip,
                 yserver_core::backend::ClipState::None
             );
-            if has_clip {
+            let local = Rectangle16 {
+                x: dst_x,
+                y: dst_y,
+                width,
+                height,
+            };
+            // Storage shared with the window's children (a redirect
+            // backing) holds their pixels too: ClipByChildren must leave
+            // them, as the GC's composite clip does in Xorg. A window's
+            // own leaf storage holds none, and keeps the fast path.
+            let children_clip = (self.store.lookup(host_xid) != Some(target.backing_id()))
+                .then(|| self.clip_fill_rects_by_subwindow_mode(host_xid, &[local]))
+                .filter(|pieces| pieces.as_slice() != [local]);
+            if has_clip || children_clip.is_some() {
                 // A clipped upload must use per-run source offsets: the GPU
                 // fast path accepts only a whole wire image and would paint
                 // stale rows outside a rectangle clip. Bitmap clips likewise
                 // lower to pixel runs here. Copy through apply_gc_function is
                 // still exactly the source value.
-                let local = Rectangle16 {
-                    x: dst_x,
-                    y: dst_y,
-                    width,
-                    height,
-                };
-                let runs = self.intersect_with_current_clip_live(&[local]);
+                let pieces = children_clip.unwrap_or_else(|| vec![local]);
+                let runs = self.intersect_with_current_clip_live(&pieces);
                 for run in runs {
                     self.put_image_rop_cpu(
                         target.dst(),
@@ -28978,6 +29019,50 @@ fn compute_render_composite_clip(
     acc
 }
 
+/// What a pure move inside a shared backing carries, in the window's
+/// local content space: its `outer` extent minus the higher siblings
+/// over it at either end (`old_occluders`, `new_occluders`), and inside
+/// the parent's clip (`parent_bounds`, backing coordinates; `None` = the
+/// whole backing) at both the old and the new origin. Xorg's
+/// `fbCopyWindow` copies the old `borderClip` into the new one, and a
+/// borderClip never leaves the parent's (`mi/mivaltree.c:390`): a GTK
+/// bin window taller than its viewport otherwise drags its rows below
+/// the viewport over the frame's title bar on every scroll.
+fn shared_backing_move_pieces(
+    outer: ash::vk::Rect2D,
+    old_occluders: &[ash::vk::Rect2D],
+    new_occluders: &[ash::vk::Rect2D],
+    parent_bounds: Option<ash::vk::Rect2D>,
+    old_origin: (i32, i32),
+    new_origin: (i32, i32),
+) -> Vec<ash::vk::Rect2D> {
+    let in_parent_at = |origin: (i32, i32)| -> Vec<ash::vk::Rect2D> {
+        parent_bounds.map_or_else(
+            || vec![outer],
+            |b| {
+                intersect_rect_with_clip(
+                    outer,
+                    &[ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: b.offset.x - origin.0,
+                            y: b.offset.y - origin.1,
+                        },
+                        extent: b.extent,
+                    }],
+                )
+            },
+        )
+    };
+    let still_visible = compute_copy_area_dst_rects(outer, new_occluders);
+    let (was_inside, is_inside) = (in_parent_at(old_origin), in_parent_at(new_origin));
+    compute_copy_area_dst_rects(outer, old_occluders)
+        .into_iter()
+        .flat_map(|r| intersect_rect_with_clip(r, &still_visible))
+        .flat_map(|r| intersect_rect_with_clip(r, &was_inside))
+        .flat_map(|r| intersect_rect_with_clip(r, &is_inside))
+        .collect()
+}
+
 /// Order the disjoint pieces of an in-place move by `delta` so that no
 /// piece is read after another piece has written over it. Each copy is
 /// individually overlap-safe (`RenderEngine::copy_area` stages a
@@ -29144,7 +29229,7 @@ mod tests {
         compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
         dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
         mode_timing, picture_is_include_inferiors_root, reconcile_connector_probe,
-        restore_primary_output_after_rebuild,
+        restore_primary_output_after_rebuild, shared_backing_move_pieces,
     };
     use crate::{
         internal_probe::{ProbeKmsHandles, RouteProbeRequest},
@@ -39290,6 +39375,21 @@ mod tests {
     /// entry, returning the new DrawableId. Used by the 4a
     /// resolver tests so the ancestor walk has something to chew
     /// on without touching Vk.
+    /// The target of a window painting into an ancestor's backing:
+    /// clipped to `(x, y, w, h)`, the window inside its ancestors, with no
+    /// border term.
+    fn in_ancestor_backing(
+        id: crate::kms::render::store::DrawableId,
+        offset: (i32, i32),
+        (x, y, width, height): (i32, i32, u32, u32),
+        depth: u8,
+    ) -> PaintTarget {
+        PaintTarget::new(id, offset, None, depth).within_window_bounds(Some(ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D { width, height },
+        }))
+    }
+
     pub(super) fn seed_window(
         b: &mut KmsBackend,
         xid: u32,
@@ -39739,8 +39839,9 @@ mod tests {
         // P (22,22,100,60) and C (29,31,20,10) intersected.
         assert_eq!(clip, Some((29, 31, 20, 10)));
 
-        // The `bw == 0` control on the SAME shape: no level contributes,
-        // so the walk lands on the pre-#133 offset with no clip.
+        // The `bw == 0` control on the SAME shape: no border term, so the
+        // walk lands on the pre-#133 offset, clipped only to C inside its
+        // ancestors (C (15,17,20,10) ∩ P (10,10,100,60) ∩ W).
         let mut b0 = KmsBackend::for_tests();
         seed_bordered_window(&mut b0, 0x4040, None, 0, 0, 200, 100, 0);
         seed_bordered_window(&mut b0, 0x4041, Some(0x4040), 10, 10, 100, 60, 0);
@@ -39765,8 +39866,8 @@ mod tests {
         b0.store.set_redirected_target(w0, Some(b0_id));
         assert_eq!(
             b0.paint_target_shape_for_tests(0x4042),
-            Some(((15, 17), None, false)),
-            "bw == 0 keeps the pre-#133 (x, y) accumulation and no clip",
+            Some(((15, 17), Some((15, 17, 20, 10)), false)),
+            "bw == 0 keeps the pre-#133 (x, y) accumulation and no border clip",
         );
     }
 
@@ -41098,6 +41199,83 @@ mod tests {
     /// (10, 20) under W; grandchild G at (3, 4) under C. Paint on
     /// G's xid resolves to `(B, (13, 24))` — the sum of the
     /// child offsets traversed.
+    /// xfce4-screensaver-preferences under xfwm4's compositor: frame F
+    /// (756x534) redirected, client C at (5,29) 746x500, GTK's bin window
+    /// V at (8,8) 730x531, all `bw == 0`. V paints into F's backing at
+    /// (13,37) and, as its Xorg clipList (`mi/mivaltree.c:390`), only
+    /// down to C's bottom edge: 500 - 8 = 492 rows, not 531 over the
+    /// frame's bottom border. The clip is no border term, so the
+    /// direct-scanout gate (`has_border_clip`) does not see it.
+    #[test]
+    fn resolve_paint_target_clips_a_child_to_its_parent_in_the_shared_backing() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        let mut b = KmsBackend::for_tests();
+        let f_id = seed_bordered_window(&mut b, 0x100, None, 902, 441, 756, 534, 0);
+        seed_bordered_window(&mut b, 0x200, Some(0x100), 5, 29, 746, 500, 0);
+        seed_bordered_window(&mut b, 0x300, Some(0x200), 8, 8, 730, 531, 0);
+        let b_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 756,
+                        height: 534,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(f_id, Some(b_id));
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x300),
+            Some(((13, 37), Some((13, 37, 730, 492)), false))
+        );
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x200),
+            Some(((5, 29), Some((5, 29, 746, 500)), false))
+        );
+        // F paints into its own backing: nothing but the backing clips it.
+        assert_eq!(
+            b.paint_target_shape_for_tests(0x100),
+            Some(((0, 0), None, false))
+        );
+    }
+
+    /// GTK scrolls that bin window by moving it: V from (8,8) to (8,-42)
+    /// in C, i.e. from backing origin (13,37) to (13,-13). Xorg's
+    /// `fbCopyWindow` fills the new borderClip from the old one
+    /// translated; both stay inside C (backing rows 29..529), so the copy
+    /// covers V's local rows 42..492 — the old visible rows 0..492 moved
+    /// up 50 and cut at C's top. Nothing lands in the title bar above
+    /// row 29, nor is anything read from below row 529.
+    #[test]
+    fn shared_backing_move_pieces_stay_inside_the_parent_at_both_ends() {
+        let rect = |x, y, width, height| ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D { width, height },
+        };
+        let outer = rect(0, 0, 730, 531);
+        let parent = Some(rect(5, 29, 746, 500));
+        assert_eq!(
+            shared_backing_move_pieces(outer, &[], &[], parent, (13, 37), (13, -13)),
+            vec![rect(0, 42, 730, 450)]
+        );
+        // Scrolling back down: the old rows 42..492 return to 0..450.
+        assert_eq!(
+            shared_backing_move_pieces(outer, &[], &[], parent, (13, -13), (13, 37)),
+            vec![rect(0, 42, 730, 450)]
+        );
+        // A parent that is the whole backing: the whole window moves.
+        assert_eq!(
+            shared_backing_move_pieces(outer, &[], &[], None, (13, 37), (13, -13)),
+            vec![outer]
+        );
+    }
+
     #[test]
     fn resolve_paint_target_descendant_accumulates_offset() {
         use crate::kms::render::store::{DrawableKind, Storage};
@@ -41123,7 +41301,12 @@ mod tests {
             .expect("backing allocate");
         b.store.set_redirected_target(w_id, Some(b_id));
         let pt = b.resolve_paint_target(0x300).expect("resolve");
-        assert_eq!(pt, PaintTarget::new(b_id, (13, 24), None, 24));
+        // Clipped to G ∩ C ∩ W, all 100x100: Xorg's clipList never leaves
+        // the parent's.
+        assert_eq!(
+            pt,
+            in_ancestor_backing(b_id, (13, 24), (13, 24, 87, 76), 24)
+        );
     }
 
     /// Top-level whose `parent == Some(root_xid)` (root isn't in
@@ -41204,11 +41387,17 @@ mod tests {
         // Top-level (parent=None production rep) must walk into
         // root's redirect with its own (x, y) accumulated.
         let pt_w = b.resolve_paint_target(0x100).expect("resolve W");
-        assert_eq!(pt_w, PaintTarget::new(backing_id, (50, 60), None, 24));
+        assert_eq!(
+            pt_w,
+            in_ancestor_backing(backing_id, (50, 60), (50, 60, 100, 100), 24)
+        );
         // Descendant of a top-level: accumulates C-in-W (3, 4)
-        // then W-in-root (50, 60) → (53, 64).
+        // then W-in-root (50, 60) → (53, 64), clipped to W.
         let pt_c = b.resolve_paint_target(0x101).expect("resolve C");
-        assert_eq!(pt_c, PaintTarget::new(backing_id, (53, 64), None, 24));
+        assert_eq!(
+            pt_c,
+            in_ancestor_backing(backing_id, (53, 64), (53, 64, 97, 96), 24)
+        );
     }
 
     /// Plan §4a (Tests, line 644-646): clearing a redirect via
@@ -41296,7 +41485,7 @@ mod tests {
         b.store.set_redirected_target(w_id, Some(bw_id));
         b.store.set_redirected_target(c_id, Some(bc_id));
         let pt = b.resolve_paint_target(0x300).expect("resolve");
-        assert_eq!(pt, PaintTarget::new(bc_id, (3, 4), None, 24));
+        assert_eq!(pt, in_ancestor_backing(bc_id, (3, 4), (3, 4, 97, 96), 24));
     }
 
     /// XOR-safe dedup contract for `IncludeInferiors` stroke collection.
@@ -41384,7 +41573,10 @@ mod tests {
         b.store.detach_xid(0x200);
 
         let pt = b.resolve_paint_target(0x200).expect("resolve");
-        assert_eq!(pt, PaintTarget::new(backing_id, (10, 20), None, 24));
+        assert_eq!(
+            pt,
+            in_ancestor_backing(backing_id, (10, 20), (10, 20, 90, 80), 24)
+        );
     }
 
     /// A depth-24 child painting into a depth-32 redirected backing must keep

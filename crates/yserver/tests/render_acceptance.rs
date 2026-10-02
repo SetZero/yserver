@@ -10672,6 +10672,115 @@ fn redirected_titlebar_copy_preserves_border() {
     }
 }
 
+/// A client window C inside its redirected frame F (an xfwm4 frame under
+/// the compositor), with a child V reaching past C's bottom as GTK's
+/// scrolled bin window does. C and V paint into F's backing, which F's
+/// own pixels share: Xorg confines each to its clipList, its rect inside
+/// its parent's (`mi/mivaltree.c:390`) minus its children for
+/// ClipByChildren, and a move copies only that (`fbCopyWindow`). Nothing
+/// outside C may change, whatever C or V draws or wherever V moves.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_frame_child_paints_stay_inside_the_child() {
+    const FRAME: u32 = 0xFF20_2020;
+    const GRAY: u32 = 0xFF3B_3B3E;
+    const BLUE: u32 = 0xFF00_00FF;
+    const ORANGE: u32 = 0xFFFF_8000;
+    const F: u32 = 0x1480;
+    const C: u32 = 0x1481;
+    const V: u32 = 0x1482;
+    const GC: u32 = 0x1483;
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let window = |f: &mut ProtoFixture, wid, parent, x, y, w, h, bg| {
+        or_create_window(
+            f,
+            wid,
+            parent,
+            32,
+            x,
+            y,
+            w,
+            h,
+            0,
+            yserver_core::resources::ARGB_VISUAL.0,
+            2 | 8 | 0x2000,
+            &[bg, 0, yserver_core::resources::ARGB_COLORMAP.0],
+        );
+        wz_map(f, wid);
+    };
+    window(&mut f, F, root, 20, 30, 200, 150, FRAME);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    window(&mut f, C, F, 5, 20, 190, 100, GRAY);
+    window(&mut f, V, C, 100, 10, 80, 120, BLUE);
+    let check = |f: &mut ProtoFixture, when: &str, expect: &[(u32, u32, u32)]| {
+        let (sw, _, pixels) = f.backing(F);
+        for &(x, y, pixel) in expect {
+            let at = ((y * sw + x) * 4) as usize;
+            assert_eq!(
+                &pixels[at..at + 4],
+                &brd_bgra(pixel),
+                "{when}: F's backing at ({x},{y})"
+            );
+        }
+    };
+    // Below C (F's own pixels), where V's 120 rows would reach.
+    check(
+        &mut f,
+        "V mapped",
+        &[(145, 135, FRAME), (145, 60, BLUE), (50, 60, GRAY)],
+    );
+
+    or_create_gc(&mut f, GC, C, ORANGE);
+    or_fill(&mut f, C, GC, -50, -50, 400, 400);
+    check(
+        &mut f,
+        "fill over C",
+        &[
+            (50, 10, FRAME),
+            (2, 60, FRAME),
+            (50, 60, ORANGE),
+            (145, 60, BLUE),
+            (145, 135, FRAME),
+        ],
+    );
+
+    let (w, h) = (230u16, 140u16);
+    let mut body = C.to_le_bytes().to_vec();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&w.to_le_bytes());
+    body.extend_from_slice(&h.to_le_bytes());
+    body.extend_from_slice(&(-20i16).to_le_bytes());
+    body.extend_from_slice(&(-20i16).to_le_bytes());
+    body.extend_from_slice(&[0, 32, 0, 0]);
+    for _ in 0..u32::from(w) * u32::from(h) {
+        body.extend_from_slice(&brd_bgra(GRAY));
+    }
+    f.req(72, 2, &body);
+    check(
+        &mut f,
+        "PutImage over C",
+        &[
+            (50, 10, FRAME),
+            (198, 60, FRAME),
+            (50, 60, GRAY),
+            (145, 60, BLUE),
+            (145, 135, FRAME),
+        ],
+    );
+
+    // Scrolled up by 50: V's old rows past C's bottom are not V's to
+    // carry, and its new rows above C's top are not V's to write.
+    wz_configure(&mut f, V, 2, &[-40]);
+    check(
+        &mut f,
+        "V moved to y=-40",
+        &[(145, 10, FRAME), (145, 25, BLUE), (145, 135, FRAME)],
+    );
+}
+
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn redirected_menu_border_change_resizes_backing() {
