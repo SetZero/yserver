@@ -8155,6 +8155,19 @@ impl KmsBackend {
             log::warn!("wayland: a client redirects the root's children; subwindows will not show");
         }
         self.wayland_redirect_refused = !redirected;
+        // The compositor manages the windows, so clients asking which
+        // window manager does are told its name; of the EWMH hints, only
+        // the title is carried over to it (`crate::wayland`'s `names`).
+        if let Err(error) =
+            yserver_core::core_loop::process_request::announce_window_manager_for_server(
+                state,
+                self,
+                "hyprix",
+                &["_NET_SUPPORTING_WM_CHECK", "_NET_WM_NAME"],
+            )
+        {
+            log::warn!("wayland: announcing the window manager: {error}");
+        }
         let Some(mut link) = self.wayland.take() else {
             return;
         };
