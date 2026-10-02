@@ -1731,6 +1731,39 @@ fn outer_rect(
     }
 }
 
+/// `window`'s bounding region in its parent's content space for the
+/// geometry given: its outer rect, cut to its bounding shape when it has
+/// one (the shape is relative to its content origin). Xorg's
+/// `borderSize` (`SetBorderSize`, `dix/window.c:1747-1770`).
+fn bounding_in_parent(
+    state: &ServerState,
+    window: ResourceId,
+    (x, y, width, height, border_width): (i16, i16, u16, u16, u16),
+) -> Vec<x11::xfixes::RegionRect> {
+    let outer = outer_rect(x, y, width, height, border_width);
+    let Some(shape) = state
+        .shape_windows
+        .get(&window)
+        .and_then(|s| s.bounding.as_ref())
+    else {
+        return vec![outer];
+    };
+    let bw = i16::try_from(border_width).unwrap_or(i16::MAX);
+    let shape =
+        crate::nested::offset_rects(shape.clone(), x.saturating_add(bw), y.saturating_add(bw));
+    crate::nested::intersect_regions(&[outer], &shape)
+}
+
+/// [`bounding_in_parent`] at the window's current geometry.
+fn current_bounding_in_parent(
+    state: &ServerState,
+    window: ResourceId,
+) -> Vec<x11::xfixes::RegionRect> {
+    state.resources.window(window).map_or_else(Vec::new, |w| {
+        bounding_in_parent(state, window, (w.x, w.y, w.width, w.height, w.border_width))
+    })
+}
+
 /// Expose what `moved` uncovered when it left `vacated` (in `parent`'s
 /// content space): Xorg's `miHandleValidateExposures` after a
 /// `ConfigureWindow`, for the case where nothing else restores those
@@ -1806,7 +1839,7 @@ fn higher_sibling_rects(state: &ServerState, window: ResourceId) -> Vec<x11::xfi
                 && state.composite_redirects.window_mode(*s)
                     != Some(crate::server::CompositeRedirectMode::Manual)
         })
-        .map(|(_, w)| outer_rect(w.x, w.y, w.width, w.height, w.border_width))
+        .flat_map(|(s, _)| current_bounding_in_parent(state, s))
         .collect()
 }
 
@@ -1833,12 +1866,12 @@ fn expose_child_share(
     if mode == Some(crate::server::CompositeRedirectMode::Manual) {
         return region;
     }
-    let outer = outer_rect(c.x, c.y, c.width, c.height, c.border_width);
-    let share = crate::nested::intersect_regions(&region, &[outer]);
+    let outer = current_bounding_in_parent(state, child);
+    let share = crate::nested::intersect_regions(&region, &outer);
     if share.is_empty() {
         return region;
     }
-    let rest = crate::nested::subtract_regions(&region, &[outer]);
+    let rest = crate::nested::subtract_regions(&region, &outer);
     if expose && mode.is_none() {
         // Into the child's content space; the border ring is not
         // repainted here.
@@ -7139,7 +7172,68 @@ fn fmt_shape_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> Strin
     s
 }
 
+/// SHAPE requests, and the exposures a viewable window's new bounding
+/// shape makes: Xorg's `miSetShape` (`mi/miwindow.c:637-677`) revalidates
+/// the tree, so what the window no longer covers is exposed beneath it
+/// and what it newly covers is exposed to it. GDK clips a native window
+/// inside a client-side one with its bounding shape and shifts that
+/// shape on every scroll; the dialog repaints its button bar below the
+/// viewport only on that Expose.
 fn handle_shape_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::shape as x11shape;
+    // Rectangles, Mask and Combine carry the destination kind at byte 1,
+    // Offset at byte 0; all four the destination window at bytes 4..8.
+    let kind_at = match header.data {
+        x11shape::RECTANGLES | x11shape::MASK | x11shape::COMBINE => Some(1),
+        x11shape::OFFSET => Some(0),
+        _ => None,
+    };
+    let reshaped = kind_at
+        .filter(|at| body.get(*at) == Some(&x11shape::KIND_BOUNDING))
+        .and_then(|_| body.get(4..8))
+        .map(|b| ResourceId(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .filter(|w| {
+            state
+                .resources
+                .window(*w)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable)
+        })
+        .and_then(|w| {
+            let parent = state.resources.window(w)?.parent;
+            // A top-level keeps its own storage, and the scene recomposites
+            // what its shape uncovers — as for a move.
+            (parent != crate::resources::ROOT_WINDOW || has_redirected_ancestor(state, w))
+                .then(|| (w, parent, current_bounding_in_parent(state, w)))
+        });
+    let outcome =
+        handle_shape_request_ops(state, backend, origin, client_id, sequence, header, body)?;
+    if let Some((window, parent, before)) = reshaped {
+        let inside = content_within_ancestors(state, parent);
+        let before = crate::nested::intersect_regions(&before, &[inside]);
+        let after =
+            crate::nested::intersect_regions(&current_bounding_in_parent(state, window), &[inside]);
+        let vacated = crate::nested::subtract_regions(&before, &after);
+        if !vacated.is_empty() {
+            expose_vacated_area(state, backend, origin, parent, window, vacated);
+        }
+        let gained = crate::nested::subtract_regions(&after, &before);
+        let gained = crate::nested::subtract_regions(&gained, &higher_sibling_rects(state, window));
+        if !gained.is_empty() {
+            let _rest = expose_child_share(state, backend, origin, window, gained, true);
+        }
+    }
+    Ok(outcome)
+}
+
+fn handle_shape_request_ops(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
@@ -24291,27 +24385,25 @@ fn handle_configure_window(
                 request.value_mask,
             );
         }
-        // What the window left behind inside a shared redirect backing.
+        // What the window left behind, exposed beneath it as Xorg's
+        // `miMoveWindow` does — inside a shared redirect backing, and for
+        // a subwindow anywhere (a top-level keeps its own storage and the
+        // scene recomposites what it uncovers).
+        let shared = has_redirected_ancestor(state, window_id);
         if viewable
             && let Some((old_x, old_y, old_w, old_h, old_bw)) = before_geom
             && let Some(parent) = parent
-            && has_redirected_ancestor(state, window_id)
+            && (shared || parent != crate::resources::ROOT_WINDOW)
         {
             // Both ends as far as the parent's clip reaches: the part of
             // the window outside it was never drawn, nor carried.
             let inside = content_within_ancestors(state, parent);
             let old_outer = crate::nested::intersect_regions(
-                &[outer_rect(old_x, old_y, old_w, old_h, old_bw)],
+                &bounding_in_parent(state, window_id, (old_x, old_y, old_w, old_h, old_bw)),
                 &[inside],
             );
             let new_outer = crate::nested::intersect_regions(
-                &[outer_rect(
-                    geometry.x,
-                    geometry.y,
-                    geometry.width,
-                    geometry.height,
-                    geometry.border_width,
-                )],
+                &current_bounding_in_parent(state, window_id),
                 &[inside],
             );
             let vacated = crate::nested::subtract_regions(&old_outer, &new_outer);
@@ -24327,8 +24419,9 @@ fn handle_configure_window(
             // the translated old `borderClip`. MATE: dragging the
             // workspace switcher under the (higher) notification area
             // left a tray-sized hole in the switcher.
-            // A resize already exposes the whole window (below).
-            if !resized {
+            // A resize already exposes the whole window (below); a window
+            // with storage of its own keeps its pixels.
+            if !resized && shared {
                 let (dx, dy) = (
                     geometry.x.saturating_sub(old_x),
                     geometry.y.saturating_sub(old_y),
@@ -81359,5 +81452,82 @@ mod tests {
         state.resources.window_mut(f).unwrap().x = 32000;
         assert_eq!(content_within_ancestors(&state, f), rect(756, 534));
         assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
+    }
+
+    /// GDK clips a native child of a client-side window with its bounding
+    /// shape and shifts the shape when it scrolls. Xorg's `miSetShape`
+    /// (`mi/miwindow.c:637-677`) then exposes what the window no longer
+    /// covers to its parent and what it newly covers to itself — the
+    /// parent's button bar is repainted only on that Expose. Measured on
+    /// Xorg 21.1 by tools/vng-scenarios/child-clip-probe.c: the shape
+    /// (0,0 170x60) of V at (10,10) becoming (0,30 170x60) exposes
+    /// P 10,10 170x30 and V 0,60 170x30.
+    #[test]
+    fn bounding_shape_change_exposes_what_it_uncovers_and_covers() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes::RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let (p, v) = (ResourceId(0x1c0_0001), ResourceId(0x1c0_0002));
+        seed_window(&mut state, p, ROOT_WINDOW, 190, 100);
+        seed_window(&mut state, v, p, 170, 120);
+        for w in [p, v] {
+            state.resources.window_mut(w).unwrap().map_state = crate::resources::MapState::Viewable;
+        }
+        let vw = state.resources.window_mut(v).unwrap();
+        (vw.x, vw.y) = (10, 10);
+        crate::nested::set_shape_rects(
+            &mut state,
+            v,
+            x11shape::KIND_BOUNDING,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 170,
+                height: 60,
+            }],
+        );
+        let client = state.clients.get_mut(&1).unwrap();
+        client.event_masks.insert(p, 0x0000_8000);
+        client.event_masks.insert(v, 0x0000_8000);
+
+        // RECTANGLES body: op kind ordering pad dest(4) x_off(2) y_off(2) rects.
+        let mut body = vec![x11shape::OP_SET, x11shape::KIND_BOUNDING, 0, 0];
+        body.extend_from_slice(&v.0.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        for field in [0u16, 30, 170, 60] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 129,
+            data: x11shape::RECTANGLES,
+            length_units: 6,
+        };
+        handle_shape_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("ShapeRectangles");
+
+        let exposes: Vec<(u32, [u16; 4])> = read_all_available(&mut peer)
+            .chunks_exact(32)
+            .filter(|e| e[0] & 0x7f == 12)
+            .map(|e| {
+                let at = |i: usize| u16::from_le_bytes([e[i], e[i + 1]]);
+                (
+                    u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+                    [at(8), at(10), at(12), at(14)],
+                )
+            })
+            .collect();
+        assert_eq!(
+            exposes,
+            vec![(p.0, [10, 10, 170, 30]), (v.0, [0, 60, 170, 30])]
+        );
     }
 }
