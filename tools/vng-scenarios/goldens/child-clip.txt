@@ -368,3 +368,51 @@ VG: reshaped, then scrolled back down 30, Expose handled
   y=40:  0-0 frame 5-10 gray 15-180 blue 185-190 gray 195-195 frame
   y=105: 0-0 frame 5-190 yellow 195-195 frame
   damage covers every change
+==> xembed-direct.log <==
+mapped, viewport at the top
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+scrolled down 81, before Expose
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+  damage covers every change
+  Expose C 8,377 730x81 count 0
+  Expose C 8,0 730x8 count 0
+scrolled down 81, Expose handled
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+  damage covers every change
+scrolled back to the top, before Expose
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-528 gray 531-531 frame
+  y=509: 0-4 frame 8-748 gray 752-752 frame
+  damage covers every change
+  Expose C 8,8 730x81 count 0
+  Expose C 8,458 730x42 count 0
+scrolled back to the top, Expose handled
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+  damage covers every change
+==> xembed.log <==
+mapped, viewport at the top
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+scrolled down 81, before Expose
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+  damage covers every change
+  Expose C 8,377 730x81 count 0
+  Expose C 8,0 730x8 count 0
+scrolled down 81, Expose handled
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+  damage covers every change
+scrolled back to the top, before Expose
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-528 gray 531-531 frame
+  y=509: 0-4 frame 8-748 gray 752-752 frame
+  damage covers every change
+  Expose C 8,8 730x81 count 0
+  Expose C 8,458 730x42 count 0
+scrolled back to the top, Expose handled
+  x=400: 0-27 frame 30-36 gray 39-486 000000 489-492 gray 495-528 yellow 531-531 frame
+  y=509: 0-4 frame 8-12 gray 16-740 yellow 744-748 gray 752-752 frame
+  damage covers every change
