@@ -7,20 +7,21 @@
  *
  * F is the frame (depth 32, 200x150) with three children: the title bar
  * T (0,0 200x20), the client C (5,20 190x100) and the button bar B
- * (0,125 200x25). C has a child V (100,10 80x120) that reaches past C's
- * bottom, as GTK's scrolled bin window does. In `redirect` the probe is
+ * (0,125 200x25), and above them H (130,15 30x20) overlapping C's top
+ * edge. C has a child V (100,10 80x120) that reaches past C's bottom, as
+ * GTK's scrolled bin window does. In `redirect` the probe is
  * its own compositor (RedirectSubwindows(root, Manual)) and reads F's
  * backing (NameWindowPixmap); in `direct` it reads F on screen, through
  * the root window (F sits at the root's origin).
  *
  * Each stage resets every window to its background, draws into C or V
  * with rects that reach past C's bounds or moves V, and logs F along
- * columns x=50 (C only) and x=145 (through V) and rows y=10 (T), y=25,
- * y=60 and y=137 (B), run-length encoded in F's coordinates, plus the
- * GraphicsExpose and NoExpose events a CopyArea produced. Nothing
- * outside C may change.
+ * columns x=50 (C only) and x=145 (through H and V) and rows y=10 (T),
+ * y=25 (H), y=60 and y=137 (B), run-length encoded in F's coordinates,
+ * plus the GraphicsExpose and NoExpose events a CopyArea produced.
+ * Nothing outside C, or under H, may change.
  *
- *   cc -O1 -o probe child-clip-probe.c -lxcb -lxcb-composite -lxcb-render -lxcb-shm
+ *   cc -O1 -o probe child-clip-probe.c -lxcb -lxcb-composite -lxcb-render -lxcb-shape -lxcb-shm
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@
 #include <unistd.h>
 #include <xcb/composite.h>
 #include <xcb/render.h>
+#include <xcb/shape.h>
 #include <xcb/shm.h>
 #include <xcb/xcb.h>
 
@@ -40,6 +42,8 @@
 #define MAGENTA 0xff00ffu
 #define RED 0xff0000u
 #define ORANGE 0xff8000u
+#define YELLOW 0xffff00u
+#define CYAN 0x00ffffu
 
 #define FW 200
 #define FH 150
@@ -49,7 +53,8 @@ static xcb_screen_t *s;
 static xcb_visualid_t vis32;
 static xcb_colormap_t cmap32;
 static xcb_render_pictformat_t fmt32;
-static xcb_window_t f, t, cw, b, v;
+static xcb_window_t f, t, cw, b, h, v;
+static xcb_window_t g, cg, vg;
 static int redirect;
 
 static void sync_server(void)
@@ -68,6 +73,8 @@ static const char *colour(uint32_t px)
     case MAGENTA: return "magenta";
     case RED: return "red";
     case ORANGE: return "orange";
+    case YELLOW: return "yellow";
+    case CYAN: return "cyan";
     }
     snprintf(hex, sizeof hex, "%06x", px);
     return hex;
@@ -92,6 +99,9 @@ static void runs(const uint32_t *img, int x0, int y0, int dx, int dy, int n)
     }
 }
 
+static void paint_cg(int x, int y, int w, int h);
+static void paint_vg(int x, int y, int w, int h);
+
 static void events(void)
 {
     xcb_generic_event_t *e;
@@ -106,9 +116,39 @@ static void events(void)
         case XCB_NO_EXPOSURE:
             printf("  NoExpose\n");
             break;
+        case XCB_EXPOSE: {
+            xcb_expose_event_t *x = (xcb_expose_event_t *)e;
+            if (x->window == cg || x->window == vg)
+                printf("  Expose %s %d,%d %ux%u count %u\n", x->window == cg ? "CG" : "VG", x->x,
+                       x->y, x->width, x->height, x->count);
+            if (x->window == cg)
+                paint_cg(x->x, x->y, x->width, x->height);
+            else if (x->window == vg)
+                paint_vg(x->x, x->y, x->width, x->height);
+            break;
+        }
         }
         free(e);
     }
+}
+
+static xcb_get_image_reply_t *read_frame(xcb_window_t frame, int root_y)
+{
+    xcb_drawable_t d = s->root;
+    xcb_pixmap_t p = XCB_NONE;
+    if (!redirect)
+        usleep(150000); /* the root reads the last composited frame */
+    if (redirect) {
+        p = xcb_generate_id(c);
+        xcb_composite_name_window_pixmap(c, frame, p);
+        d = p;
+        root_y = 0;
+    }
+    xcb_get_image_reply_t *r = xcb_get_image_reply(
+        c, xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, d, 0, root_y, FW, FH, ~0u), NULL);
+    if (p)
+        xcb_free_pixmap(c, p);
+    return r;
 }
 
 static void report(const char *when)
@@ -189,7 +229,7 @@ static void reset(void)
 {
     uint32_t y = 10;
     xcb_configure_window(c, v, XCB_CONFIG_WINDOW_Y, &y);
-    xcb_window_t all[] = {f, t, cw, b, v};
+    xcb_window_t all[] = {f, t, cw, b, h, v};
     for (unsigned i = 0; i < sizeof all / sizeof all[0]; i++)
         xcb_clear_area(c, 0, all[i], 0, 0, 0, 0);
     sync_server();
@@ -239,6 +279,86 @@ static void gc_clip_fill(uint32_t mode, int x, int y, int w, int h)
     xcb_free_gc(c, g);
 }
 
+/* GTK's scrolled viewport as a native window, as xfce4-screensaver-
+ * preferences has it: VG, taller than its client CG, is clipped to the
+ * viewport by a bounding shape (GDK clips a native child of a
+ * client-side window that way) and scrolled by moving it and shifting
+ * the shape. CG paints its own button bar below the viewport, and both
+ * repaint whatever they are sent Expose for. G sits below F on the root. */
+#define GY 200
+
+/* `w` filled with `bg`, and `fg` over its part of the band. */
+static void paint_with_band(xcb_window_t w, uint32_t bg, uint32_t fg, xcb_rectangle_t band, int x,
+                            int y, int ww, int hh)
+{
+    xcb_gcontext_t gbg = gc(w, bg, XCB_SUBWINDOW_MODE_CLIP_BY_CHILDREN);
+    xcb_rectangle_t r = {x, y, ww, hh};
+    xcb_poly_fill_rectangle(c, w, gbg, 1, &r);
+    xcb_free_gc(c, gbg);
+    int x0 = x > band.x ? x : band.x, y0 = y > band.y ? y : band.y;
+    int x1 = x + ww < band.x + band.width ? x + ww : band.x + band.width;
+    int y1 = y + hh < band.y + band.height ? y + hh : band.y + band.height;
+    if (x1 > x0 && y1 > y0) {
+        xcb_gcontext_t gfg = gc(w, fg, XCB_SUBWINDOW_MODE_CLIP_BY_CHILDREN);
+        xcb_rectangle_t in = {x0, y0, x1 - x0, y1 - y0};
+        xcb_poly_fill_rectangle(c, w, gfg, 1, &in);
+        xcb_free_gc(c, gfg);
+    }
+}
+
+static void paint_cg(int x, int y, int w, int h)
+{
+    paint_with_band(cg, GRAY, YELLOW, (xcb_rectangle_t){0, 75, 190, 20}, x, y, w, h);
+}
+
+static void paint_vg(int x, int y, int w, int h)
+{
+    paint_with_band(vg, BLUE, RED, (xcb_rectangle_t){0, 40, 170, 10}, x, y, w, h);
+}
+
+static void viewport_shape(int top)
+{
+    xcb_rectangle_t r = {0, top, 170, 60};
+    xcb_shape_rectangles(c, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING, XCB_CLIP_ORDERING_UNSORTED,
+                         vg, 0, 0, 1, &r);
+}
+
+static void report_g(const char *when)
+{
+    sync_server();
+    xcb_get_image_reply_t *r = read_frame(g, GY);
+    printf("%s\n", when);
+    if (!r) {
+        printf("  GetImage failed\n");
+        return;
+    }
+    const uint32_t *img = (const uint32_t *)xcb_get_image_data(r);
+    printf("  x=100:");
+    runs(img, 100, 0, 0, 5, FH / 5);
+    printf("\n  y=40: ");
+    runs(img, 0, 40, 5, 0, FW / 5);
+    printf("\n  y=105:");
+    runs(img, 0, 105, 5, 0, FW / 5);
+    printf("\n");
+    free(r);
+    events();
+    fflush(stdout);
+}
+
+static void scroll_viewport(int y, const char *when)
+{
+    char line[96];
+    uint32_t v32 = (uint32_t)y;
+    xcb_configure_window(c, vg, XCB_CONFIG_WINDOW_Y, &v32);
+    viewport_shape(10 - y);
+    snprintf(line, sizeof line, "VG: %s", when);
+    report_g(line);
+    sync_server();
+    usleep(100000);
+    snprintf(line, sizeof line, "VG: %s, Expose handled", when);
+    report_g(line);
+}
+
 int main(int argc, char **argv)
 {
     redirect = argc > 1 && !strcmp(argv[1], "redirect");
@@ -263,6 +383,7 @@ int main(int argc, char **argv)
     t = window(f, 0, 0, 200, 20, MAGENTA);
     cw = window(f, 5, 20, 190, 100, GRAY);
     b = window(f, 0, 125, 200, 25, GREEN);
+    h = window(f, 130, 15, 30, 20, CYAN);
     v = window(cw, 100, 10, 80, 120, BLUE);
     sync_server();
     usleep(300000);
@@ -385,6 +506,21 @@ int main(int argc, char **argv)
         xcb_free_gc(c, red);
         xcb_free_gc(c, cp);
     }
+
+    g = window(s->root, 0, GY, FW, FH, FRAME);
+    cg = window(g, 5, 20, 190, 100, GRAY);
+    vg = window(cg, 10, 10, 170, 120, BLUE);
+    viewport_shape(0);
+    sync_server();
+    usleep(200000);
+    paint_cg(0, 0, 190, 100);
+    paint_vg(0, 0, 170, 120);
+    uint32_t exposure = XCB_EVENT_MASK_EXPOSURE;
+    xcb_change_window_attributes(c, cg, XCB_CW_EVENT_MASK, &exposure);
+    xcb_change_window_attributes(c, vg, XCB_CW_EVENT_MASK, &exposure);
+    report_g("VG: viewport shaped to its top 60 rows, CG's buttons below it");
+    scroll_viewport(-20, "scrolled up 30");
+    scroll_viewport(10, "scrolled back down 30");
 
     FILE *done = fopen("PROBE-DONE", "w");
     if (done)
