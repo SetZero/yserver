@@ -18415,26 +18415,30 @@ impl crate::wayland::WindowImages for KmsBackend {
             .map(|drawable| drawable.content_version)
     }
 
-    fn read_image(
+    fn read_image_into(
         &mut self,
         host_xid: u32,
         width: u16,
         height: u16,
         border: u16,
-    ) -> Option<Vec<u8>> {
-        let target = self.resolve_paint_target(host_xid)?;
+        out: &mut [u8],
+    ) -> bool {
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return false;
+        };
         let depth = target.x11_depth();
         if depth != 24 && depth != 32 {
-            return None;
+            return false;
         }
-        // The content, and `border` pixels of the border around it:
-        // `get_image`'s rectangle at the window's own origin, less the
-        // border, which the backing holds around the content.
         let border = u32::from(border);
         let (width, height) = (
             u32::from(width) + 2 * border,
             u32::from(height) + 2 * border,
         );
+        let stride = width as usize * 4;
+        if out.len() < stride * height as usize {
+            return false;
+        }
         let inset = i32::try_from(border).unwrap_or(0);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
@@ -18443,24 +18447,46 @@ impl crate::wayland::WindowImages for KmsBackend {
             },
             extent: ash::vk::Extent2D { width, height },
         };
-        let readback = self.engine.get_image(
+        // Storage at depth 24 and 32 is BGRA8, which is the compositor's
+        // buffer's own layout: rows copied as they are. Short only while a
+        // resize is under way, when what the backing lacks is black.
+        let readback = self.engine.get_image_with(
             &mut self.store,
             &mut self.platform,
             target.src_including_border(),
             rect,
             depth,
+            |raw, copy_w, copy_h| {
+                let row = (copy_w as usize * 4).min(stride);
+                if copy_w as usize * 4 == stride && copy_h == height {
+                    out[..raw.len()].copy_from_slice(raw);
+                    return Ok(());
+                }
+                for (y, to) in out
+                    .chunks_exact_mut(stride)
+                    .take(height as usize)
+                    .enumerate()
+                {
+                    match raw
+                        .get(y * copy_w as usize * 4..)
+                        .and_then(|from| from.get(..row))
+                    {
+                        Some(from) if y < copy_h as usize => {
+                            to[..row].copy_from_slice(from);
+                            to[row..].fill(0);
+                        }
+                        _ => to.fill(0),
+                    }
+                }
+                Ok(())
+            },
         );
         self.drain_frame_builder_telemetry();
         match readback {
-            Ok(mut bytes) => {
-                // Short only while a resize is under way: pad, as
-                // `get_image` does, so the rows stay where they belong.
-                bytes.resize(width as usize * height as usize * 4, 0);
-                Some(bytes)
-            }
+            Ok(()) => true,
             Err(error) => {
                 log::warn!("wayland: reading window 0x{host_xid:x} back: {error:?}");
-                None
+                false
             }
         }
     }

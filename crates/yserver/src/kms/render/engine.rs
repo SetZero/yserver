@@ -742,6 +742,9 @@ pub(crate) struct StagingBuffer {
     /// vkCreateBuffer/vkAllocateMemory churn, which is costly on NVIDIA. Remove
     /// with the rest of this investigation if the pool doesn't pan out.
     from_pool: bool,
+    /// Made by [`StagingBuffer::new_for_readback`]: kept as the engine's
+    /// spare readback buffer at retire rather than destroyed.
+    for_readback: bool,
 }
 
 impl std::fmt::Debug for StagingBuffer {
@@ -862,6 +865,7 @@ impl StagingBuffer {
             size,
             coherent,
             from_pool: false,
+            for_readback: readback,
         })
     }
 
@@ -1102,6 +1106,10 @@ struct RenderEngineInner {
     /// `put_image`, to avoid per-upload vkCreateBuffer/vkAllocateMemory churn
     /// (costly on NVIDIA). See [`StagingPool`].
     staging_pool: StagingPool,
+    /// The last `get_image` readback buffer, retired and free: a window
+    /// read back every frame (the Wayland backend's) would otherwise make
+    /// and destroy one the size of the window each time.
+    readback_spare: Option<StagingBuffer>,
     /// Stage 3b: per-picture GPU-side state. Today only carries
     /// gradient `GradientPicture` instances built lazily by Stage
     /// 3c's first `render_composite`; Stage 3b just ensures
@@ -1768,6 +1776,7 @@ impl RenderEngine {
                 vk,
                 submitted: VecDeque::new(),
                 staging_pool: StagingPool::default(),
+                readback_spare: None,
                 picture_paint: HashMap::new(),
                 glyph_atlas: None,
                 text_pipelines: HashMap::new(),
@@ -1844,8 +1853,18 @@ impl RenderEngine {
             }
             // staging drops at end of scope → destroys Vk handles. (Frame-
             // builder put_image staging lives in the frame pin-set, not here;
-            // it's pooled at the pending_frames retire below.)
-            drop(op.staging.take());
+            // it's pooled at the pending_frames retire below.) A readback
+            // buffer is kept as the spare instead, the larger of the two.
+            if let Some(arc) = op.staging.take()
+                && let Ok(buf) = Arc::try_unwrap(arc)
+                && buf.for_readback
+                && inner
+                    .readback_spare
+                    .as_ref()
+                    .is_none_or(|spare| spare.size <= buf.size)
+            {
+                inner.readback_spare = Some(buf);
+            }
             // Phase B.2 Mechanism 3: release retired BatchResources
             // attached via adopt_retired_resource_for_gpu_retirement
             // case (b). BatchResource::release is explicit (no Drop);
@@ -5517,6 +5536,26 @@ impl RenderEngine {
         rect: vk::Rect2D,
         out_depth: u8,
     ) -> Result<Vec<u8>, RenderError> {
+        self.get_image_with(store, platform, src_handle, rect, out_depth, |raw, w, h| {
+            pack_from_storage(raw, w, h, out_depth)
+        })
+    }
+
+    /// [`Self::get_image`], with the storage bytes handed to `consume`
+    /// where they lie in the mapped readback buffer -- tightly packed
+    /// `copy_w` × `copy_h` texels of the storage format, and empty for an
+    /// empty rectangle -- rather than packed into a new `Vec`: for a
+    /// caller that copies them where they are wanted itself, as the
+    /// Wayland backend copies a window into its compositor's buffer.
+    pub(crate) fn get_image_with<R>(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        src_handle: Src,
+        rect: vk::Rect2D,
+        out_depth: u8,
+        consume: impl FnOnce(&[u8], u32, u32) -> Result<R, RenderError>,
+    ) -> Result<R, RenderError> {
         let src = src_handle.id();
         // get_image is a synchronous CPU readback — must see all
         // prior submits including any pending COW batch.
@@ -5573,17 +5612,17 @@ impl RenderEngine {
         let copy_w = clipped.extent.width;
         let copy_h = clipped.extent.height;
         if copy_w == 0 || copy_h == 0 {
-            return Ok(Vec::new());
+            return consume(&[], 0, 0);
         }
         let staging_size = u64::from(copy_w) * u64::from(copy_h) * u64::from(storage_bpp);
         // Readback staging: HOST_CACHED-preferred so the CPU pack below reads
         // at cached-RAM speed. Plain HOST_COHERENT is write-combined on
         // discrete GPUs and made this pack 50–90ms for a full-screen read
         // (project_cinnamon_nvidia_chop_shm_getimage).
-        let staging = Arc::new(StagingBuffer::new_for_readback(
-            inner.vk.clone(),
-            staging_size.max(1),
-        )?);
+        let staging = Arc::new(match inner.readback_spare.take() {
+            Some(spare) if spare.size >= staging_size => spare,
+            _ => StagingBuffer::new_for_readback(inner.vk.clone(), staging_size.max(1))?,
+        });
 
         let (cb, ticket) = begin_op_cb(inner, platform)?;
         let device = &inner.vk.device;
@@ -5674,7 +5713,7 @@ impl RenderEngine {
         // the fence above signalled so the GPU has completed all writes, and
         // invalidate_for_read made those writes visible to the CPU.
         let raw: &[u8] = unsafe { std::slice::from_raw_parts(staging.mapped.as_ptr(), raw_size) };
-        let out = pack_from_storage(raw, copy_w, copy_h, out_depth)?;
+        let out = consume(raw, copy_w, copy_h);
         let t_after_pack = std::time::Instant::now();
 
         // Carry the phase split out on EVERY call (the slow-tail log below
@@ -5748,7 +5787,7 @@ impl RenderEngine {
             retired_resources: Vec::new(),
         });
 
-        Ok(out)
+        out
     }
 
     // ── Op: image_text (Stage 3a) ───────────────────────────────

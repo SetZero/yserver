@@ -80,7 +80,7 @@ use std::{
     time::Duration,
 };
 
-use compositor_toolkit::{Client, Event, SurfaceId, ToplevelOptions, tiny_skia::PixmapMut};
+use compositor_toolkit::{Client, Event, SurfaceId, ToplevelOptions};
 use yserver_core::{
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, ROOT_WINDOW, Window, WindowClass},
     server::ServerState,
@@ -123,15 +123,17 @@ pub trait WindowImages {
 
     /// The window's image, its `width` × `height` content with `border`
     /// pixels of its border around it (0 for none), each four bytes in
-    /// memory order B, G, R and alpha (unused below depth 32): an X
-    /// `ZPixmap` at 32 bits per pixel.
-    fn read_image(
+    /// memory order B, G, R and alpha (unused below depth 32) -- an X
+    /// `ZPixmap` at 32 bits per pixel -- read into `out`, which holds at
+    /// least that many bytes; whether it was read.
+    fn read_image_into(
         &mut self,
         host_xid: u32,
         width: u16,
         height: u16,
         border: u16,
-    ) -> Option<Vec<u8>>;
+        out: &mut [u8],
+    ) -> bool;
 }
 
 /// Where a window of the compositor's is in drawing it: the frame callback
@@ -144,6 +146,9 @@ struct Frames {
     shown: Option<u64>,
     /// The compositor configured it since it was last drawn.
     configured: bool,
+    /// A hash of each row of the image last handed over, which the next
+    /// is compared with to say which rows changed.
+    rows: Vec<u64>,
 }
 
 /// A top-level X window as the compositor's window.
@@ -533,6 +538,13 @@ impl WaylandLink {
 /// override-redirect window, whose border X shows as its own since no
 /// window manager draws one. A top-level's border is not shown, as a window
 /// manager's frame would take its place.
+///
+/// The image is read straight into the compositor's buffer -- X's 32-bit
+/// `ZPixmap` is `wl_shm`'s layout, `XRGB8888` below depth 32 and
+/// premultiplied `ARGB8888` at it -- and the compositor is told only the
+/// band of rows that differ from the image before, found by a hash of each
+/// row ([`Frames::rows`]): what X drew is not needed for that, so no
+/// drawing path can be missed.
 fn show(
     client: &mut Client,
     images: &mut dyn WindowImages,
@@ -553,13 +565,41 @@ fn show(
         window.width.saturating_add(border.saturating_mul(2)),
         window.height.saturating_add(border.saturating_mul(2)),
     );
-    let Some(pixels) = images.read_image(host_xid, window.width, window.height, border) else {
-        return;
-    };
     let opaque = window.depth != 32;
     let size = (u32::from(width), u32::from(height));
-    match client.draw_sized(surface, size, |pixmap| {
-        blit(pixmap, &pixels, width, height, opaque);
+    // Whether the compositor has this size's image already: a configure
+    // since, or a first frame, or another size, is all of it changed.
+    let whole =
+        frames.configured || frames.shown.is_none() || frames.rows.len() != usize::from(height);
+    let rows = &mut frames.rows;
+    match client.draw_pixels(surface, size, opaque, |out| {
+        if !images.read_image_into(host_xid, window.width, window.height, border, out) {
+            return None;
+        }
+        let stride = usize::from(width) * 4;
+        let hashes = out
+            .chunks_exact(stride)
+            .take(usize::from(height))
+            .map(row_hash);
+        let mut band: Option<(u32, u32)> = None;
+        let mut damage = Vec::new();
+        if whole {
+            rows.clear();
+            rows.extend(hashes);
+        } else {
+            for (y, hash) in hashes.enumerate() {
+                if rows[y] != hash {
+                    rows[y] = hash;
+                    let y = y as u32;
+                    band = Some(band.map_or((y, y), |(first, _)| (first, y)));
+                }
+            }
+            // Nothing changed that shows: a version moved by a draw that
+            // drew the same pixels. One row keeps the commit meaningful.
+            let (first, last) = band.unwrap_or((0, 0));
+            damage.push((0, first, size.0, last - first + 1));
+        }
+        Some(damage)
     }) {
         Ok(true) => {
             client.request_frame(surface);
@@ -570,6 +610,21 @@ fn show(
         Ok(false) => {}
         Err(error) => log::warn!("wayland: drawing 0x{host_xid:x}: {error}"),
     }
+}
+
+/// A row's hash, for [`show`]'s comparison with the image before: FxHash's
+/// step over its 8-byte words, which is as fast as reading them.
+fn row_hash(row: &[u8]) -> u64 {
+    let mut hash: u64 = 0;
+    let mut words = row.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    for &byte in words.remainder() {
+        hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    hash
 }
 
 /// Whether a child of the root is shown as a window of the compositor's:
@@ -690,74 +745,9 @@ fn latin1(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Copy an X image (B, G, R, alpha at 32 bits per pixel, `width` ×
-/// `height`) to the top left of the compositor's buffer, which is
-/// tiny-skia's premultiplied R, G, B, alpha, over opaque black. An `opaque`
-/// image, below depth 32, has no alpha of its own.
-fn blit(pixmap: &mut PixmapMut<'_>, pixels: &[u8], width: u16, height: u16, opaque: bool) {
-    let buffer_width = pixmap.width() as usize;
-    let buffer_height = pixmap.height() as usize;
-    let data = pixmap.data_mut();
-    for pixel in data.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&[0, 0, 0, 0xff]);
-    }
-    let stride = usize::from(width) * 4;
-    let columns = usize::from(width).min(buffer_width);
-    let rows = usize::from(height).min(buffer_height);
-    for row in 0..rows {
-        let (Some(from), Some(to)) = (
-            pixels.get(row * stride..row * stride + columns * 4),
-            data.get_mut(row * buffer_width * 4..(row * buffer_width + columns) * 4),
-        ) else {
-            break;
-        };
-        for (from, to) in from.chunks_exact(4).zip(to.chunks_exact_mut(4)) {
-            to[0] = from[2];
-            to[1] = from[1];
-            to[2] = from[0];
-            to[3] = if opaque { 0xff } else { from[3] };
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn blit_swaps_red_and_blue_and_pads_with_black() {
-        // A 2x1 X image: blue, then half-transparent red.
-        let pixels = [0xff, 0, 0, 0, 0, 0, 0x80, 0x80];
-        let mut bytes = vec![0x55; 3 * 2 * 4];
-        let mut pixmap = PixmapMut::from_bytes(&mut bytes, 3, 2).expect("a 3x2 pixmap");
-        blit(&mut pixmap, &pixels, 2, 1, true);
-        assert_eq!(&bytes[0..4], &[0, 0, 0xff, 0xff], "blue, opaque");
-        assert_eq!(&bytes[4..8], &[0x80, 0, 0, 0xff], "red, alpha ignored");
-        assert_eq!(&bytes[8..12], &[0, 0, 0, 0xff], "past the image: black");
-        assert_eq!(&bytes[12..16], &[0, 0, 0, 0xff], "the next row: black");
-
-        let mut bytes = vec![0; 2 * 4];
-        let mut pixmap = PixmapMut::from_bytes(&mut bytes, 2, 1).expect("a 2x1 pixmap");
-        blit(&mut pixmap, &pixels, 2, 1, false);
-        assert_eq!(
-            &bytes[4..8],
-            &[0x80, 0, 0, 0x80],
-            "depth 32 keeps its alpha"
-        );
-    }
-
-    #[test]
-    fn blit_clips_an_image_larger_than_the_buffer() {
-        let pixels = [0x10; 4 * 4 * 4];
-        let mut bytes = vec![0; 2 * 2 * 4];
-        let mut pixmap = PixmapMut::from_bytes(&mut bytes, 2, 2).expect("a 2x2 pixmap");
-        blit(&mut pixmap, &pixels, 4, 4, true);
-        assert!(
-            bytes
-                .chunks_exact(4)
-                .all(|pixel| pixel == [0x10, 0x10, 0x10, 0xff])
-        );
-    }
 
     #[test]
     fn the_class_is_the_second_string_or_the_only_one() {
@@ -782,7 +772,11 @@ mod tests {
         assert_eq!(fixed.min, (640, 480));
         assert_eq!(fixed.max, (640, 480));
         let least = size_limits(&hints(0x10, (200, 100), (900, 900)));
-        assert_eq!((least.min, least.max), ((200, 100), (0, 0)), "PMaxSize unset");
+        assert_eq!(
+            (least.min, least.max),
+            ((200, 100), (0, 0)),
+            "PMaxSize unset"
+        );
         assert_eq!(
             size_limits(&hints(0x0c, (1, 1), (2, 2))),
             SizeLimits::default(),
@@ -790,7 +784,11 @@ mod tests {
         );
         let negative = size_limits(&hints(0x30, (u32::MAX, 10), (640, 480)));
         assert_eq!(negative.min, (0, 10), "a negative size is no limit");
-        assert_eq!(size_limits(&[0x30, 0, 0, 0]), SizeLimits::default(), "cut short");
+        assert_eq!(
+            size_limits(&[0x30, 0, 0, 0]),
+            SizeLimits::default(),
+            "cut short"
+        );
         assert_eq!(size_limits(&[]), SizeLimits::default());
     }
 
