@@ -1046,6 +1046,24 @@ pub enum ServerSelectionEvent {
     },
 }
 
+/// A window manager request a client sent the root, which a server that
+/// is itself the window manager carries out ([`ServerState::server_wm_requests`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerWmRequest {
+    /// `_NET_WM_MOVERESIZE` (EWMH 1.5): the client was pressed on its own
+    /// title bar or edge and hands the drag to the window manager.
+    MoveResize {
+        /// The client's window.
+        window: ResourceId,
+        /// What to do: 0 to 7 a resize by the edge or corner clockwise
+        /// from the top left, 8 a move, 9 and 10 the same by the keyboard,
+        /// 11 cancel.
+        direction: u32,
+        /// The button pressed, or 0 for whichever.
+        button: u32,
+    },
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -1100,6 +1118,12 @@ pub struct ServerState {
     /// here for the backend to take (`core_loop::process_request`'s
     /// `convert_selection_for_server` and its siblings).
     pub server_selection_events: Vec<ServerSelectionEvent>,
+    /// Window manager requests clients sent the root while the server says
+    /// it is the window manager and lists the request in `_NET_SUPPORTED`
+    /// (`core_loop::process_request`'s `announce_window_manager_for_server`),
+    /// for the backend that carries them out to take: a rootless server
+    /// whose windows another display system manages.
+    pub server_wm_requests: Vec<ServerWmRequest>,
     /// Last known pointer position in root coordinates, cached from the
     /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
     /// `xXIEnterEvent` layout and carry the pointer position) are emitted
@@ -1646,6 +1670,7 @@ impl ServerState {
             xkb_interests: HashMap::new(),
             selections: HashMap::new(),
             server_selection_events: Vec::new(),
+            server_wm_requests: Vec::new(),
             pointer_root: (0, 0),
             active_pointer_grab: None,
             button_grabs: Vec::new(),

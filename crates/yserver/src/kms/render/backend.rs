@@ -8904,14 +8904,20 @@ impl KmsBackend {
         }
         self.wayland_redirect_refused = !redirected;
         // The compositor manages the windows, so clients asking which
-        // window manager does are told its name; of the EWMH hints, only
-        // the title is carried over to it (`crate::wayland`'s `names`).
+        // window manager does are told its name; of the EWMH hints, the
+        // title is carried over to it (`crate::wayland`'s `names`), and a
+        // drag by a window's own title bar or edge
+        // (`WaylandLink::wm_request`).
         if let Err(error) =
             yserver_core::core_loop::process_request::announce_window_manager_for_server(
                 state,
                 self,
                 "hyprix",
-                &["_NET_SUPPORTING_WM_CHECK", "_NET_WM_NAME"],
+                &[
+                    "_NET_SUPPORTING_WM_CHECK",
+                    "_NET_WM_NAME",
+                    "_NET_WM_MOVERESIZE",
+                ],
             )
         {
             log::warn!("wayland: announcing the window manager: {error}");
@@ -8920,6 +8926,9 @@ impl KmsBackend {
             return;
         };
         link.sync(state, self);
+        for request in std::mem::take(&mut state.server_wm_requests) {
+            link.wm_request(state, request);
+        }
         link.sync_cursor(self);
         let requests = link.take_requests();
         link.sync_clipboard(state, self);

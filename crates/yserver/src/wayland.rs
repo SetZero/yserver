@@ -83,7 +83,7 @@ use std::{
 use compositor_toolkit::{Client, Event, SurfaceId, ToplevelOptions};
 use yserver_core::{
     resources::{COMPOSITE_OVERLAY_WINDOW, MapState, ROOT_WINDOW, Window, WindowClass},
-    server::ServerState,
+    server::{ServerState, ServerWmRequest},
 };
 use yserver_protocol::x11::{AtomId, ResourceId};
 
@@ -391,6 +391,46 @@ impl WaylandLink {
         }
     }
 
+    /// Carry out a window manager request a client sent the root: a press
+    /// on a window's own title bar or edge, `_NET_WM_MOVERESIZE`, becomes
+    /// the compositor's drag of its window (`xdg_toplevel.move` or
+    /// `resize`), from the last press the compositor sent. The keyboard
+    /// forms and a cancel have nothing to become: the compositor's drag
+    /// follows the pointer and ends with the button.
+    pub fn wm_request(&mut self, state: &ServerState, request: ServerWmRequest) {
+        let ServerWmRequest::MoveResize {
+            window, direction, ..
+        } = request;
+        let Some(edges) = xdg_edges(direction) else {
+            log::debug!(
+                "wayland: _NET_WM_MOVERESIZE {direction} of 0x{:x} not carried out",
+                window.0
+            );
+            return;
+        };
+        // The window itself, or the top-level it is inside.
+        let mut current = window;
+        let surface = loop {
+            if let Some(toplevel) = self
+                .toplevels
+                .values()
+                .find(|toplevel| toplevel.window == current)
+            {
+                break toplevel.surface;
+            }
+            match state.resources.parent_of(current) {
+                Some(parent) if parent != current && parent != ROOT_WINDOW => current = parent,
+                _ => return,
+            }
+        };
+        log::info!(
+            "wayland: window 0x{:x} asks to be {} by the pointer",
+            window.0,
+            if edges == 0 { "moved" } else { "resized" }
+        );
+        self.client.drag_window(surface, edges);
+    }
+
     /// What the compositor asked since the last call, for the server to
     /// carry out.
     pub fn take_requests(&mut self) -> Vec<Request> {
@@ -645,6 +685,25 @@ fn row_hash(row: &[u8]) -> u64 {
 /// Whether a child of the root is shown as a window of the compositor's:
 /// viewable, drawing, and not override-redirect (a menu or a tooltip, which
 /// becomes a popup in a later slice).
+/// The `xdg_toplevel.resize_edge` for a `_NET_WM_MOVERESIZE` direction: 0
+/// (`NONE`) for a move, `None` for one that is not a drag by the pointer.
+/// EWMH numbers the edges clockwise from the top left; xdg-shell's are bits,
+/// top 1, bottom 2, left 4, right 8.
+fn xdg_edges(direction: u32) -> Option<u32> {
+    Some(match direction {
+        0 => 5,  // top left
+        1 => 1,  // top
+        2 => 9,  // top right
+        3 => 8,  // right
+        4 => 10, // bottom right
+        5 => 2,  // bottom
+        6 => 6,  // bottom left
+        7 => 4,  // left
+        8 => 0,  // move
+        _ => return None,
+    })
+}
+
 fn is_toplevel(id: yserver_protocol::x11::ResourceId, window: &Window) -> bool {
     id != COMPOSITE_OVERLAY_WINDOW
         && window.map_state == MapState::Viewable
@@ -805,6 +864,28 @@ mod tests {
             "cut short"
         );
         assert_eq!(size_limits(&[]), SizeLimits::default());
+    }
+
+    #[test]
+    fn each_ewmh_direction_is_an_xdg_edge_or_a_move() {
+        let edges: Vec<Option<u32>> = (0..12).map(xdg_edges).collect();
+        assert_eq!(
+            edges,
+            [
+                Some(5),
+                Some(1),
+                Some(9),
+                Some(8),
+                Some(10),
+                Some(2),
+                Some(6),
+                Some(4),
+                Some(0),
+                None,
+                None,
+                None
+            ]
+        );
     }
 
     #[test]

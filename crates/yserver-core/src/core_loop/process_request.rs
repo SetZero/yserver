@@ -1383,6 +1383,34 @@ pub fn announce_window_manager_for_server(
     Ok(())
 }
 
+/// Whether the server itself is the window manager the root names
+/// (`announce_window_manager_for_server`) and lists `hint` in the root's
+/// `_NET_SUPPORTED`: whether a client's request of that kind is the
+/// server's to carry out.
+fn server_manages(state: &ServerState, hint: AtomId) -> bool {
+    let root_word_list = |name: &str| -> Vec<u32> {
+        state
+            .atoms
+            .id_for(name)
+            .and_then(|atom| state.resources.window(ROOT_WINDOW)?.properties.get(&atom))
+            .map(|value| {
+                value
+                    .data
+                    .chunks_exact(4)
+                    .filter_map(|word| word.try_into().ok().map(u32::from_le_bytes))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let announced = root_word_list("_NET_SUPPORTING_WM_CHECK")
+        .first()
+        .is_some_and(|window| {
+            state.resources.window_owner(ResourceId(*window))
+                == Some(crate::resources::SERVER_OWNER)
+        });
+    announced && root_word_list("_NET_SUPPORTED").contains(&hint.0)
+}
+
 /// Make the server's `window` the owner of `selection`, or give it up with
 /// `None`, as a client's `SetSelectionOwner` at `CurrentTime` would: the
 /// previous owner hears `SelectionClear`, and XFIXES subscribers are told.
@@ -32402,6 +32430,39 @@ fn handle_send_event(
         return Ok(RequestOutcome::Handled);
     }
 
+    // A window manager request for the server itself, when it says it is
+    // the window manager. It is still delivered below: a client selecting
+    // on the root sees it as it would under any window manager.
+    if req.event[0] & 0x7f == 33 && req.event[1] == 32 && req.destination == ROOT_WINDOW {
+        let word = |at: usize| {
+            let bytes = [
+                req.event[at],
+                req.event[at + 1],
+                req.event[at + 2],
+                req.event[at + 3],
+            ];
+            match sender_byte_order {
+                ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+                ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            }
+        };
+        let message_type = AtomId(word(8));
+        if state.atoms.name(message_type) == Some("_NET_WM_MOVERESIZE")
+            && server_manages(state, message_type)
+        {
+            let request = crate::server::ServerWmRequest::MoveResize {
+                window: ResourceId(word(4)),
+                direction: word(20),
+                button: word(24),
+            };
+            debug!(
+                "client {} #{} SendEvent {request:?} to the server as window manager",
+                client_id.0, sequence.0
+            );
+            state.server_wm_requests.push(request);
+        }
+    }
+
     let mut targets: Vec<ClientId> = if req.destination.0 == 0xffff_ffff {
         subscribers_by_id(state, ROOT_WINDOW, req.event_mask)
     } else if req.event_mask == 0 {
@@ -59086,6 +59147,70 @@ mod tests {
         assert_eq!(
             word(&state, replaced, "_NET_SUPPORTING_WM_CHECK"),
             replaced.0
+        );
+    }
+
+    /// A `_NET_WM_MOVERESIZE` a client sends the root is queued for the
+    /// backend only while the server is the window manager and lists it.
+    #[test]
+    fn a_move_resize_is_the_servers_while_it_manages_and_lists_it() {
+        const CLIENT: u32 = 1;
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let move_resize = state.atoms.intern("_NET_WM_MOVERESIZE", false);
+        let send = |state: &mut ServerState| {
+            let mut body = Vec::with_capacity(40);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            // SubstructureRedirect | SubstructureNotify, as EWMH says.
+            body.extend_from_slice(&0x0018_0000u32.to_le_bytes());
+            let mut event = [0u8; 32];
+            event[0] = 33; // ClientMessage
+            event[1] = 32;
+            event[4..8].copy_from_slice(&0x0020_0001u32.to_le_bytes());
+            event[8..12].copy_from_slice(&move_resize.0.to_le_bytes());
+            event[12..16].copy_from_slice(&300u32.to_le_bytes()); // x_root
+            event[16..20].copy_from_slice(&200u32.to_le_bytes()); // y_root
+            event[20..24].copy_from_slice(&8u32.to_le_bytes()); // move
+            event[24..28].copy_from_slice(&1u32.to_le_bytes()); // button 1
+            body.extend_from_slice(&event);
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: 25,
+                data: 0,
+                length_units: 11,
+            };
+            handle_send_event(state, ClientId(CLIENT), SequenceNumber(1), header, &body)
+                .expect("SendEvent");
+        };
+
+        send(&mut state);
+        assert_eq!(state.server_wm_requests, [], "no window manager yet");
+
+        announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &["_NET_WM_NAME"])
+            .expect("announce");
+        send(&mut state);
+        assert_eq!(state.server_wm_requests, [], "not listed");
+
+        let net_supported = state.atoms.intern("_NET_SUPPORTED", false);
+        let atom_type = state.atoms.intern("ATOM", false);
+        change_property_for_server(
+            &mut state,
+            &mut backend,
+            ROOT_WINDOW,
+            net_supported,
+            atom_type,
+            32,
+            &move_resize.0.to_le_bytes(),
+        )
+        .expect("listed");
+        send(&mut state);
+        assert_eq!(
+            state.server_wm_requests,
+            [crate::server::ServerWmRequest::MoveResize {
+                window: ResourceId(0x0020_0001),
+                direction: 8,
+                button: 1,
+            }]
         );
     }
 
