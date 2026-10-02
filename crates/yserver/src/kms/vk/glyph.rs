@@ -223,7 +223,12 @@ impl GlyphAtlas {
             .allocation_size(mem_reqs.size)
             .memory_type_index(memory_type_index)
             .push_next(&mut dedicated);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &alloc_info,
+            crate::kms::vk::mem_accounting::MemCategory::Glyph,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { vk.device.destroy_image(image, None) };
@@ -232,7 +237,7 @@ impl GlyphAtlas {
         };
         if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());
@@ -252,7 +257,7 @@ impl GlyphAtlas {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e.into());
@@ -268,7 +273,7 @@ impl GlyphAtlas {
                 Err(e) => {
                     unsafe {
                         vk.device.destroy_image_view(view, None);
-                        vk.device.free_memory(memory, None);
+                        crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                         vk.device.destroy_image(image, None);
                     }
                     return Err(e);
@@ -516,7 +521,7 @@ impl GlyphAtlas {
         unsafe {
             self.vk.device.unmap_memory(self.staging_memory);
             self.vk.device.destroy_buffer(self.staging_buffer, None);
-            self.vk.device.free_memory(self.staging_memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.staging_memory);
         }
         self.staging_buffer = buffer;
         self.staging_memory = memory;
@@ -532,10 +537,10 @@ impl Drop for GlyphAtlas {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
             self.vk.device.unmap_memory(self.staging_memory);
             self.vk.device.destroy_buffer(self.staging_buffer, None);
-            self.vk.device.free_memory(self.staging_memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.staging_memory);
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -578,7 +583,12 @@ fn allocate_staging(
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(memory_type_index);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Glyph,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_buffer(buffer, None) };
@@ -587,7 +597,7 @@ fn allocate_staging(
     };
     if let Err(e) = unsafe { vk.device.bind_buffer_memory(buffer, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_buffer(buffer, None);
         }
         return Err(e.into());
@@ -599,7 +609,7 @@ fn allocate_staging(
         Ok(p) => p,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_buffer(buffer, None);
             }
             return Err(e.into());

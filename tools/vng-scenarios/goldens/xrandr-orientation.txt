@@ -1,0 +1,83 @@
+==> orient.log <==
+===== probe
+  info rotation 0x1 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 1280 800 rotation 0x1
+  screen 1280 800
+  stale config timestamp: status 1 new_ts same cts same root ok
+  old timestamp before any set: status <known> new_ts same cts same root ok
+  size_id 1: status 0 new_ts moved cts same root ok
+  rotation 3: error BadValue code 2 value 3
+  rotation 0x41: error BadMatch code 8 value 65
+  rate 1: error BadValue code 2 value 1
+  rate 75: status 0 new_ts moved cts same root ok
+  same config: status 0 new_ts moved cts same root ok
+  same config again: status 0 new_ts moved cts same root ok
+  1.0-sized request: error BadLength code 16
+===== xrandr -o left
+rc 0
+  info rotation 0x2 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 800 1280 rotation 0x2
+  screen 800 1280
+Virtual-1 connected primary 800x1280+0+0 left (normal left inverted right x axis y axis) <mm>
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+===== xrandr -o right
+rc 0
+  info rotation 0x8 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 800 1280 rotation 0x8
+  screen 800 1280
+Virtual-1 connected primary 800x1280+0+0 right (normal left inverted right x axis y axis) <mm>
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+===== xrandr -o inverted
+rc 0
+  info rotation 0x4 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 1280 800 rotation 0x4
+  screen 1280 800
+Virtual-1 connected primary 1280x800+0+0 inverted (normal left inverted right x axis y axis) <mm>
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+===== xrandr -o normal
+rc 0
+  info rotation 0x1 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 1280 800 rotation 0x1
+  screen 1280 800
+Virtual-1 connected primary 1280x800+0+0 (normal left inverted right x axis y axis) <mm>
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+===== xrandr -o 1
+rc 0
+  info rotation 0x2 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 800 1280 rotation 0x2
+  screen 800 1280
+Virtual-1 connected primary 800x1280+0+0 left (normal left inverted right x axis y axis) <mm>
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+===== xrandr -o left
+rc 0
+  info rotation 0x2 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 800 1280 rotation 0x2
+  screen 800 1280
+Virtual-1 connected primary 800x1280+0+0 left (normal left inverted right x axis y axis) <mm>
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+===== probe while left
+  info rotation 0x2 rotations 0x3f size_id 0 sizes [(1280, 800, <mm>), (5120, 2160, <mm>), (4096, 2160, <mm>), (3840, 2160, <mm>), (1920, 1440, <mm>), (2560, 1080, <mm>), (1856, 1392, <mm>), (1792, 1344, <mm>), (2048, 1152, <mm>), (1920, 1200, <mm>), (1920, 1080, <mm>), (1600, 1200, <mm>), (1680, 1050, <mm>), (1400, 1050, <mm>), (1280, 1024, <mm>), (1440, 900, <mm>), (1280, 960, <mm>), (1360, 768, <mm>), (1280, 768, <mm>), (1024, 768, <mm>), (800, 600, <mm>), (640, 480, <mm>)] rate 75 ts <t> cts <t>
+  crtc pos 0 0 size 800 1280 rotation 0x2
+  screen 800 1280
+  stale config timestamp: status 1 new_ts same cts same root ok
+  old timestamp: status 2 new_ts same cts same root ok
+  size_id 1: status 0 new_ts moved cts same root ok
+  rotation 3: error BadValue code 2 value 3
+  rotation 0x41: error BadMatch code 8 value 65
+  rate 1: error BadValue code 2 value 1
+  rate 75: status 0 new_ts moved cts same root ok
+  same config: status 0 new_ts moved cts same root ok
+  same config again: status 0 new_ts moved cts same root ok
+  1.0-sized request: error BadLength code 16
+===== end
+==> events.log <==
+CrtcChangeNotify rotation 0x1 geom 0 0 5120 2160
+CrtcChangeNotify rotation 0x1 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x2 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x8 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x4 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x1 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x2 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x1 geom 0 0 5120 2160
+CrtcChangeNotify rotation 0x2 geom 0 0 1280 800
+CrtcChangeNotify rotation 0x1 geom 0 0 1280 800

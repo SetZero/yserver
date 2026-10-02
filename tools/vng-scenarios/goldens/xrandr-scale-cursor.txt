@@ -1,0 +1,6 @@
+==> root-pixels.txt <==
+root-301.png (2560, 1600) cda198acd493e394
+root-900.png (2560, 1600) cda198acd493e394
+==> root.txt <==
+  Width: 2560
+  Height: 1600

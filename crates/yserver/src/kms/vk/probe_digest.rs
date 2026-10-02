@@ -470,7 +470,12 @@ fn allocate_buffer(
     let allocation_info = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type_index);
-    let memory = match unsafe { vk.device.allocate_memory(&allocation_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &allocation_info,
+        crate::kms::vk::mem_accounting::MemCategory::Other,
+        &memory_properties,
+    ) {
         Ok(memory) => memory,
         Err(error) => {
             unsafe { vk.device.destroy_buffer(buffer, None) };
@@ -479,7 +484,7 @@ fn allocate_buffer(
     };
     if let Err(error) = unsafe { vk.device.bind_buffer_memory(buffer, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_buffer(buffer, None);
         }
         return Err(error);
@@ -636,7 +641,7 @@ unsafe fn destroy_handles(device: &ash::Device, handles: &mut ProbeDigestHandles
         handles.input_buffer = vk::Buffer::null();
     }
     if handles.input_memory != vk::DeviceMemory::null() {
-        unsafe { device.free_memory(handles.input_memory, None) };
+        unsafe { crate::kms::vk::mem_accounting::free_memory(device, handles.input_memory) };
         handles.input_memory = vk::DeviceMemory::null();
     }
     if handles.output_buffer != vk::Buffer::null() {
@@ -644,7 +649,7 @@ unsafe fn destroy_handles(device: &ash::Device, handles: &mut ProbeDigestHandles
         handles.output_buffer = vk::Buffer::null();
     }
     if handles.output_memory != vk::DeviceMemory::null() {
-        unsafe { device.free_memory(handles.output_memory, None) };
+        unsafe { crate::kms::vk::mem_accounting::free_memory(device, handles.output_memory) };
         handles.output_memory = vk::DeviceMemory::null();
     }
 }

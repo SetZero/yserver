@@ -20,6 +20,7 @@ pub mod glx;
 pub mod mit_shm;
 pub mod present;
 pub mod randr;
+pub mod record;
 pub mod request_lengths;
 pub mod request_swap;
 pub mod screensaver;
@@ -177,6 +178,9 @@ pub struct CrossingEvent {
     pub detail: u8,
     /// X11 mode: 0=NotifyNormal, 1=NotifyGrab, 2=NotifyUngrab.
     pub mode: u8,
+    /// The `focus` flag: the event window is the keyboard focus or an
+    /// inferior of it, or the focus is PointerRoot.
+    pub focus: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -663,6 +667,15 @@ pub fn write_setup_success(
     byte_order: ClientByteOrder,
     setup: SetupSuccess<'_>,
 ) -> io::Result<()> {
+    writer.write_all(&encode_setup_success(byte_order, setup)?)
+}
+
+/// The connection-setup success reply exactly as `write_setup_success`
+/// sends it (RECORD's ClientStarted replays these bytes).
+pub fn encode_setup_success(
+    byte_order: ClientByteOrder,
+    setup: SetupSuccess<'_>,
+) -> io::Result<Vec<u8>> {
     let vendor = setup.vendor.as_bytes();
 
     let mut extra = Vec::new();
@@ -737,7 +750,7 @@ pub fn write_setup_success(
     write_u16(byte_order, &mut reply, setup.protocol_minor);
     write_u16(byte_order, &mut reply, length_units);
     reply.extend_from_slice(&extra);
-    writer.write_all(&reply)
+    Ok(reply)
 }
 
 fn write_screen(byte_order: ClientByteOrder, out: &mut Vec<u8>, screen: Screen) {
@@ -874,7 +887,7 @@ pub fn read_request(
     // size of the payload to do it. Flag the request as malformed so
     // the dispatcher's max-length gate emits BadLength.
     let max_units: u32 = if big_requests_enabled {
-        256 * 1024
+        MAX_BIG_REQUEST_UNITS
     } else {
         u32::from(u16::MAX)
     };
@@ -2586,6 +2599,7 @@ pub fn encode_xi2_crossing_event(
     mode: u8,
     detail: u8,
     sourceid: u16,
+    focus: bool,
 ) {
     out.push(35); // GenericEvent
     out.push(major_opcode);
@@ -2608,7 +2622,7 @@ pub fn encode_xi2_crossing_event(
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
     out.push(1); // same_screen
-    out.push(u8::from(matches!(evtype, 9 | 10))); // focus
+    out.push(u8::from(focus));
     write_u16(byte_order, out, 1); // buttons_len
 
     // mods: base, latched, locked, effective — KEYBOARD modifier bits
@@ -2662,6 +2676,7 @@ pub fn encode_xi2_focus_event(
         mode,
         detail,
         deviceid,
+        false,
     );
 }
 
@@ -2920,13 +2935,39 @@ pub fn write_ge_query_version_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    // GEQueryVersion reply: major=1, minor=0, rest padding
+    // GEQueryVersion reply: major=1, minor=0 in the client's byte order
+    // (Xorg SProcGEQueryVersion swaps both), rest padding.
     let mut reply = fixed_reply(byte_order, sequence, 0, 0);
-    reply.extend_from_slice(&[1, 0]); // major_version = 1
-    reply.extend_from_slice(&[0, 0]); // minor_version = 0
+    write_u16(byte_order, &mut reply, 1); // major_version
+    write_u16(byte_order, &mut reply, 0); // minor_version
     reply.extend_from_slice(&[0; 20]);
     writer.write_all(&reply)
 }
+
+/// XKEYBOARD protocol version the server implements (Xorg
+/// `SERVER_XKB_MAJOR_VERSION` / `SERVER_XKB_MINOR_VERSION`).
+pub const XKB_SERVER_MAJOR_VERSION: u16 = 1;
+pub const XKB_SERVER_MINOR_VERSION: u16 = 0;
+
+/// `xkbUseExtensionReply` as Xorg's `ProcXkbUseExtension` writes it:
+/// `supported` in the data byte, then the server version, with the
+/// sequence number and version in the client's byte order.
+pub fn write_xkb_use_extension_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    supported: bool,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(byte_order, sequence, u8::from(supported), 0);
+    write_u16(byte_order, &mut reply, XKB_SERVER_MAJOR_VERSION);
+    write_u16(byte_order, &mut reply, XKB_SERVER_MINOR_VERSION);
+    reply.extend_from_slice(&[0; 20]);
+    writer.write_all(&reply)
+}
+
+/// BIG-REQUESTS maximum request length in 4-byte units: Xorg's
+/// `MAX_BIG_REQUEST_SIZE` (`include/os.h:70`), just under 16 MiB.
+pub const MAX_BIG_REQUEST_UNITS: u32 = 4_194_303;
 
 pub fn write_big_requests_enable_reply(
     writer: &mut impl Write,
@@ -3395,7 +3436,7 @@ fn encode_crossing_event(
     write_i16(order, out, event.event_y);
     write_u16(order, out, event.state);
     out.push(event.mode);
-    out.push(0x03); // same_screen + focus
+    out.push(0x02 | u8::from(event.focus)); // ELFlagSameScreen | ELFlagFocus
 }
 
 pub fn encode_enter_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, event: CrossingEvent) {
@@ -3585,23 +3626,70 @@ pub fn write_xkb_new_keyboard_notify(
     writer.write_all(&buf)
 }
 
+/// Fields of an [`write_xkb_map_notify`] event: XKBproto.h `xkbMapNotify`
+/// (1050-1077) minus the header (`type`, `xkbType`, `sequenceNumber`) and
+/// `time` (0, like our other XKB events). `changed` is an `XkbMapPartsMask`
+/// set; each advertised part should have its first/count range filled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbMapNotify {
+    pub device_id: u8,
+    pub ptr_btn_actions: u8,
+    pub changed: u16,
+    pub min_keycode: u8,
+    pub max_keycode: u8,
+    pub first_type: u8,
+    pub n_types: u8,
+    pub first_key_sym: u8,
+    pub n_key_syms: u8,
+    pub first_key_act: u8,
+    pub n_key_acts: u8,
+    pub first_key_behavior: u8,
+    pub n_key_behaviors: u8,
+    pub first_key_explicit: u8,
+    pub n_key_explicit: u8,
+    pub first_mod_map_key: u8,
+    pub n_mod_map_keys: u8,
+    pub first_vmod_map_key: u8,
+    pub n_vmod_map_keys: u8,
+    pub virtual_mods: u16,
+}
+
+impl XkbMapNotify {
+    /// A whole-keymap replacement (a layout reload): `changed` =
+    /// KeyTypes|KeySyms|ModifierMap = 0x07, the keysym and modmap ranges
+    /// cover `min..=max`. VirtualMods is not claimed (vmod bindings are
+    /// layout-independent) and `virtualMods` stays zero, so every advertised
+    /// bit has populated fields. `n_types` MUST match GetMap's published
+    /// type count.
+    #[must_use]
+    pub fn whole_keymap(device_id: u8, min_keycode: u8, max_keycode: u8, n_types: u8) -> Self {
+        // CARD8 count: saturate so the full 0..=255 keycode range yields 255,
+        // not a wrap to 0 (255-0+1 == 256). The evdev range (8..=255 -> 248)
+        // never hits this, but the saturation is load-bearing for safety.
+        let count = max_keycode.saturating_sub(min_keycode).saturating_add(1);
+        Self {
+            device_id,
+            changed: 0x0007,
+            min_keycode,
+            max_keycode,
+            n_types,
+            first_key_sym: min_keycode,
+            n_key_syms: count,
+            first_mod_map_key: min_keycode,
+            n_mod_map_keys: count,
+            ..Self::default()
+        }
+    }
+}
+
 /// `XkbMapNotify` (xkbType=1). Layout per XKBproto.h `xkbMapNotify`
-/// (1050-1077). `changed` = KeyTypes|KeySyms|ModifierMap = 0x07; the
-/// per-component first/count ranges below cover the full keymap. We do
-/// not claim VirtualMods (layout-independent) and leave `virtualMods`
-/// zero, so every advertised bit has matching populated fields.
-/// `n_types` MUST match GetMap's published type count (4 in phase A;
-/// the derived count once real key types are published).
-#[allow(clippy::too_many_arguments)]
+/// (1050-1077); the fields come from [`XkbMapNotify`].
 pub fn write_xkb_map_notify(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
     xkb_event_base: u8,
-    device_id: u8,
-    min_keycode: u8,
-    max_keycode: u8,
-    n_types: u8,
+    n: XkbMapNotify,
 ) -> io::Result<()> {
     let mut buf = [0u8; 32];
     buf[0] = xkb_event_base;
@@ -3610,23 +3698,311 @@ pub fn write_xkb_map_notify(
     write_u16(byte_order, &mut seq_buf, sequence.0);
     buf[2..4].copy_from_slice(&seq_buf);
     // buf[4..8] time = 0
-    buf[8] = device_id;
-    // buf[9] ptrBtnActions = 0
+    buf[8] = n.device_id;
+    buf[9] = n.ptr_btn_actions;
     let mut changed_buf = Vec::with_capacity(2);
-    write_u16(byte_order, &mut changed_buf, 0x0007); // KeyTypes|KeySyms|ModifierMap
+    write_u16(byte_order, &mut changed_buf, n.changed);
     buf[10..12].copy_from_slice(&changed_buf);
-    buf[12] = min_keycode;
-    buf[13] = max_keycode;
-    // firstType=0, nTypes — must match GetMap's published type count.
-    buf[14] = 0;
-    buf[15] = n_types;
-    // CARD8 count: saturate so the full 0..=255 keycode range yields 255,
-    // not a wrap to 0 (255-0+1 == 256). The evdev range (8..=255 -> 248)
-    // never hits this, but the saturation is load-bearing for safety.
-    buf[16] = min_keycode; // firstKeySym
-    buf[17] = max_keycode.saturating_sub(min_keycode).saturating_add(1); // nKeySyms
-    buf[24] = min_keycode; // firstModMapKey
-    buf[25] = max_keycode.saturating_sub(min_keycode).saturating_add(1); // nModMapKeys
+    buf[12] = n.min_keycode;
+    buf[13] = n.max_keycode;
+    buf[14] = n.first_type;
+    buf[15] = n.n_types;
+    buf[16] = n.first_key_sym;
+    buf[17] = n.n_key_syms;
+    buf[18] = n.first_key_act;
+    buf[19] = n.n_key_acts;
+    buf[20] = n.first_key_behavior;
+    buf[21] = n.n_key_behaviors;
+    buf[22] = n.first_key_explicit;
+    buf[23] = n.n_key_explicit;
+    buf[24] = n.first_mod_map_key;
+    buf[25] = n.n_mod_map_keys;
+    buf[26] = n.first_vmod_map_key;
+    buf[27] = n.n_vmod_map_keys;
+    let mut vmods_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut vmods_buf, n.virtual_mods);
+    buf[28..30].copy_from_slice(&vmods_buf);
+    // buf[30..32] pad1
+    writer.write_all(&buf)
+}
+
+/// Fields of an [`write_xkb_controls_notify`] event: XKBproto.h
+/// `xkbControlsNotify` minus the header and `time` (0, like our other XKB
+/// events).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbControlsNotify {
+    pub device_id: u8,
+    pub num_groups: u8,
+    /// `XkbControlsMask` bits that changed (e.g. PerKeyRepeat `1 << 30`).
+    pub changed_controls: u32,
+    pub enabled_controls: u32,
+    pub enabled_control_changes: u32,
+    pub keycode: u8,
+    pub event_type: u8,
+    pub request_major: u8,
+    pub request_minor: u8,
+}
+
+/// `XkbControlsNotify` (xkbType=3). Layout per XKBproto.h
+/// `xkbControlsNotify`: deviceID @8, numGroups @9, changedControls @12,
+/// enabledControls @16, enabledControlChanges @20, keycode @24,
+/// eventType @25, requestMajor @26, requestMinor @27.
+pub fn write_xkb_controls_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbControlsNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 3; // xkbType = XkbControlsNotify
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    buf[9] = n.num_groups;
+    // buf[10..12] pad1
+    for (at, v) in [
+        (12, n.changed_controls),
+        (16, n.enabled_controls),
+        (20, n.enabled_control_changes),
+    ] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    buf[24] = n.keycode;
+    buf[25] = n.event_type;
+    buf[26] = n.request_major;
+    buf[27] = n.request_minor;
+    // buf[28..32] pad2
+    writer.write_all(&buf)
+}
+
+/// Which of the two `xkbIndicatorNotify` events an
+/// [`write_xkb_indicator_notify`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XkbIndicatorNotifyKind {
+    /// `XkbIndicatorStateNotify` (xkbType 4): indicators turned on/off.
+    State,
+    /// `XkbIndicatorMapNotify` (xkbType 5): indicator maps changed.
+    Map,
+}
+
+/// Fields of an [`write_xkb_indicator_notify`] event (XKBproto.h
+/// `xkbIndicatorNotify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XkbIndicatorNotify {
+    pub kind: XkbIndicatorNotifyKind,
+    pub device_id: u8,
+    /// The indicators lit.
+    pub state: u32,
+    /// The indicators the event is about.
+    pub changed: u32,
+}
+
+/// `XkbIndicatorStateNotify` / `XkbIndicatorMapNotify`. Layout per
+/// XKBproto.h `xkbIndicatorNotify`: deviceID @8, state @12, changed @16.
+/// Time is 0, like our other XKB events.
+pub fn write_xkb_indicator_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbIndicatorNotify,
+) -> io::Result<()> {
+    let XkbIndicatorNotify {
+        kind,
+        device_id,
+        state,
+        changed,
+    } = n;
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = match kind {
+        XkbIndicatorNotifyKind::State => 4,
+        XkbIndicatorNotifyKind::Map => 5,
+    };
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = device_id;
+    // buf[9..12] pad1
+    for (at, v) in [(12, state), (16, changed)] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    // buf[20..32] pad2..pad5
+    writer.write_all(&buf)
+}
+
+/// Fields of an [`write_xkb_compat_map_notify`] event (XKBproto.h
+/// `xkbCompatMapNotify`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbCompatMapNotify {
+    pub device_id: u8,
+    /// The group compat maps the request (or change) set.
+    pub changed_groups: u8,
+    pub first_si: u16,
+    pub n_si: u16,
+    /// Symbol interprets in the compat map afterwards.
+    pub n_total_si: u16,
+}
+
+/// `XkbCompatMapNotify` (xkbType=7). Layout per XKBproto.h
+/// `xkbCompatMapNotify`: deviceID @8, changedGroups @9, firstSI @10,
+/// nSI @12, nTotalSI @14, pads to 32 (Xorg sends its stack there; zero
+/// here). Time is 0, like our other XKB events.
+pub fn write_xkb_compat_map_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbCompatMapNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 7; // xkbType = XkbCompatMapNotify
+    let mut b = Vec::with_capacity(2);
+    write_u16(byte_order, &mut b, sequence.0);
+    buf[2..4].copy_from_slice(&b);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    buf[9] = n.changed_groups;
+    for (at, v) in [(10, n.first_si), (12, n.n_si), (14, n.n_total_si)] {
+        let mut b = Vec::with_capacity(2);
+        write_u16(byte_order, &mut b, v);
+        buf[at..at + 2].copy_from_slice(&b);
+    }
+    writer.write_all(&buf)
+}
+
+/// Fields of an [`write_xkb_names_notify`] event (XKBproto.h
+/// `xkbNamesNotify`), as the server fills them in (Xorg's `_XkbSetNames`
+/// puts the request's `nTypes` in `n_level_names` and its group names mask
+/// in `changed_virtual_mods`; the encoder writes what it is given).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbNamesNotify {
+    pub device_id: u8,
+    /// `XkbNamesMask` bits.
+    pub changed: u16,
+    pub first_type: u8,
+    pub n_types: u8,
+    pub first_level_name: u8,
+    pub n_level_names: u8,
+    pub n_radio_groups: u8,
+    pub n_aliases: u8,
+    pub changed_group_names: u8,
+    pub changed_virtual_mods: u16,
+    pub first_key: u8,
+    pub n_keys: u8,
+    pub changed_indicators: u32,
+}
+
+/// `XkbNamesNotify` (xkbType=6). Layout per XKBproto.h `xkbNamesNotify`:
+/// deviceID @8, changed @10, firstType @12, nTypes @13, firstLevelName @14,
+/// nLevelNames @15, nRadioGroups @17, nAliases @18, changedGroupNames @19,
+/// changedVirtualMods @20, firstKey @22, nKeys @23, changedIndicators @24,
+/// pads zero (Xorg memsets the event). Time is 0, like our other XKB events.
+pub fn write_xkb_names_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbNamesNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 6; // xkbType = XkbNamesNotify
+    let mut b = Vec::with_capacity(2);
+    write_u16(byte_order, &mut b, sequence.0);
+    buf[2..4].copy_from_slice(&b);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    // buf[9] pad1
+    for (at, v) in [(10, n.changed), (20, n.changed_virtual_mods)] {
+        let mut b = Vec::with_capacity(2);
+        write_u16(byte_order, &mut b, v);
+        buf[at..at + 2].copy_from_slice(&b);
+    }
+    buf[12] = n.first_type;
+    buf[13] = n.n_types;
+    buf[14] = n.first_level_name;
+    buf[15] = n.n_level_names;
+    // buf[16] pad2
+    buf[17] = n.n_radio_groups;
+    buf[18] = n.n_aliases;
+    buf[19] = n.changed_group_names;
+    buf[22] = n.first_key;
+    buf[23] = n.n_keys;
+    let mut b = Vec::with_capacity(4);
+    write_u32(byte_order, &mut b, n.changed_indicators);
+    buf[24..28].copy_from_slice(&b);
+    // buf[28..32] pad3
+    writer.write_all(&buf)
+}
+
+/// Fields of an [`write_xkb_extension_device_notify`] event (XKBproto.h
+/// `xkbExtensionDeviceNotify`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbExtensionDeviceNotify {
+    pub device_id: u8,
+    /// `XkbXI_*` bits: what changed (IndicatorNames 0x04, IndicatorMaps
+    /// 0x08, IndicatorState 0x10, ...).
+    pub reason: u16,
+    pub led_class: u16,
+    pub led_id: u16,
+    pub leds_defined: u32,
+    pub led_state: u32,
+    pub first_btn: u8,
+    pub n_btns: u8,
+    pub supported: u16,
+    pub unsupported: u16,
+}
+
+/// `XkbExtensionDeviceNotify` (xkbType=11). Layout per XKBproto.h
+/// `xkbExtensionDeviceNotify`: deviceID @8, reason @10, ledClass @12,
+/// ledID @14, ledsDefined @16, ledState @20, firstBtn @24, nBtns @25,
+/// supported @26, unsupported @28. Time is 0, like our other XKB events.
+pub fn write_xkb_extension_device_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbExtensionDeviceNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 11; // xkbType = XkbExtensionDeviceNotify
+    let mut b = Vec::with_capacity(2);
+    write_u16(byte_order, &mut b, sequence.0);
+    buf[2..4].copy_from_slice(&b);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    // buf[9] pad1
+    for (at, v) in [
+        (10, n.reason),
+        (12, n.led_class),
+        (14, n.led_id),
+        (26, n.supported),
+        (28, n.unsupported),
+    ] {
+        let mut b = Vec::with_capacity(2);
+        write_u16(byte_order, &mut b, v);
+        buf[at..at + 2].copy_from_slice(&b);
+    }
+    for (at, v) in [(16, n.leds_defined), (20, n.led_state)] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    buf[24] = n.first_btn;
+    buf[25] = n.n_btns;
+    // buf[30..32] pad3
     writer.write_all(&buf)
 }
 
@@ -3933,6 +4309,29 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn ge_query_version_reply_uses_the_client_byte_order() {
+        // Xvfb 21.1.24, GE QueryVersion(1, 0), sequence 2:
+        //   LE 01000200 00000000 01000000 00…
+        //   BE 01000002 00000000 00010000 00…
+        for (order, expected_head) in [
+            (
+                ClientByteOrder::LittleEndian,
+                [1u8, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            ),
+            (
+                ClientByteOrder::BigEndian,
+                [1u8, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0],
+            ),
+        ] {
+            let mut reply = Vec::new();
+            write_ge_query_version_reply(&mut reply, order, SequenceNumber(2)).unwrap();
+            assert_eq!(reply.len(), 32);
+            assert_eq!(&reply[..12], &expected_head, "{order:?}");
+            assert!(reply[12..].iter().all(|&b| b == 0), "{order:?}");
+        }
+    }
+
     fn create_window_body(value_mask: u32, values: &[u32]) -> Vec<u8> {
         let mut body = Vec::with_capacity(28 + values.len() * 4);
         body.extend_from_slice(&0x0080_0001u32.to_le_bytes()); // wid
@@ -4171,10 +4570,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             SequenceNumber(0x1234),
             85, // xkb_event_base
-            1,  // device_id
-            8,
-            255, // min/max keycode
-            4,   // n_types (phase A fixed table)
+            XkbMapNotify::whole_keymap(1, 8, 255, 4),
         )
         .unwrap();
         assert_eq!(buf.len(), 32);
@@ -4198,6 +4594,340 @@ mod tests {
             &0u16.to_le_bytes(),
             "virtualMods @28 = 0 (not claimed)"
         );
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-change-keyboard-mapping.txt`
+    /// protected-one-level): the ControlsNotify for a per-key repeat change,
+    /// byte for byte except seq/time.
+    #[test]
+    fn xkb_controls_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_controls_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0x55,
+            XkbControlsNotify {
+                device_id: 3,
+                num_groups: 1,
+                changed_controls: 0x4000_0000,
+                enabled_controls: 0x0000_13a1,
+                enabled_control_changes: 0,
+                keycode: 0,
+                event_type: 0,
+                request_major: 100,
+                request_minor: 0,
+            },
+        )
+        .unwrap();
+        let xorg = "550309005b8574060301000000000040a1130000000000000000640000000000";
+        let xorg: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-set-modifier-mapping.txt`
+    /// vmod-remap-numlock): the IndicatorMapNotify of the Num Lock map, byte
+    /// for byte except seq/time.
+    #[test]
+    fn xkb_indicator_map_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_indicator_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0x55,
+            XkbIndicatorNotify {
+                kind: XkbIndicatorNotifyKind::Map,
+                device_id: 3,
+                state: 0,
+                changed: 0x0000_0002,
+            },
+        )
+        .unwrap();
+        let xorg = "550509002397a006030000000000000002000000000000000000000000000000";
+        let xorg: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    fn xorg_event(hex: &str) -> Vec<u8> {
+        (0..32)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-setcompat.txt` si-skip-broken): the
+    /// CompatMapNotify of a SetCompatMap with interprets 0+3 leaving 123,
+    /// byte for byte except seq/time and bytes 16.. (uninitialised stack in
+    /// Xorg; zero here).
+    #[test]
+    fn xkb_compat_map_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_compat_map_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x61),
+            0x55,
+            XkbCompatMapNotify {
+                device_id: 3,
+                changed_groups: 0,
+                first_si: 0,
+                n_si: 3,
+                n_total_si: 123,
+            },
+        )
+        .unwrap();
+        let xorg = xorg_event("550761002eae3d080300000003007b00904ffd6d90550000c013fc6d90550000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..16], xorg[8..16]);
+        assert_eq!(buf[16..], [0; 16]);
+        // xkbcomp's upload: changedGroups 0x0f, 0+124 of 124.
+        buf.clear();
+        write_xkb_compat_map_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x7c),
+            0x55,
+            XkbCompatMapNotify {
+                device_id: 3,
+                changed_groups: 0x0f,
+                first_si: 0,
+                n_si: 124,
+                n_total_si: 124,
+            },
+        )
+        .unwrap();
+        let xorg = xorg_event("55077c00faab6807030f00007c007c00e09c3272425600001800000000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..16], xorg[8..16]);
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-setcompat.txt` indmap-lights): the
+    /// ExtensionDeviceNotify of a SetIndicatorMap whose new map lit
+    /// indicator 20 (reason IndicatorMaps|IndicatorState), byte for byte
+    /// except seq/time; and the maps-only one of xkbcomp's upload.
+    #[test]
+    fn xkb_extension_device_notify_wire_layout() {
+        let n = XkbExtensionDeviceNotify {
+            device_id: 3,
+            reason: 0x0018,
+            led_class: 0,
+            led_id: 0,
+            leds_defined: 0x0010_3fff,
+            led_state: 0x0010_0000,
+            first_btn: 0,
+            n_btns: 0,
+            supported: 0x001f,
+            unsupported: 0,
+        };
+        let mut buf = Vec::new();
+        write_xkb_extension_device_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x61),
+            0x55,
+            n,
+        )
+        .unwrap();
+        let xorg = xorg_event("550b6100b4b03d080300180000000000ff3f10000000100000001f0000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+        buf.clear();
+        write_xkb_extension_device_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x73),
+            0x55,
+            XkbExtensionDeviceNotify {
+                reason: 0x0008,
+                leds_defined: 0x3fff,
+                led_state: 0,
+                ..n
+            },
+        )
+        .unwrap();
+        let xorg = xorg_event("550b7300f4ab68070300080000000000ff3f00000000000000001f0000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkbcomp-steps.txt` identity and usru
+    /// step 4): the NamesNotify of xkbcomp's SetNames, byte for byte except
+    /// seq/time (Xorg memsets it, so its pads are zero).
+    #[test]
+    fn xkb_names_notify_wire_layout() {
+        let n = XkbNamesNotify {
+            device_id: 3,
+            changed: 0x1fff,
+            first_type: 4,
+            n_types: 23,
+            first_level_name: 0,
+            n_level_names: 23,
+            n_radio_groups: 0,
+            n_aliases: 73,
+            changed_group_names: 0,
+            changed_virtual_mods: 0x0001,
+            first_key: 8,
+            n_keys: 248,
+            changed_indicators: 0x3fff,
+        };
+        let mut buf = Vec::new();
+        write_xkb_names_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x85),
+            0x55,
+            n,
+        )
+        .unwrap();
+        let xorg = xorg_event("5506850001ac68070300ff1f0417001700004900010008f8ff3f000000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+        buf.clear();
+        write_xkb_names_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x85),
+            0x55,
+            XkbNamesNotify {
+                changed_virtual_mods: 0x0003,
+                ..n
+            },
+        )
+        .unwrap();
+        let xorg = xorg_event("5506850081bb68070300ff1f0417001700004900030008f8ff3f000000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Every `XkbNamesNotify` field at its offset, distinct values,
+    /// big-endian client.
+    #[test]
+    fn xkb_names_notify_field_offsets_big_endian() {
+        let mut buf = Vec::new();
+        write_xkb_names_notify(
+            &mut buf,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x0102),
+            0x55,
+            XkbNamesNotify {
+                device_id: 3,
+                changed: 0x0405,
+                first_type: 6,
+                n_types: 7,
+                first_level_name: 8,
+                n_level_names: 9,
+                n_radio_groups: 0x0a,
+                n_aliases: 0x0b,
+                changed_group_names: 0x0c,
+                changed_virtual_mods: 0x0d0e,
+                first_key: 0x0f,
+                n_keys: 0x10,
+                changed_indicators: 0x1112_1314,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            buf,
+            [
+                0x55, 6, 1, 2, 0, 0, 0, 0, 3, 0, 4, 5, 6, 7, 8, 9, 0, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0, 0, 0, 0
+            ]
+        );
+    }
+
+    /// Every `XkbExtensionDeviceNotify` field at its offset, distinct
+    /// values, big-endian client.
+    #[test]
+    fn xkb_extension_device_notify_field_offsets_big_endian() {
+        let mut buf = Vec::new();
+        write_xkb_extension_device_notify(
+            &mut buf,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x0102),
+            0x55,
+            XkbExtensionDeviceNotify {
+                device_id: 3,
+                reason: 0x0405,
+                led_class: 0x0607,
+                led_id: 0x0809,
+                leds_defined: 0x0a0b_0c0d,
+                led_state: 0x0e0f_1011,
+                first_btn: 0x12,
+                n_btns: 0x13,
+                supported: 0x1415,
+                unsupported: 0x1617,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            buf,
+            [
+                0x55, 11, 1, 2, 0, 0, 0, 0, 3, 0, 4, 5, 6, 7, 8, 9, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 0
+            ]
+        );
+    }
+
+    /// Every `XkbMapNotify` field at its `xkbMapNotify` offset (XKBproto.h),
+    /// with distinct values so a swapped pair shows.
+    #[test]
+    fn xkb_map_notify_field_offsets() {
+        let n = XkbMapNotify {
+            device_id: 3,
+            ptr_btn_actions: 4,
+            changed: 0x0102,
+            min_keycode: 8,
+            max_keycode: 250,
+            first_type: 5,
+            n_types: 6,
+            first_key_sym: 20,
+            n_key_syms: 21,
+            first_key_act: 22,
+            n_key_acts: 23,
+            first_key_behavior: 24,
+            n_key_behaviors: 25,
+            first_key_explicit: 26,
+            n_key_explicit: 27,
+            first_mod_map_key: 28,
+            n_mod_map_keys: 29,
+            first_vmod_map_key: 30,
+            n_vmod_map_keys: 31,
+            virtual_mods: 0x0a0b,
+        };
+        let mut le = Vec::new();
+        write_xkb_map_notify(
+            &mut le,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            90,
+            n,
+        )
+        .unwrap();
+        assert_eq!(
+            le,
+            [
+                90, 1, 7, 0, 0, 0, 0, 0, 3, 4, 0x02, 0x01, 8, 250, 5, 6, 20, 21, 22, 23, 24, 25,
+                26, 27, 28, 29, 30, 31, 0x0b, 0x0a, 0, 0
+            ]
+        );
+        let mut be = Vec::new();
+        write_xkb_map_notify(
+            &mut be,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            90,
+            n,
+        )
+        .unwrap();
+        assert_eq!(&be[2..4], &[0, 7], "sequenceNumber big-endian");
+        assert_eq!(&be[10..12], &[0x01, 0x02], "changed big-endian");
+        assert_eq!(&be[28..30], &[0x0a, 0x0b], "virtualMods big-endian");
     }
 
     #[test]
@@ -4705,12 +5435,45 @@ mod tests {
     }
 
     #[test]
+    fn read_request_accepts_a_4mib_big_request() {
+        // Chromium sends ~4 MiB PutImage requests; the old 1 MiB cap rejected them (#166).
+        const UNITS: u32 = 1024 * 1024 + 8;
+        const BODY_BYTES: usize = (UNITS as usize * 4) - 8;
+        let mut input = Vec::with_capacity(8 + BODY_BYTES);
+        input.extend_from_slice(&[72, 2, 0, 0]);
+        input.extend_from_slice(&UNITS.to_le_bytes());
+        input.resize(input.len() + BODY_BYTES, 0x55);
+        let mut cursor = std::io::Cursor::new(input);
+        let (header, body) = read_request(&mut cursor, ClientByteOrder::LittleEndian, true)
+            .expect("read should succeed")
+            .expect("request should be present");
+        assert_eq!(header.length_units, UNITS);
+        assert_eq!(body.len(), BODY_BYTES);
+    }
+
+    #[test]
+    fn big_requests_enable_reply_advertises_xorg_maximum() {
+        let mut buf = Vec::new();
+        write_big_requests_enable_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            MAX_BIG_REQUEST_UNITS,
+        )
+        .expect("encode");
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            4_194_303
+        );
+    }
+
+    #[test]
     fn read_request_flags_over_max_big_length_and_drains_body() {
-        // xts5 TOO_LONG: bigRequestLength = max+1 = 262145 with the
+        // xts5 TOO_LONG: bigRequestLength = max+1 with the
         // matching payload bytes on the wire. We override length to
         // the BadLength sentinel and drain the payload to keep the
         // socket aligned for the next request.
-        const OVER_MAX: u32 = 256 * 1024 + 1; // 262145 units
+        const OVER_MAX: u32 = MAX_BIG_REQUEST_UNITS + 1;
         const BODY_BYTES: usize = (OVER_MAX as usize * 4) - 8;
         let mut input = Vec::with_capacity(8 + BODY_BYTES + 4);
         input.extend_from_slice(&[1, 2, 0, 0]); // opcode, data, length=0
@@ -4974,6 +5737,7 @@ mod tests {
             0,
             0,
             2,
+            false,
         );
 
         assert_eq!(out.len(), 76);
@@ -5555,6 +6319,7 @@ mod tests {
                     state: 0,
                     detail: 0,
                     mode: 0,
+                    focus: true,
                 },
             );
             assert_eq!(buf.len(), 32);
@@ -5571,7 +6336,7 @@ mod tests {
             assert_eq!(&buf[26..28], &20i16.to_le_bytes());
             assert_eq!(&buf[28..30], &0u16.to_le_bytes());
             assert_eq!(buf[30], 0); // mode = NotifyNormal
-            assert_eq!(buf[31], 0x03); // same_screen,focus = 0x01 | 0x02
+            assert_eq!(buf[31], 0x03); // ELFlagSameScreen 0x02 | ELFlagFocus 0x01
         }
 
         #[test]
@@ -5593,6 +6358,7 @@ mod tests {
                     state: 0,
                     detail: 0,
                     mode: 0,
+                    focus: true,
                 },
             );
             assert_eq!(buf.len(), 32);
@@ -5711,6 +6477,7 @@ mod tests {
                                 state,
                                 detail: 0,
                                 mode: 0,
+                                focus: true,
                             },
                         );
                     }
@@ -5733,6 +6500,7 @@ mod tests {
                                 state,
                                 detail: 0,
                                 mode: 0,
+                                focus: true,
                             },
                         );
                     }

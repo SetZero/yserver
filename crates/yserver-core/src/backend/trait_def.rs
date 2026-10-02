@@ -140,6 +140,9 @@ pub use crate::host_x11::HostSocketStatus;
 /// encoder premultiplies + byte-swaps at the wire boundary.
 #[derive(Debug, Clone)]
 pub struct ActiveCursorImage {
+    /// Host handle of the displayed cursor (the core maps it to the
+    /// cursor's XFIXES name).
+    pub host_xid: u32,
     pub width: u16,
     pub height: u16,
     pub hot_x: u16,
@@ -151,6 +154,19 @@ pub struct ActiveCursorImage {
     /// changes. Backed by `Arc<CursorRecord>.version` in v2.
     pub serial: u32,
     pub bgra_bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// The cursor the backend's sprite now shows after a change, reported
+/// through `Backend::take_displayed_cursor_change` so the core can send
+/// XFIXES `CursorNotify`. This is the cursor the pointer *should* show —
+/// an XFIXES `HideCursor` does not change it (Xorg `CursorDisplayCursor`
+/// compares the requested cursor, not the blanked one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayedCursor {
+    /// Host handle of the cursor, as stored in the core's cursor table.
+    pub host_xid: u32,
+    /// Same serial `get_active_cursor_image` reports for this cursor.
+    pub serial: u32,
 }
 
 /// Present capability surface. Phase 4.2 design §4. Per-window
@@ -475,6 +491,95 @@ pub struct XkbNewKeyboardInfo {
     pub changed: u16,
 }
 
+/// One notification step of an XKB Set* request, in Xorg's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XkbSetEvent {
+    /// `XkbSendNewKeyboardNotify` (with its legacy core MappingNotify); the
+    /// request's opcodes are the cause.
+    NewKeyboard(XkbNewKeyboardInfo),
+    /// `XkbSendNotification`: MapNotify (when `map_notify.changed` isn't 0)
+    /// with its legacy core MappingNotify, the per-key repeat ControlsNotify
+    /// and the IndicatorMapNotify.
+    Notification(KeyboardMappingChange),
+    /// Per-key repeat bits re-derived with no notification (the end of
+    /// `XkbUpdateActions`, when the request sent a NewKeyboardNotify
+    /// instead): copied to the core keyboard feedback.
+    Repeats(Vec<(u8, bool)>),
+    /// `_XkbSetCompatMap`'s `XkbSendCompatMapNotify`, to every client with a
+    /// compat map interest (`compatNotifyMask` ≠ 0).
+    CompatMap(yserver_protocol::x11::XkbCompatMapNotify),
+    /// `XkbApplyLedMapChanges`' notifications for new indicator maps.
+    IndicatorMaps(XkbIndicatorMapsChange),
+    /// `XkbSendNamesNotify`, to every client whose names interest ∩
+    /// `changed` ≠ 0.
+    Names(yserver_protocol::x11::XkbNamesNotify),
+    /// `_XkbSetNames`' ExtensionDeviceNotify for new indicator names
+    /// (reason IndicatorNames) on the core keyboard's default LED feedback.
+    IndicatorNames {
+        /// `sli->namesPresent | sli->mapsPresent` afterwards.
+        leds_defined: u32,
+        /// The indicators lit (`sli->effectiveState`).
+        state: u32,
+    },
+}
+
+/// What new indicator maps did (Xorg `XkbApplyLedMapChanges` +
+/// `XkbUpdateLedAutoState` on the core keyboard's default feedback), for
+/// its IndicatorMapNotify, IndicatorStateNotify and ExtensionDeviceNotify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XkbIndicatorMapsChange {
+    /// The indicators whose map the request set.
+    pub maps_changed: u32,
+    /// The indicators the new maps turned on or off (0 = none).
+    pub state_changed: u32,
+    /// The indicators lit afterwards (`sli->effectiveState`).
+    pub state: u32,
+    /// `sli->namesPresent | sli->mapsPresent` afterwards.
+    pub leds_defined: u32,
+}
+
+/// What an XKB Set* request did (a port of Xorg's handler in the backend).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XkbSetOutcome {
+    /// The request's error, `(code, errorValue)`. A request that fails its
+    /// checks changes nothing and sends nothing.
+    pub error: Option<(u8, u32)>,
+    pub events: Vec<XkbSetEvent>,
+}
+
+/// What an XKB backend's `ChangeKeyboardMapping` or `SetModifierMapping` did
+/// to its keymap, for the notifications the core loop sends (Xorg
+/// `XkbApplyMappingChange` → `XkbSendNotification`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardMappingChange {
+    /// The `XkbMapNotify` Xorg sends for it: KeySyms over the requested keys
+    /// or ModifierMap over the keycode range, plus the key actions and
+    /// vmodmap it re-derived and, when a virtual modifier's real mapping
+    /// changed, the virtual modifiers and the key types naming them.
+    pub map_notify: yserver_protocol::x11::XkbMapNotify,
+    /// Groups in the keymap afterwards (`XkbControlsNotify.numGroups`).
+    pub num_groups: u8,
+    /// The XKB controls the backend reports enabled in GetControls
+    /// (`XkbControlsNotify.enabledControls`).
+    pub enabled_controls: u32,
+    /// Per re-derived key whose auto-repeat the keymap derives (no explicit
+    /// `repeat=`): whether it repeats now. Xorg's `XkbUpdateActions`
+    /// recomputes these bits of `per_key_repeat` from the interprets.
+    pub repeats: Vec<(u8, bool)>,
+    /// Indicators whose map a virtual modifier mapping change altered
+    /// (`XkbIndicatorMapNotify.changed`; 0 = none).
+    pub indicator_map_changed: u32,
+    /// The indicators lit (`XkbIndicatorMapNotify.state`).
+    pub indicator_state: u32,
+    /// Group compat maps whose resolved mask a virtual modifier mapping
+    /// change altered (`changes->compat.changed_groups`; 0 = none): Xorg's
+    /// `XkbSendNotification` sends a CompatMapNotify for them.
+    pub compat_changed_groups: u8,
+    /// Symbol interprets in the compat map (that CompatMapNotify's
+    /// `nTotalSI`).
+    pub compat_total_si: u16,
+}
+
 /// Outcome of an XkbGetKbdByName keymap load by component names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeymapLoad {
@@ -715,6 +820,12 @@ pub trait Backend {
     /// not change). Default no-op for nested/recording backends.
     fn refresh_randr_state_set_time(&mut self, _state: &mut ServerState, _set_time: u32) {}
 
+    /// The RANDR layout changed (a CRTC set, a screen resize or a server
+    /// reset): take the CRTC transforms and root extent from `state.randr`
+    /// and move the pointer onto a CRTC (`RRPointerScreenConfigured`).
+    /// Default no-op.
+    fn randr_layout_changed(&mut self, _state: &mut ServerState) {}
+
     /// Resize the logical (virtual) screen to `w`×`h`: reallocate the
     /// root + Composite-overlay backing storage and update the pointer
     /// clamp / logical extent. Default no-op `Ok(())` for nested
@@ -871,6 +982,14 @@ pub trait Backend {
     /// own per-drawable storage (the nested `HostX11Backend`,
     /// `RecordingBackend`).
     fn dump_drawables(&mut self) {}
+
+    /// Diagnostic: log exported backings joined with `core()`'s holders if they changed; returns whether they did.
+    fn report_export_holders(
+        &mut self,
+        _core: &dyn Fn() -> crate::backend::export_holders::CoreHolders,
+    ) -> bool {
+        false
+    }
 
     /// Notify the backend that a window property changed or was
     /// deleted. KMS uses this to re-evaluate EWMH stack hints
@@ -1105,6 +1224,26 @@ pub trait Backend {
 
     fn unmap_subwindow(&mut self, origin: Option<OriginContext>, host_xid: u32) -> io::Result<()>;
 
+    /// A window became viewable: allocate and paint its storage (parent first; never root/COW).
+    fn realize_window_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid);
+        Ok(())
+    }
+
+    /// A window became unviewable: drop its storage (core: child first, never root/COW).
+    fn release_window_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid);
+        Ok(())
+    }
+
     fn configure_subwindow(
         &mut self,
         origin: Option<OriginContext>,
@@ -1284,6 +1423,15 @@ pub trait Backend {
     ) -> io::Result<()> {
         let _ = (origin, backing);
         Ok(())
+    }
+
+    /// Drop exactly the one alias ref a freed name held; host-X11 names own a host pixmap each.
+    fn release_window_pixmap_name(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.free_pixmap(origin, backing.as_raw())
     }
 
     /// Returns whether the existing redirected backing storage already
@@ -2360,6 +2508,25 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Xorg `miSyncShmFenceCheckTriggered`: for a fence whose state lives
+    /// in memory shared with the client (a DRI3 `FenceFromFD` xshmfence),
+    /// whether that memory says triggered — the client may trigger or
+    /// reset it itself, so this, not the server's bit, is the fence's
+    /// state. `None` for a fence without shared state.
+    fn dri3_fence_triggered(&self, _fence_xid: u32) -> Option<bool> {
+        None
+    }
+
+    /// Xorg `miSyncShmFenceReset`: SYNC `ResetFence` resets a
+    /// shared-memory fence's memory too (`xshmfence_reset`).
+    fn dri3_reset_fence(&mut self, _fence_xid: u32) {}
+
+    /// Xorg `miSyncShmScreenDestroyFence`: the fence resource is gone
+    /// (DestroyFence, owner disconnect). A shared-memory fence is
+    /// triggered — releasing anything the client waits on — and unmapped;
+    /// any other backing keyed by the xid is dropped.
+    fn dri3_destroy_fence(&mut self, _fence_xid: u32) {}
+
     /// Stage 5 Task 6.1: take an Arc clone of the xshmfence's
     /// underlying primitive, suitable for deferred completion paths
     /// that need to survive an intervening `XFixesDestroyFence`.
@@ -2553,6 +2720,23 @@ pub trait Backend {
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>>;
 
+    /// An XKB Set* request (`minor`, `body` after the 4-byte header) on the
+    /// backend's keyboard description, as Xorg's handler does it;
+    /// `client_is_ancient` = the client asked XkbUseExtension for 0.65;
+    /// `atom_name` resolves an atom of the request (`None`: not a valid
+    /// atom, Xorg's `!ValidAtom`; atoms live in the core loop). `None`
+    /// when this backend doesn't implement `minor`: the request is accepted
+    /// and does nothing.
+    fn xkb_set(
+        &mut self,
+        _minor: u8,
+        _body: &[u8],
+        _client_is_ancient: bool,
+        _atom_name: &dyn Fn(u32) -> Option<String>,
+    ) -> Option<XkbSetOutcome> {
+        None
+    }
+
     /// Load a multi-group keymap from an XKB `symbols` component string
     /// (e.g. "pc+us+de:2+us:3+inet(evdev)"). Default: backends without a real
     /// keymap can't load → `Failed`.
@@ -2578,12 +2762,33 @@ pub trait Backend {
         None
     }
 
-    fn xfixes_change_cursor_by_name(
+    /// XFIXES `ChangeCursor` / `ChangeCursorByName` (Xorg `ReplaceCursor`):
+    /// every place that displays host cursor `old_host_xid` — window cursor
+    /// attributes, the root's default, an active grab's cursor — now uses
+    /// `new_host_xid`, and the sprite refreshes if it showed the old one.
+    /// The core resolves names and cursor ids; the backend only ever sees
+    /// host handles.
+    fn replace_cursor(
         &mut self,
         origin: Option<OriginContext>,
-        host_cursor_xid: u32,
-        name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()>;
+
+    /// XFIXES `HideCursor` / `ShowCursor`: blank (`true`) or restore
+    /// (`false`) the sprite while leaving the effective cursor, and so
+    /// `GetCursorImage` and `CursorNotify`, unchanged. The core only calls
+    /// this on the edges: the first hide by any client and the last show.
+    /// Default no-op for backends that draw no sprite of their own.
+    fn set_cursor_hidden(&mut self, _hidden: bool) {}
+
+    /// Take the pending "the effective cursor changed" report, if the sprite
+    /// switched to a different cursor since the last call. Drained by the
+    /// core after every request and loop iteration to send XFIXES
+    /// `CursorNotify`. Default `None` for backends that track no sprite.
+    fn take_displayed_cursor_change(&mut self) -> Option<DisplayedCursor> {
+        None
+    }
 
     /// Stage 5 unblock — XFIXES `GetCursorImage` data source for the
     /// active on-screen cursor. Returns the straight-alpha BGRA
@@ -2645,6 +2850,23 @@ pub trait Backend {
     /// its test window ("Expected event not received" en masse).
     fn warp_pointer_root(&mut self, _state: &mut ServerState, _x: i32, _y: i32) {}
 
+    /// The window tree changed under a pointer that did not move: a map,
+    /// unmap, configure, restack, reparent, shape change or a destroy (called
+    /// before the dying windows leave the tree). Re-resolve the window under
+    /// the pointer and fan out the crossings within the request, as Xorg's
+    /// `WindowsRestructured` does (`dix/events.c:3269`). Default no-op: a
+    /// host-forwarding backend gets these crossings from the host.
+    fn windows_restructured(&mut self, _state: &mut ServerState) {}
+
+    /// After the server moved the pointer on its own (XTEST fake motion),
+    /// hand the new position to whatever tracks physical pointer input, so
+    /// the next real motion continues from there instead of jumping back.
+    /// The KMS backend's direct-mode input thread accumulates relative
+    /// deltas from its own copy of the position ([`Self::warp_pointer_root`]
+    /// resyncs it the same way). Default no-op: host-forwarding backends get
+    /// their position from the host.
+    fn resync_input_position(&mut self) {}
+
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;
 
     fn list_fonts_proxy(
@@ -2683,6 +2905,36 @@ pub trait Backend {
     ) -> io::Result<(u8, Vec<u32>)>;
 
     fn get_modifier_mapping(&mut self, origin: Option<OriginContext>) -> io::Result<(u8, Vec<u8>)>;
+
+    /// Apply `ChangeKeyboardMapping` to the backend's XKB keymap as Xorg's
+    /// `XkbApplyMappingChange` does. `None` = no XKB keymap here; the core
+    /// loop stores the rows itself (`ServerState::keymap_overrides`).
+    fn change_keyboard_mapping(
+        &mut self,
+        _first_keycode: u8,
+        _keysyms_per_keycode: u8,
+        _keysyms: &[u32],
+    ) -> Option<KeyboardMappingChange> {
+        None
+    }
+
+    /// Apply `SetModifierMapping` (or XI `SetDeviceModifierMapping`) to the
+    /// backend's XKB keymap: `modmap[kc]` is the real modifier of each
+    /// keycode (Xorg `build_modmap_from_modkeymap`; one bit at most, already
+    /// validated, MappingBusy already refused by the core loop). `None` = no
+    /// XKB keymap here; the core loop stores the map itself
+    /// (`ServerState::modifier_mapping_override`).
+    fn set_modifier_mapping(&mut self, _modmap: &[u8; 256]) -> Option<KeyboardMappingChange> {
+        None
+    }
+
+    /// Per-key auto-repeat bits (keycode N → byte N>>3, bit N&7) the
+    /// backend's XKB keymap derives, which seed the core per-key repeat at
+    /// startup as Xorg's `XkbFinishInit` does. `None` = no keymap: keep
+    /// Xorg's `DEFAULT_AUTOREPEATS`.
+    fn keymap_auto_repeats(&self) -> Option<[u8; 32]> {
+        None
+    }
 
     /// RANDR per-output identity for the read-only output properties
     /// `EDID` / `EDID_DATA` / `ConnectorType`: returns `(raw EDID blob,

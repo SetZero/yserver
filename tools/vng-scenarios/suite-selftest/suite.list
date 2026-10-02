@@ -1,0 +1,5 @@
+# Runner self-tests (tools/vng-scenarios/suite-selftest/run.sh): every one must FAIL.
+selftest-fail       guest=fail.sh   timeout=300
+selftest-crash      guest=crash.sh  root-hook=crash-root.sh  timeout=300
+selftest-hang       guest=hang.sh   timeout=60
+selftest-interrupt  guest=hang.sh   timeout=600

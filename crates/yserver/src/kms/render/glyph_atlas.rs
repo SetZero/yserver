@@ -221,7 +221,12 @@ impl GlyphAtlas {
             .allocation_size(mem_reqs.size)
             .memory_type_index(mt)
             .push_next(&mut dedicated);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+            &vk.device,
+            &alloc_info,
+            crate::kms::vk::mem_accounting::MemCategory::Glyph,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { vk.device.destroy_image(image, None) };
@@ -230,7 +235,7 @@ impl GlyphAtlas {
         };
         if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());
@@ -250,7 +255,7 @@ impl GlyphAtlas {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e.into());
@@ -331,8 +336,10 @@ impl GlyphAtlas {
 
     /// Record barriers + `vkCmdCopyBufferToImage` into `cb` that
     /// uploads `w × h` pixels of glyph data from `staging_buffer`
-    /// (offset 0, tightly packed) into the atlas image at
-    /// `(atlas_x, atlas_y)`. Updates the tracked layout to
+    /// (starting at `buffer_offset`, tightly packed) into the atlas
+    /// image at `(atlas_x, atlas_y)`. `buffer_offset` must be a multiple
+    /// of 4 and of the atlas texel size (VUID-vkCmdCopyBufferToImage-
+    /// bufferOffset). Updates the tracked layout to
     /// `SHADER_READ_ONLY_OPTIMAL` on return.
     ///
     /// Caller is responsible for sequencing this on a CB whose
@@ -342,6 +349,7 @@ impl GlyphAtlas {
         &mut self,
         cb: vk::CommandBuffer,
         staging_buffer: vk::Buffer,
+        buffer_offset: vk::DeviceSize,
         atlas_x: u32,
         atlas_y: u32,
         w: u32,
@@ -364,7 +372,7 @@ impl GlyphAtlas {
         unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 
         let region = [vk::BufferImageCopy::default()
-            .buffer_offset(0)
+            .buffer_offset(buffer_offset)
             .buffer_row_length(0)
             .buffer_image_height(0)
             .image_subresource(
@@ -431,7 +439,7 @@ impl Drop for GlyphAtlas {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }

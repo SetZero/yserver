@@ -571,6 +571,11 @@ pub struct TransferResources {
     /// BO (its prior fence has signaled — no wait) to derive
     /// `gpu_render_ns`. `null` if the device has no timestamp support.
     pub timestamp_pool: vk::QueryPool,
+    /// Whether a submitted compose has reset and written both queries.
+    /// Reading a query that was never reset is invalid (validation:
+    /// "query not reset"), so the first compose of a new pool must skip
+    /// the read rather than rely on `NOT_READY`.
+    pub timestamps_written: bool,
 }
 
 // Intentionally `!Send + !Sync`: the mapped staging pointer and every
@@ -774,6 +779,16 @@ impl CopiedRenderSource {
             DrawableImage::new_server_owned_window(Arc::clone(&render_vk), width, height).map_err(
                 |error| copied_drawable_error("allocate copied optimal render target", error),
             )?;
+        for memory in [
+            transport_on_renderer.memory,
+            imported_on_sink.backing_memory(),
+            render_target.backing_memory(),
+        ] {
+            crate::kms::vk::mem_accounting::recategorise(
+                memory,
+                crate::kms::vk::mem_accounting::MemCategory::Scanout,
+            );
+        }
 
         let completion_semaphore = create_export_semaphore(&render_vk).map_err(|result| {
             scanout_vk_error("create copied source completion semaphore", result)
@@ -3500,12 +3515,13 @@ impl Drop for ScanoutBo {
                     staging_mapped: std::ptr::NonNull::dangling(),
                     staging_size: 0,
                     timestamp_pool: vk::QueryPool::null(),
+                    timestamps_written: false,
                 },
             );
             if t.command_pool != vk::CommandPool::null() {
                 self.vk.device.unmap_memory(t.staging_memory);
                 self.vk.device.destroy_buffer(t.staging_buffer, None);
-                self.vk.device.free_memory(t.staging_memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&self.vk.device, t.staging_memory);
                 self.vk.device.destroy_command_pool(t.command_pool, None);
                 if t.timestamp_pool != vk::QueryPool::null() {
                     self.vk.device.destroy_query_pool(t.timestamp_pool, None);
@@ -3518,7 +3534,7 @@ impl Drop for ScanoutBo {
                 self.vk.device.destroy_image_view(self.vk_image_view, None);
             }
             self.vk.device.destroy_image(self.vk_image, None);
-            self.vk.device.free_memory(self.vk_memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.vk_memory);
             if self.vk_semaphore != vk::Semaphore::null() {
                 self.vk.device.destroy_semaphore(self.vk_semaphore, None);
             }
@@ -5433,6 +5449,7 @@ fn scanout_modifier_single_plane_supports_feature(
     modifier_single_plane_supports_feature(vk, modifier, scanout_image_usage(), feature)
 }
 
+#[track_caller]
 fn modifier_single_plane_supports_feature(
     vk: &VkContext,
     modifier: u64,
@@ -5461,13 +5478,13 @@ fn modifier_single_plane_supports_feature(
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    }
+    if super::image_format_properties2(
+        vk,
+        "scanout::modifier_single_plane_supports_feature",
+        Some(modifier),
+        &format_info,
+        &mut props2,
+    )
     .is_err()
     {
         return false;
@@ -5634,6 +5651,7 @@ fn validate_copied_route_pair(
 /// the established allocator's candidate construction. Keeping the runtime
 /// predicate separate guarantees that adding diagnostics cannot prune or
 /// reorder any allocation plan.
+#[track_caller]
 fn probe_scanout_modifier_single_plane_feature(
     vk: &VkContext,
     modifier: u64,
@@ -5662,13 +5680,13 @@ fn probe_scanout_modifier_single_plane_feature(
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if let Err(error) = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    } {
+    if let Err(error) = super::image_format_properties2(
+        vk,
+        "scanout::probe_scanout_modifier_single_plane_feature",
+        Some(modifier),
+        &format_info,
+        &mut props2,
+    ) {
         return if error == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
             Unsupported
         } else {
@@ -5696,6 +5714,7 @@ fn probe_scanout_modifier_single_plane_feature(
 /// `VK_IMAGE_TILING_LINEAR` scanout image. This is the renderer-owned
 /// ExplicitLinear/LegacyLinear evidence; padded explicit-linear remains part
 /// of the modifier observation above.
+#[track_caller]
 fn probe_scanout_linear_feature(
     vk: &VkContext,
     feature: vk::ExternalMemoryFeatureFlags,
@@ -5716,13 +5735,13 @@ fn probe_scanout_linear_feature(
         .push_next(&mut external_info);
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if let Err(error) = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    } {
+    if let Err(error) = super::image_format_properties2(
+        vk,
+        "scanout::probe_scanout_linear_feature",
+        None,
+        &format_info,
+        &mut props2,
+    ) {
         return if error == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
             Unsupported
         } else {
@@ -5802,7 +5821,7 @@ fn addfb_flags_for_modifier(modifier: Option<u64>) -> FbCmd2Flags {
 fn destroy_scanout_image(vk: &VkContext, image: vk::Image, memory: vk::DeviceMemory) {
     unsafe {
         vk.device.destroy_image(image, None);
-        vk.device.free_memory(memory, None);
+        crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
     }
 }
 
@@ -5961,7 +5980,12 @@ fn allocate_vk_scanout_image(
         .push_next(&mut export_info)
         .push_next(&mut dedicated);
 
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scanout,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -5971,7 +5995,7 @@ fn allocate_vk_scanout_image(
 
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(e);
@@ -5981,7 +6005,7 @@ fn allocate_vk_scanout_image(
         ScanoutAllocationPlan::DrmModifier(_) => {
             let Some(ext) = vk.image_drm_format_modifier_ext.as_ref() else {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
@@ -5991,7 +6015,7 @@ fn allocate_vk_scanout_image(
                 unsafe { ext.get_image_drm_format_modifier_properties(image, &mut props) }
             {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e);
@@ -6042,7 +6066,7 @@ fn allocate_vk_scanout_image(
         Ok(fd) => fd,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e);
@@ -6237,7 +6261,12 @@ fn allocate_gbm_scanout_image(
         .memory_type_index(memory_type_index)
         .push_next(&mut import_info)
         .push_next(&mut dedicated);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scanout,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe {
@@ -6251,7 +6280,7 @@ fn allocate_gbm_scanout_image(
     // On success `memory` owns `vk_fd_raw`; do NOT close it here.
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(GbmScanoutError::Vk(e));
@@ -6447,7 +6476,12 @@ fn allocate_transfer_resources(
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(memory_type_index);
-    let staging_memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let staging_memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Staging,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe {
@@ -6462,7 +6496,7 @@ fn allocate_transfer_resources(
             .bind_buffer_memory(staging_buffer, staging_memory, 0)
     } {
         unsafe {
-            vk.device.free_memory(staging_memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, staging_memory);
             vk.device.destroy_buffer(staging_buffer, None);
             vk.device.destroy_command_pool(command_pool, None);
         }
@@ -6476,7 +6510,7 @@ fn allocate_transfer_resources(
         Ok(p) => p,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(staging_memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, staging_memory);
                 vk.device.destroy_buffer(staging_buffer, None);
                 vk.device.destroy_command_pool(command_pool, None);
             }
@@ -6501,7 +6535,7 @@ fn allocate_transfer_resources(
                 unsafe {
                     vk.device.unmap_memory(staging_memory);
                     vk.device.destroy_buffer(staging_buffer, None);
-                    vk.device.free_memory(staging_memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, staging_memory);
                     vk.device.destroy_command_pool(command_pool, None);
                 }
                 return Err(error);
@@ -6517,6 +6551,7 @@ fn allocate_transfer_resources(
         staging_mapped,
         staging_size,
         timestamp_pool,
+        timestamps_written: false,
     })
 }
 
@@ -6531,7 +6566,7 @@ fn destroy_transfer_resources(vk: &VkContext, transfer: &mut TransferResources) 
     unsafe {
         vk.device.unmap_memory(transfer.staging_memory);
         vk.device.destroy_buffer(transfer.staging_buffer, None);
-        vk.device.free_memory(transfer.staging_memory, None);
+        crate::kms::vk::mem_accounting::free_memory(&vk.device, transfer.staging_memory);
         if transfer.timestamp_pool != vk::QueryPool::null() {
             vk.device.destroy_query_pool(transfer.timestamp_pool, None);
         }

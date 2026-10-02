@@ -1,0 +1,362 @@
+==> rotate.log <==
+===== normal: xrandr --output Virtual-1 --rotate normal
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+  Width: 1280
+  Height: 800
+  dimensions:    1280x800 pixels (<startup mm> millimeters)
+  resolution:    96x96 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1280x800 @ 0,0
+  screen 1280 x 800
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode> rotation 0x1 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 1280x800: applied
+  crop 1279x800: rejected
+  crop 1280x799: rejected
+  crop 800x1280: rejected
+  crop 4000x4000: applied
+===== left: xrandr --output Virtual-1 --rotate left
+Screen 0: minimum 320 x 200, current 800 x 1280, maximum <max>
+Virtual-1 connected primary 800x1280+0+0 (<mode>) left (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+  Width: 800
+  Height: 1280
+  dimensions:    800x1280 pixels (200x320 millimeters)
+  resolution:    102x102 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 800x1280 @ 0,0
+  screen 800 x 1280
+  crtc <crtc> pos 0 0 size 800 1280 mode <mode> rotation 0x2 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 800x1280: applied
+  crop 799x1280: rejected
+  crop 800x1279: rejected
+  crop 1280x800: rejected
+  crop 4000x4000: applied
+===== right: xrandr --output Virtual-1 --rotate right
+Screen 0: minimum 320 x 200, current 800 x 1280, maximum <max>
+Virtual-1 connected primary 800x1280+0+0 (<mode>) right (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+  Width: 800
+  Height: 1280
+  dimensions:    800x1280 pixels (300x200 millimeters)
+  resolution:    68x163 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 800x1280 @ 0,0
+  screen 800 x 1280
+  crtc <crtc> pos 0 0 size 800 1280 mode <mode> rotation 0x8 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 800x1280: applied
+  crop 799x1280: rejected
+  crop 800x1279: rejected
+  crop 1280x800: rejected
+  crop 4000x4000: applied
+===== inverted: xrandr --output Virtual-1 --rotate inverted
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) inverted (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+  Width: 1280
+  Height: 800
+  dimensions:    1280x800 pixels (200x125 millimeters)
+  resolution:    163x163 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1280x800 @ 0,0
+  screen 1280 x 800
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode> rotation 0x4 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 1280x800: applied
+  crop 1279x800: rejected
+  crop 1280x799: rejected
+  crop 800x1280: rejected
+  crop 4000x4000: applied
+===== reflect-x: xrandr --output Virtual-1 --rotate normal --reflect x
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal X axis (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+  Width: 1280
+  Height: 800
+  dimensions:    1280x800 pixels (300x200 millimeters)
+  resolution:    108x102 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1280x800 @ 0,0
+  screen 1280 x 800
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode> rotation 0x11 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 1280x800: applied
+  crop 1279x800: rejected
+  crop 1280x799: rejected
+  crop 800x1280: rejected
+  crop 4000x4000: applied
+===== reflect-y: xrandr --output Virtual-1 --reflect y
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal Y axis (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+  Width: 1280
+  Height: 800
+  dimensions:    1280x800 pixels (300x200 millimeters)
+  resolution:    108x102 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1280x800 @ 0,0
+  screen 1280 x 800
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode> rotation 0x21 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 1280x800: applied
+  crop 1279x800: rejected
+  crop 1280x799: rejected
+  crop 800x1280: rejected
+  crop 4000x4000: applied
+===== reflect-xy: xrandr --output Virtual-1 --reflect xy
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal X and Y axis (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+  Width: 1280
+  Height: 800
+  dimensions:    1280x800 pixels (300x200 millimeters)
+  resolution:    108x102 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1280x800 @ 0,0
+  screen 1280 x 800
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode> rotation 0x31 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 1280x800: applied
+  crop 1279x800: rejected
+  crop 1280x799: rejected
+  crop 800x1280: rejected
+  crop 4000x4000: applied
+===== left-reflect-x: xrandr --output Virtual-1 --rotate left --reflect x
+Screen 0: minimum 320 x 200, current 800 x 1280, maximum <max>
+Virtual-1 connected primary 800x1280+0+0 (<mode>) left X axis (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 800/<mm>x1280/<mm>+0+0  Virtual-1
+  Width: 800
+  Height: 1280
+  dimensions:    800x1280 pixels (200x320 millimeters)
+  resolution:    102x102 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 800x1280 @ 0,0
+  screen 800 x 1280
+  crtc <crtc> pos 0 0 size 800 1280 mode <mode> rotation 0x12 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 800x1280: applied
+  crop 799x1280: rejected
+  crop 800x1279: rejected
+  crop 1280x800: rejected
+  crop 4000x4000: applied
+===== left-scale2: xrandr --output Virtual-1 --reflect normal --rotate left --scale 2x2
+Screen 0: minimum 320 x 200, current 1600 x 2560, maximum <max>
+Virtual-1 connected primary 1600x2560+0+0 (<mode>) left (normal left inverted right x axis y axis) <mm>
+	Transform:  2.000000 0.000000 0.000000
+	           filter: bilinear
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1600/<mm>x2560/<mm>+0+0  Virtual-1
+  Width: 1600
+  Height: 2560
+  dimensions:    1600x2560 pixels (250x400 millimeters)
+  resolution:    163x163 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1600x2560 @ 0,0
+  screen 1600 x 2560
+  crtc <crtc> pos 0 0 size 1600 2560 mode <mode> rotation 0x2 rotations 0x3f
+   cur {'matrix11': 131072, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 131072, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 131072, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 131072, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter bilinear
+  timestamp <t> config <t>
+  crop 1600x2560: applied
+  crop 1599x2560: applied
+  crop 1600x2559: applied
+  crop 2560x1600: applied
+  crop 4000x4000: applied
+===== left-scale2-pos: xrandr --output Virtual-1 --rotate left --scale 2x2 --pos 0x0
+Screen 0: minimum 320 x 200, current 1600 x 2560, maximum <max>
+Virtual-1 connected primary 1600x2560+0+0 (<mode>) left (normal left inverted right x axis y axis) <mm>
+	Transform:  2.000000 0.000000 0.000000
+	           filter: bilinear
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1600/<mm>x2560/<mm>+0+0  Virtual-1
+  Width: 1600
+  Height: 2560
+  dimensions:    1600x2560 pixels (300x200 millimeters)
+  resolution:    135x325 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1600x2560 @ 0,0
+  screen 1600 x 2560
+  crtc <crtc> pos 0 0 size 1600 2560 mode <mode> rotation 0x2 rotations 0x3f
+   cur {'matrix11': 131072, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 131072, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 131072, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 131072, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter bilinear
+  timestamp <t> config <t>
+  crop 1600x2560: applied
+  crop 1599x2560: applied
+  crop 1600x2559: applied
+  crop 2560x1600: applied
+  crop 4000x4000: applied
+===== restore: xrandr --output Virtual-1 --rotate normal --scale 1x1
+Screen 0: minimum 320 x 200, current 1280 x 800, maximum <max>
+Virtual-1 connected primary 1280x800+0+0 (<mode>) normal (normal left inverted right x axis y axis) <mm>
+	Transform:  1.000000 0.000000 0.000000
+	           filter:
+  1280x800 (<mode>) 107.300MHz -HSync -VSync *current +preferred
+Monitors: 1
+ 0: +*Virtual-1 1280/<mm>x800/<mm>+0+0  Virtual-1
+  Width: 1280
+  Height: 800
+  dimensions:    1280x800 pixels (100x62 millimeters)
+  resolution:    325x328 dots per inch
+    XINERAMA
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1280x800 @ 0,0
+  screen 1280 x 800
+  crtc <crtc> pos 0 0 size 1280 800 mode <mode> rotation 0x1 rotations 0x3f
+   cur {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} pend {'matrix11': 65536, 'matrix12': 0, 'matrix13': 0, 'matrix21': 0, 'matrix22': 65536, 'matrix23': 0, 'matrix31': 0, 'matrix32': 0, 'matrix33': 65536} filter
+  timestamp <t> config <t>
+  crop 1280x800: applied
+  crop 1279x800: rejected
+  crop 1280x799: rejected
+  crop 800x1280: rejected
+  crop 4000x4000: applied
+==> events.log <==
+ScreenChangeNotify rotation 0x1 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x1 size 4000 4000 mm 300 200
+ScreenChangeNotify rotation 0x1 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x1 size 1280 800 mm 300 200
+CrtcChangeNotify rotation 0x1 geom 0 0 0 0
+ScreenChangeNotify rotation 0x1 size 800 1280 mm 200 320
+ScreenChangeNotify rotation 0x2 size 1280 800 mm 320 200
+CrtcChangeNotify rotation 0x2 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x2 size 1280 800 mm 200 300
+ScreenChangeNotify rotation 0x2 size 4000 4000 mm 200 300
+ScreenChangeNotify rotation 0x2 size 1280 800 mm 200 300
+ScreenChangeNotify rotation 0x8 size 1280 800 mm 200 300
+CrtcChangeNotify rotation 0x8 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x8 size 4000 4000 mm 200 300
+ScreenChangeNotify rotation 0x8 size 1280 800 mm 200 300
+ScreenChangeNotify rotation 0x8 size 1280 800 mm 200 300
+CrtcChangeNotify rotation 0x8 geom 0 0 0 0
+ScreenChangeNotify rotation 0x8 size 800 1280 mm 125 200
+ScreenChangeNotify rotation 0x4 size 1280 800 mm 200 125
+CrtcChangeNotify rotation 0x4 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x4 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x4 size 4000 4000 mm 300 200
+ScreenChangeNotify rotation 0x4 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x11 size 1280 800 mm 300 200
+CrtcChangeNotify rotation 0x11 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x11 size 4000 4000 mm 300 200
+ScreenChangeNotify rotation 0x11 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x21 size 1280 800 mm 300 200
+CrtcChangeNotify rotation 0x21 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x21 size 4000 4000 mm 300 200
+ScreenChangeNotify rotation 0x21 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x31 size 1280 800 mm 300 200
+CrtcChangeNotify rotation 0x31 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x31 size 4000 4000 mm 300 200
+ScreenChangeNotify rotation 0x31 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x31 size 1280 800 mm 300 200
+CrtcChangeNotify rotation 0x31 geom 0 0 0 0
+ScreenChangeNotify rotation 0x31 size 800 1280 mm 200 320
+ScreenChangeNotify rotation 0x12 size 1280 800 mm 320 200
+CrtcChangeNotify rotation 0x12 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x12 size 1280 800 mm 200 300
+ScreenChangeNotify rotation 0x12 size 4000 4000 mm 200 300
+ScreenChangeNotify rotation 0x12 size 1280 800 mm 200 300
+ScreenChangeNotify rotation 0x12 size 1280 800 mm 200 300
+CrtcChangeNotify rotation 0x12 geom 0 0 0 0
+ScreenChangeNotify rotation 0x12 size 2560 1600 mm 400 250
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 400 250
+CrtcChangeNotify rotation 0x2 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1599 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2559 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 1600 2560 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 4000 4000 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1599 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2559 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 1600 2560 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 4000 4000 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+ScreenChangeNotify rotation 0x2 size 2560 1600 mm 200 300
+CrtcChangeNotify rotation 0x2 geom 0 0 0 0
+ScreenChangeNotify rotation 0x2 size 800 1280 mm 62 100
+ScreenChangeNotify rotation 0x1 size 1280 800 mm 100 62
+CrtcChangeNotify rotation 0x1 geom 0 0 1280 800
+ScreenChangeNotify rotation 0x1 size 1280 800 mm 300 200
+ScreenChangeNotify rotation 0x1 size 4000 4000 mm 300 200
+ScreenChangeNotify rotation 0x1 size 1280 800 mm 300 200
+==> root-pixels.txt <==
+root-inverted-301.png (1280, 800) 40e3c7d9d61b43fa
+root-inverted-700.png (1280, 800) 40e3c7d9d61b43fa
+root-left-301.png (800, 1280) f80e1cad6c60af03
+root-left-700.png (800, 1280) f80e1cad6c60af03
+root-left-reflect-x-301.png (800, 1280) f80e1cad6c60af03
+root-left-reflect-x-700.png (800, 1280) f80e1cad6c60af03
+root-left-scale2-301.png (1600, 2560) 2cb41513b1101123
+root-left-scale2-700.png (1600, 2560) 2cb41513b1101123
+root-left-scale2-pos-301.png (1600, 2560) 2cb41513b1101123
+root-left-scale2-pos-700.png (1600, 2560) 2cb41513b1101123
+root-normal-301.png (1280, 800) 40e3c7d9d61b43fa
+root-normal-700.png (1280, 800) 40e3c7d9d61b43fa
+root-reflect-x-301.png (1280, 800) 40e3c7d9d61b43fa
+root-reflect-x-700.png (1280, 800) 40e3c7d9d61b43fa
+root-reflect-xy-301.png (1280, 800) 40e3c7d9d61b43fa
+root-reflect-xy-700.png (1280, 800) 40e3c7d9d61b43fa
+root-reflect-y-301.png (1280, 800) 40e3c7d9d61b43fa
+root-reflect-y-700.png (1280, 800) 40e3c7d9d61b43fa
+root-restore-301.png (1280, 800) 40e3c7d9d61b43fa
+root-restore-700.png (1280, 800) 40e3c7d9d61b43fa
+root-right-301.png (800, 1280) f80e1cad6c60af03
+root-right-700.png (800, 1280) f80e1cad6c60af03

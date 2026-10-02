@@ -114,7 +114,7 @@ impl Drop for GradientPictureResources {
         unsafe {
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.memory);
         }
     }
 }
@@ -465,7 +465,13 @@ fn allocate_image(
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt)
         .push_next(&mut dedicated);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory_as(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Other,
+        crate::kms::vk::mem_accounting::ChurnClass::Gradient,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -474,7 +480,7 @@ fn allocate_image(
     };
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(e.into());
@@ -493,7 +499,7 @@ fn allocate_image(
         Ok(v) => v,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());
@@ -543,7 +549,13 @@ fn upload_initial(
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory_as(
+        &vk.device,
+        &alloc,
+        crate::kms::vk::mem_accounting::MemCategory::Staging,
+        crate::kms::vk::mem_accounting::ChurnClass::Gradient,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_buffer(buffer, None) };
@@ -552,7 +564,7 @@ fn upload_initial(
     };
     if let Err(e) = unsafe { vk.device.bind_buffer_memory(buffer, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_buffer(buffer, None);
         }
         return Err(e.into());
@@ -564,7 +576,7 @@ fn upload_initial(
         Ok(p) => p,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_buffer(buffer, None);
             }
             return Err(e.into());
@@ -643,7 +655,7 @@ fn upload_initial(
     unsafe {
         vk.device.unmap_memory(memory);
         vk.device.destroy_buffer(buffer, None);
-        vk.device.free_memory(memory, None);
+        crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
     }
     result?;
     Ok(())

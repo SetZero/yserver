@@ -72,6 +72,8 @@ pub const RR_CHANGE_PROVIDER_PROPERTY: u8 = 39;
 pub const RR_DELETE_PROVIDER_PROPERTY: u8 = 40;
 pub const RR_GET_PROVIDER_PROPERTY: u8 = 41;
 pub const RR_GET_MONITORS: u8 = 42;
+pub const RR_SET_MONITOR: u8 = 43;
+pub const RR_DELETE_MONITOR: u8 = 44;
 
 pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
@@ -211,16 +213,21 @@ pub struct SetScreenSizeRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SetCrtcTransformRequest {
     pub crtc: u32,
+    /// Row-major 16.16 matrix.
     pub transform: [i32; 9],
+    /// `nbytesFilter`.
     pub filter_name_len: u16,
-    pub filter_param_count: usize,
+    /// Filter name and parameters; `None` when the padded name overruns
+    /// the request (Xorg's negative `nparams`, BadLength).
+    pub filter: Option<TransformFilterSpec>,
 }
 
-impl SetCrtcTransformRequest {
-    #[must_use]
-    pub fn is_identity_transform(&self) -> bool {
-        self.transform == [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000]
-    }
+/// `SetCrtcTransform`'s variable part: the filter name bytes as sent and
+/// the trailing `FIXED` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransformFilterSpec {
+    pub name: Vec<u8>,
+    pub params: Vec<i32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -483,6 +490,9 @@ pub fn parse_set_screen_size_request(body: &[u8]) -> Option<SetScreenSizeRequest
 ///
 /// Bytes after the padded filter name are zero or more 16.16 `FIXED`
 /// filter parameters. Their count is implicit in the X11 request length.
+/// `None` only for a body shorter than the fixed part (`REQUEST_AT_LEAST_SIZE`);
+/// a malformed tail is reported through `filter`. Big-endian bodies arrive
+/// here already swapped (`request_swap`).
 pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformRequest> {
     if body.len() < 44 {
         return None;
@@ -493,16 +503,69 @@ pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformR
         *cell = i32::from_le_bytes(body[offset..offset + 4].try_into().ok()?);
     }
     let filter_name_len = read_u16_le(&body[40..]);
-    let filter_end = 44usize.checked_add(pad4(usize::from(filter_name_len)))?;
-    if filter_end > body.len() || !(body.len() - filter_end).is_multiple_of(4) {
-        return None;
-    }
+    let name_end = 44 + usize::from(filter_name_len);
+    let filter_end = 44 + pad4(usize::from(filter_name_len));
+    let filter =
+        (filter_end <= body.len() && (body.len() - filter_end).is_multiple_of(4)).then(|| {
+            TransformFilterSpec {
+                name: body[44..name_end].to_vec(),
+                params: body[filter_end..]
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            }
+        });
     Some(SetCrtcTransformRequest {
         crtc: read_u32_le(body),
         transform,
         filter_name_len,
-        filter_param_count: (body.len() - filter_end) / 4,
+        filter,
     })
+}
+
+/// RANDR 1.5 `SetMonitor` body: `window(4)` then an `xRRMonitorInfo`
+/// (`name(4) primary(1) automatic(1) noutput(2) x(2) y(2) width(2)
+/// height(2) widthInMillimeters(4) heightInMillimeters(4)`) and the output
+/// list. `noutput` is the client's count; the tail is whatever followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetMonitorRequest {
+    pub window: u32,
+    pub name: u32,
+    pub primary: bool,
+    pub noutput: u16,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+    pub outputs: Vec<u32>,
+}
+
+/// Parse `RRSetMonitor`. `None` for a body shorter than the fixed part
+/// (`REQUEST_AT_LEAST_SIZE`); the caller checks `noutput` against the tail.
+pub fn parse_set_monitor_request(body: &[u8]) -> Option<SetMonitorRequest> {
+    if body.len() < 28 {
+        return None;
+    }
+    Some(SetMonitorRequest {
+        window: read_u32_le(body),
+        name: read_u32_le(&body[4..]),
+        primary: body[8] != 0,
+        noutput: read_u16_le(&body[10..]),
+        x: i16::from_le_bytes([body[12], body[13]]),
+        y: i16::from_le_bytes([body[14], body[15]]),
+        width: read_u16_le(&body[16..]),
+        height: read_u16_le(&body[18..]),
+        width_mm: read_u32_le(&body[20..]),
+        height_mm: read_u32_le(&body[24..]),
+        outputs: body[28..].chunks_exact(4).map(read_u32_le).collect(),
+    })
+}
+
+/// Parse the fixed-size `RRDeleteMonitor` body: `(window, name)`.
+pub fn parse_delete_monitor_request(body: &[u8]) -> Option<(u32, u32)> {
+    (body.len() == 8).then(|| (read_u32_le(body), read_u32_le(&body[4..])))
 }
 
 /// Parse the fixed-size `RRSetPanning` request body.
@@ -631,54 +694,96 @@ pub fn encode_query_version_reply(
     out
 }
 
-/// Encodes a `GetScreenInfo` reply for the single synthetic mode.
-///
-/// Layout (RANDR 1.1+): 32-byte header followed by one `ScreenSize` (8 bytes)
-/// and one `RefreshRates` list (`nRates` u16 + `nRates` * 2 bytes, padded to 4
-/// bytes). `nInfo = nSizes + nRefreshLists` so libXrandr can iterate the
-/// trailing refresh-list section.
+/// One `xScreenSizes` of a `GetScreenInfo` reply and its rates.
+pub struct ScreenInfoSize<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub mm_width: u16,
+    pub mm_height: u16,
+    pub rates: &'a [u16],
+}
+
+/// The body of a `GetScreenInfo` reply (`ProcRRGetScreenInfo`,
+/// rrscreen.c:760-898).
+pub struct ScreenInfoReply<'a> {
+    pub root: u32,
+    pub timestamp: u32,
+    pub config_timestamp: u32,
+    /// `setOfRotations`, a CARD8.
+    pub rotations: u8,
+    pub rotation: u16,
+    pub size_id: u16,
+    pub rate: u16,
+    pub sizes: &'a [ScreenInfoSize<'a>],
+    /// `RRClientKnowsRates`: the rate lists follow the sizes only then;
+    /// `nrateEnts` is sent either way.
+    pub has_rate: bool,
+}
+
+/// Encodes a `GetScreenInfo` reply: the sizes, then for a 1.1+ client each
+/// size's `nRates` and rates, the whole padded to 4 bytes.
 #[must_use]
 pub fn encode_get_screen_info_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    root: u32,
-    timestamp: u32,
-    config_timestamp: u32,
-    width: u16,
-    height: u16,
-    mwidth: u16,
-    mheight: u16,
+    info: &ScreenInfoReply<'_>,
 ) -> Vec<u8> {
-    let n_sizes: u16 = 1;
-    let n_rates: u16 = 1;
-    let n_info: u16 = n_sizes * 2; // one refresh list per size
-    let refresh_record_padded = pad4(2 + 2 * usize::from(n_rates));
-    let extra = usize::from(n_sizes) * 8 + usize::from(n_sizes) * refresh_record_padded;
+    let n_rate_ents: usize = info.sizes.iter().map(|s| 1 + s.rates.len()).sum();
+    let mut extra = info.sizes.len() * 8;
+    if info.has_rate {
+        extra += n_rate_ents * 2;
+    }
     #[allow(clippy::cast_possible_truncation)]
-    let length = (extra / 4) as u32;
-    let rotations: u8 = 1; // RR_Rotate_0 only
-
-    let mut out = fixed_reply(byte_order, sequence, rotations, length);
-    put(byte_order, &mut out, root);
-    put(byte_order, &mut out, timestamp);
-    put(byte_order, &mut out, config_timestamp);
-    put(byte_order, &mut out, n_sizes);
-    put(byte_order, &mut out, 0u16); // sizeID = 0 (current)
-    put(byte_order, &mut out, 1u16); // rotation = RR_Rotate_0
-    put(byte_order, &mut out, 60u16); // current rate = 60 Hz
-    put(byte_order, &mut out, n_info);
+    let length = (pad4(extra) / 4) as u32;
+    let mut out = fixed_reply(byte_order, sequence, info.rotations, length);
+    put(byte_order, &mut out, info.root);
+    put(byte_order, &mut out, info.timestamp);
+    put(byte_order, &mut out, info.config_timestamp);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.sizes.len() as u16);
+    put(byte_order, &mut out, info.size_id);
+    put(byte_order, &mut out, info.rotation);
+    put(byte_order, &mut out, info.rate);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, n_rate_ents as u16);
     out.extend_from_slice(&[0u8; 2]);
     debug_assert_eq!(out.len(), 32);
-
-    put(byte_order, &mut out, width);
-    put(byte_order, &mut out, height);
-    put(byte_order, &mut out, mwidth);
-    put(byte_order, &mut out, mheight);
-
-    put(byte_order, &mut out, n_rates);
-    put(byte_order, &mut out, 60u16);
+    for size in info.sizes {
+        put(byte_order, &mut out, size.width);
+        put(byte_order, &mut out, size.height);
+        put(byte_order, &mut out, size.mm_width);
+        put(byte_order, &mut out, size.mm_height);
+    }
+    if info.has_rate {
+        for size in info.sizes {
+            #[allow(clippy::cast_possible_truncation)]
+            put(byte_order, &mut out, size.rates.len() as u16);
+            for &rate in size.rates {
+                put(byte_order, &mut out, rate);
+            }
+        }
+    }
     pad_vec4(&mut out);
+    out
+}
 
+/// Encodes a `SetScreenConfig` reply (32 bytes).
+#[must_use]
+pub fn encode_set_screen_config_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+    new_timestamp: u32,
+    new_config_timestamp: u32,
+    root: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, status, 0);
+    put(byte_order, &mut out, new_timestamp);
+    put(byte_order, &mut out, new_config_timestamp);
+    put(byte_order, &mut out, root);
+    put(byte_order, &mut out, SUBPIXEL_UNKNOWN);
+    out.extend_from_slice(&[0u8; 10]);
+    debug_assert_eq!(out.len(), 32);
     out
 }
 
@@ -720,9 +825,9 @@ pub fn encode_get_screen_resources_current_reply(
 
     let mut out = fixed_reply(byte_order, sequence, 0, length);
     // bytes 8-11: timestamp
-    out.extend_from_slice(&resources.timestamp.to_le_bytes());
+    put(byte_order, &mut out, resources.timestamp);
     // bytes 12-15: config_timestamp
-    out.extend_from_slice(&resources.config_timestamp.to_le_bytes());
+    put(byte_order, &mut out, resources.config_timestamp);
     // bytes 16-17: num_crtcs
     #[allow(clippy::cast_possible_truncation)]
     put(byte_order, &mut out, num_crtcs as u16);
@@ -748,19 +853,19 @@ pub fn encode_get_screen_resources_current_reply(
     }
     // mode info structs (xRRModeInfo, each 32 bytes)
     for mode in &resources.modes {
-        out.extend_from_slice(&mode.id.to_le_bytes());
-        out.extend_from_slice(&mode.width.to_le_bytes());
-        out.extend_from_slice(&mode.height.to_le_bytes());
-        out.extend_from_slice(&mode.dot_clock.to_le_bytes());
-        out.extend_from_slice(&mode.hsync_start.to_le_bytes());
-        out.extend_from_slice(&mode.hsync_end.to_le_bytes());
-        out.extend_from_slice(&mode.htotal.to_le_bytes());
-        out.extend_from_slice(&mode.hskew.to_le_bytes());
-        out.extend_from_slice(&mode.vsync_start.to_le_bytes());
-        out.extend_from_slice(&mode.vsync_end.to_le_bytes());
-        out.extend_from_slice(&mode.vtotal.to_le_bytes());
-        out.extend_from_slice(&mode.name_len.to_le_bytes());
-        out.extend_from_slice(&mode.mode_flags.to_le_bytes());
+        put(byte_order, &mut out, mode.id);
+        put(byte_order, &mut out, mode.width);
+        put(byte_order, &mut out, mode.height);
+        put(byte_order, &mut out, mode.dot_clock);
+        put(byte_order, &mut out, mode.hsync_start);
+        put(byte_order, &mut out, mode.hsync_end);
+        put(byte_order, &mut out, mode.htotal);
+        put(byte_order, &mut out, mode.hskew);
+        put(byte_order, &mut out, mode.vsync_start);
+        put(byte_order, &mut out, mode.vsync_end);
+        put(byte_order, &mut out, mode.vtotal);
+        put(byte_order, &mut out, mode.name_len);
+        put(byte_order, &mut out, mode.mode_flags);
     }
     // mode names (padded to 4)
     out.extend_from_slice(&resources.mode_names);
@@ -942,28 +1047,58 @@ pub fn encode_get_crtc_info_reply(
     out
 }
 
-/// Encodes a `GetCrtcTransform` reply (96 bytes) with identity transforms and no filter.
+/// One of `GetCrtcTransform`'s two transforms: matrix, canonical filter
+/// name (empty = no filter) and parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct CrtcTransformReplyPart<'a> {
+    pub matrix: [i32; 9],
+    pub filter_name: &'a [u8],
+    pub params: &'a [i32],
+}
+
+/// Encodes a `GetCrtcTransform` reply (`ProcRRGetCrtcTransform`).
 ///
 /// Wire layout: standard 8-byte header + pendingTransform(36) + hasTransforms(1)+pad(3) +
-/// currentTransform(36) + pad(4) + four u16 filter-length fields.
-/// Identity matrix in 16.16 fixed-point: diagonal = 0x0001_0000, off-diagonal = 0.
+/// currentTransform(36) + pad(4) + four u16 filter-length fields (96 bytes), then the
+/// pending and current filters, each a padded name followed by its `FIXED` parameters.
 pub fn encode_get_crtc_transform_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    has_transforms: bool,
+    pending: CrtcTransformReplyPart<'_>,
+    current: CrtcTransformReplyPart<'_>,
 ) -> Vec<u8> {
-    const IDENTITY: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
-    let mut out = fixed_reply(byte_order, sequence, 0, 16); // 64 extra bytes = 16 CARD32s
-    for &v in &IDENTITY {
-        put(byte_order, &mut out, v); // bytes 8-43: pendingTransform
+    let filter_len =
+        |part: &CrtcTransformReplyPart<'_>| pad4(part.filter_name.len()) + part.params.len() * 4;
+    let extra = filter_len(&pending) + filter_len(&current);
+    #[allow(clippy::cast_possible_truncation)]
+    let length = ((64 + extra) / 4) as u32;
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
+    for v in pending.matrix {
+        put(byte_order, &mut out, v as u32); // bytes 8-43: pendingTransform
     }
-    out.push(0); // byte 44: hasTransforms = false
+    out.push(u8::from(has_transforms)); // byte 44
     out.extend_from_slice(&[0u8; 3]); // bytes 45-47: pad
-    for &v in &IDENTITY {
-        put(byte_order, &mut out, v); // bytes 48-83: currentTransform
+    for v in current.matrix {
+        put(byte_order, &mut out, v as u32); // bytes 48-83: currentTransform
     }
     out.extend_from_slice(&[0u8; 4]); // bytes 84-87: pad
-    out.extend_from_slice(&[0u8; 8]); // bytes 88-95: four u16 filter lengths (all 0)
+    #[allow(clippy::cast_possible_truncation)]
+    for part in [&pending, &current] {
+        put(byte_order, &mut out, part.filter_name.len() as u16);
+        put(byte_order, &mut out, part.params.len() as u16);
+    }
     debug_assert_eq!(out.len(), 96);
+    for part in [&pending, &current] {
+        out.extend_from_slice(part.filter_name);
+        out.resize(
+            out.len() + pad4(part.filter_name.len()) - part.filter_name.len(),
+            0,
+        );
+        for &param in part.params {
+            put(byte_order, &mut out, param as u32);
+        }
+    }
     out
 }
 
@@ -1213,16 +1348,16 @@ pub fn encode_get_monitors_reply(
     for m in monitors {
         #[allow(clippy::cast_possible_truncation)]
         let n_out = m.outputs.len() as u16;
-        out.extend_from_slice(&m.name.to_le_bytes()); // 4: name (Atom)
+        put(byte_order, &mut out, m.name); // 4: name (Atom)
         out.push(u8::from(m.primary)); // 1: primary
         out.push(u8::from(m.automatic)); // 1: automatic
         put(byte_order, &mut out, n_out); // 2: nOutput
-        out.extend_from_slice(&m.x.to_le_bytes()); // 2: x
-        out.extend_from_slice(&m.y.to_le_bytes()); // 2: y
-        out.extend_from_slice(&m.width.to_le_bytes()); // 2: width
-        out.extend_from_slice(&m.height.to_le_bytes()); // 2: height
-        out.extend_from_slice(&m.width_mm.to_le_bytes()); // 4: widthInMillimeters
-        out.extend_from_slice(&m.height_mm.to_le_bytes()); // 4: heightInMillimeters
+        put(byte_order, &mut out, m.x); // 2: x
+        put(byte_order, &mut out, m.y); // 2: y
+        put(byte_order, &mut out, m.width); // 2: width
+        put(byte_order, &mut out, m.height); // 2: height
+        put(byte_order, &mut out, m.width_mm); // 4: widthInMillimeters
+        put(byte_order, &mut out, m.height_mm); // 4: heightInMillimeters
         for &oid in m.outputs {
             put(byte_order, &mut out, oid);
         }
@@ -1272,6 +1407,9 @@ pub fn encode_get_crtc_gamma_reply(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScreenChangeNotify {
+    /// The first CRTC's rotation (`crtcs[0]`, rrscreen.c:100); the caller
+    /// swaps the sizes for 90/270, as `RRDeliverScreenEvent` does.
+    pub rotation: u8,
     pub timestamp: u32,
     pub config_timestamp: u32,
     pub root: u32,
@@ -1288,6 +1426,7 @@ pub struct CrtcChangeNotify {
     pub request_window: u32,
     pub crtc: u32,
     pub mode: u32,
+    pub rotation: u16,
     pub x: i16,
     pub y: i16,
     pub width: u16,
@@ -1315,6 +1454,8 @@ pub struct OutputChangeNotify {
     pub output: u32,
     pub crtc: u32,
     pub mode: u32,
+    /// The output's CRTC rotation, `RR_Rotate_0` without one.
+    pub rotation: u16,
     pub connection: u8,
 }
 
@@ -1335,7 +1476,7 @@ pub fn encode_screen_change_notify_event(
 ) -> [u8; 32] {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     buf.push(first_event + EVENT_SCREEN_CHANGE_NOTIFY);
-    buf.push(ROTATION_ROTATE_0 as u8);
+    buf.push(event.rotation);
     put(byte_order, &mut buf, sequence.0);
     put(byte_order, &mut buf, event.timestamp);
     put(byte_order, &mut buf, event.config_timestamp);
@@ -1365,7 +1506,7 @@ pub fn encode_crtc_change_notify_event(
     put(byte_order, &mut buf, event.request_window);
     put(byte_order, &mut buf, event.crtc);
     put(byte_order, &mut buf, event.mode);
-    put(byte_order, &mut buf, ROTATION_ROTATE_0);
+    put(byte_order, &mut buf, event.rotation);
     // 2 bytes of pad before x/y per spec (CRTC change notify is 32 bytes total).
     buf.extend_from_slice(&[0u8; 2]);
     put(byte_order, &mut buf, event.x);
@@ -1392,7 +1533,7 @@ pub fn encode_output_change_notify_event(
     put(byte_order, &mut buf, event.output);
     put(byte_order, &mut buf, event.crtc);
     put(byte_order, &mut buf, event.mode);
-    put(byte_order, &mut buf, ROTATION_ROTATE_0);
+    put(byte_order, &mut buf, event.rotation);
     buf.push(event.connection);
     buf.push(SUBPIXEL_UNKNOWN as u8);
     buf.try_into().expect("32-byte event")
@@ -1493,30 +1634,179 @@ mod tests {
 
         let request = parse_set_crtc_transform_request(&body).expect("valid transform");
         assert_eq!(request.crtc, 2);
+        assert_eq!(request.transform, matrix);
         assert_eq!(request.filter_name_len, 3);
-        assert_eq!(request.filter_param_count, 1);
-        assert!(request.is_identity_transform());
+        assert_eq!(
+            request.filter,
+            Some(TransformFilterSpec {
+                name: b"box".to_vec(),
+                params: vec![-0x0000_8000],
+            })
+        );
 
         let mut nonidentity = body.clone();
         nonidentity[4..8].copy_from_slice(&0x0002_0000i32.to_le_bytes());
-        assert!(
-            !parse_set_crtc_transform_request(&nonidentity)
+        assert_eq!(
+            parse_set_crtc_transform_request(&nonidentity)
                 .unwrap()
-                .is_identity_transform()
+                .transform[0],
+            0x0002_0000
         );
     }
 
     #[test]
-    fn parse_set_crtc_transform_rejects_malformed_variable_tail() {
+    fn parse_set_crtc_transform_reports_malformed_variable_tail() {
         assert!(parse_set_crtc_transform_request(&[0u8; 43]).is_none());
 
+        // A name running past the request is Xorg's negative nparams.
         let mut missing_filter = vec![0u8; 44];
         missing_filter[40..42].copy_from_slice(&4u16.to_le_bytes());
-        assert!(parse_set_crtc_transform_request(&missing_filter).is_none());
+        let request = parse_set_crtc_transform_request(&missing_filter).unwrap();
+        assert_eq!(request.filter_name_len, 4);
+        assert_eq!(request.filter, None);
 
         let mut partial_parameter = vec![0u8; 45];
         partial_parameter[40..42].copy_from_slice(&0u16.to_le_bytes());
-        assert!(parse_set_crtc_transform_request(&partial_parameter).is_none());
+        assert_eq!(
+            parse_set_crtc_transform_request(&partial_parameter)
+                .unwrap()
+                .filter,
+            None
+        );
+
+        let empty = parse_set_crtc_transform_request(&[0u8; 44]).unwrap();
+        assert_eq!(empty.filter, Some(TransformFilterSpec::default()));
+    }
+
+    /// muffin's scale-down 125% request for CRTC 6 (spec, "What muffin
+    /// sends"): 1.599991 as the 16.16 word 104857, filter `good`.
+    fn muffin_transform_body(byte_order: ClientByteOrder) -> Vec<u8> {
+        let u32b = |v: u32| match byte_order {
+            ClientByteOrder::LittleEndian => v.to_le_bytes(),
+            ClientByteOrder::BigEndian => v.to_be_bytes(),
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32b(6));
+        for cell in [104_857u32, 0, 0, 0, 104_857, 0, 0, 0, 0x0001_0000] {
+            body.extend_from_slice(&u32b(cell));
+        }
+        let len = match byte_order {
+            ClientByteOrder::LittleEndian => 4u16.to_le_bytes(),
+            ClientByteOrder::BigEndian => 4u16.to_be_bytes(),
+        };
+        body.extend_from_slice(&len);
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(b"good");
+        body.extend_from_slice(&u32b(0x0001_8000));
+        body
+    }
+
+    #[test]
+    fn parse_set_crtc_transform_reads_both_byte_orders() {
+        let little = muffin_transform_body(ClientByteOrder::LittleEndian);
+        let mut big = muffin_transform_body(ClientByteOrder::BigEndian);
+        assert_ne!(little, big);
+        crate::x11::request_swap::swap_request_body(
+            128,
+            RR_SET_CRTC_TRANSFORM,
+            ClientByteOrder::BigEndian,
+            &mut big,
+        );
+        let expected = SetCrtcTransformRequest {
+            crtc: 6,
+            transform: [104_857, 0, 0, 0, 104_857, 0, 0, 0, 0x0001_0000],
+            filter_name_len: 4,
+            filter: Some(TransformFilterSpec {
+                name: b"good".to_vec(),
+                params: vec![0x0001_8000],
+            }),
+        };
+        assert_eq!(parse_set_crtc_transform_request(&little), Some(expected));
+        assert_eq!(
+            parse_set_crtc_transform_request(&big),
+            parse_set_crtc_transform_request(&little)
+        );
+    }
+
+    const IDENTITY: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+
+    #[test]
+    fn get_crtc_transform_reply_default_state_has_no_filter_bytes() {
+        let none = CrtcTransformReplyPart {
+            matrix: IDENTITY,
+            filter_name: b"",
+            params: &[],
+        };
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let out =
+                encode_get_crtc_transform_reply(byte_order, SequenceNumber(7), true, none, none);
+            assert_eq!(out.len(), 96);
+            let u32_at = |o: usize| {
+                let b: [u8; 4] = out[o..o + 4].try_into().unwrap();
+                match byte_order {
+                    ClientByteOrder::LittleEndian => u32::from_le_bytes(b),
+                    ClientByteOrder::BigEndian => u32::from_be_bytes(b),
+                }
+            };
+            assert_eq!(out[0], 1);
+            assert_eq!(u32_at(4), 16, "length");
+            assert_eq!(u32_at(8), 0x0001_0000, "pending m11");
+            assert_eq!(u32_at(24), 0x0001_0000, "pending m22");
+            assert_eq!(out[44], 1, "hasTransforms");
+            assert_eq!(u32_at(48), 0x0001_0000, "current m11");
+            assert_eq!(u32_at(80), 0x0001_0000, "current m33");
+            assert_eq!(&out[88..96], &[0u8; 8], "filter lengths");
+        }
+    }
+
+    #[test]
+    fn get_crtc_transform_reply_carries_pending_and_current_filters() {
+        let scale2 = [131_072, 0, 0, 0, 131_072, 0, 0, 0, 0x0001_0000];
+        let pending = CrtcTransformReplyPart {
+            matrix: scale2,
+            filter_name: b"bilinear",
+            params: &[0x0001_8000, -1],
+        };
+        let current = CrtcTransformReplyPart {
+            matrix: IDENTITY,
+            filter_name: b"nearest",
+            params: &[],
+        };
+        let le = encode_get_crtc_transform_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            true,
+            pending,
+            current,
+        );
+        // 96 + "bilinear"(8) + 2 params(8) + "nearest"(7→8).
+        assert_eq!(le.len(), 120);
+        assert_eq!(u32::from_le_bytes(le[4..8].try_into().unwrap()), 22);
+        assert_eq!(u32::from_le_bytes(le[8..12].try_into().unwrap()), 131_072);
+        assert_eq!(
+            u32::from_le_bytes(le[48..52].try_into().unwrap()),
+            0x0001_0000
+        );
+        assert_eq!(&le[88..96], &[8, 0, 2, 0, 7, 0, 0, 0]);
+        assert_eq!(&le[96..104], b"bilinear");
+        assert_eq!(&le[104..108], &0x0001_8000i32.to_le_bytes());
+        assert_eq!(&le[108..112], &(-1i32).to_le_bytes());
+        assert_eq!(&le[112..120], b"nearest\0");
+
+        let be = encode_get_crtc_transform_reply(
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            true,
+            pending,
+            current,
+        );
+        assert_eq!(be.len(), 120);
+        assert_eq!(u32::from_be_bytes(be[4..8].try_into().unwrap()), 22);
+        assert_eq!(u32::from_be_bytes(be[8..12].try_into().unwrap()), 131_072);
+        assert_eq!(&be[88..96], &[0, 8, 0, 2, 0, 7, 0, 0]);
+        assert_eq!(&be[96..104], b"bilinear");
+        assert_eq!(&be[104..108], &0x0001_8000i32.to_be_bytes());
+        assert_eq!(&be[112..120], b"nearest\0");
     }
 
     #[test]
@@ -2303,6 +2593,133 @@ mod tests {
         assert_eq!(&buf[40..44], &[5, 0, 6, 0]);
     }
 
+    /// Reverse `len`-byte fields at `offsets` in `buf` (Xorg's swapl/swaps).
+    fn swap_fields(buf: &mut [u8], fields: &[(usize, usize)]) {
+        for &(off, len) in fields {
+            buf[off..off + len].reverse();
+        }
+    }
+
+    /// A big-endian GetMonitors reply is the little-endian one with exactly the
+    /// fields Xorg's `ProcRRGetMonitors` swaps reversed (`rrmonitor.c:617-649`).
+    #[test]
+    fn encode_get_monitors_big_endian_swaps_every_field() {
+        let outputs = [0x0102_0304u32];
+        let monitors = [MonitorInfo {
+            name: 0x0A0B_0C0D,
+            primary: true,
+            automatic: false,
+            x: 0x0102,
+            y: -2,
+            width: 0x0A00,
+            height: 0x05A0,
+            width_mm: 0x0000_0258,
+            height_mm: 0x0000_0152,
+            outputs: &outputs,
+        }];
+        let mut want = encode_get_monitors_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            0x0506_0708,
+            &monitors,
+        );
+        let got = encode_get_monitors_reply(
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x1234),
+            0x0506_0708,
+            &monitors,
+        );
+        swap_fields(
+            &mut want,
+            &[
+                (2, 2),
+                (4, 4),
+                (8, 4),
+                (12, 4),
+                (16, 4), // header
+                (32, 4),
+                (38, 2),
+                (40, 2),
+                (42, 2),
+                (44, 2),
+                (46, 2), // name, noutput, x, y, w, h
+                (48, 4),
+                (52, 4),
+                (56, 4), // mm, output
+            ],
+        );
+        assert_eq!(got, want);
+    }
+
+    /// Same for GetScreenResources[Current]: the mode infos are swapped field by
+    /// field as `rrscreen.c:310-322` does.
+    #[test]
+    fn encode_get_screen_resources_big_endian_swaps_every_field() {
+        let name = b"2560x1440";
+        let resources = ScreenResources {
+            timestamp: 0x0102_0304,
+            config_timestamp: 0x0506_0708,
+            crtcs: vec![0x11],
+            outputs: vec![0x22],
+            modes: vec![ModeInfo {
+                id: 0x13,
+                width: 2560,
+                height: 1440,
+                dot_clock: 241_500_000,
+                hsync_start: 2608,
+                hsync_end: 2640,
+                htotal: 2720,
+                hskew: 0,
+                vsync_start: 1443,
+                vsync_end: 1448,
+                vtotal: 1481,
+                name_len: name.len() as u16,
+                mode_flags: 0x0000_000A,
+            }],
+            mode_names: name.to_vec(),
+        };
+        let mut want = encode_get_screen_resources_current_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            &resources,
+        );
+        let got = encode_get_screen_resources_current_reply(
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            &resources,
+        );
+        let m = 40; // header 32 + one crtc + one output
+        swap_fields(
+            &mut want,
+            &[
+                (2, 2),
+                (4, 4),
+                (8, 4),
+                (12, 4),
+                (16, 2),
+                (18, 2),
+                (20, 2),
+                (22, 2),
+                (32, 4),
+                (36, 4),
+                (m, 4),
+                (m + 4, 2),
+                (m + 6, 2),
+                (m + 8, 4),
+                (m + 12, 2),
+                (m + 14, 2),
+                (m + 16, 2),
+                (m + 18, 2),
+                (m + 20, 2),
+                (m + 22, 2),
+                (m + 24, 2),
+                (m + 26, 2),
+                (m + 28, 4),
+            ],
+        );
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn encode_get_monitors_single_monitor_shape() {
         let outputs = [0x20u32];
@@ -2345,6 +2762,7 @@ mod tests {
             89,
             SequenceNumber(11),
             ScreenChangeNotify {
+                rotation: 1,
                 timestamp: 100,
                 config_timestamp: 101,
                 root: 0x100,
@@ -2377,6 +2795,7 @@ mod tests {
                 request_window: 0x100,
                 crtc: 2,
                 mode: 3,
+                rotation: 1,
                 x: 4,
                 y: 5,
                 width: 1280,
@@ -2405,6 +2824,7 @@ mod tests {
                 output: 1,
                 crtc: 2,
                 mode: 3,
+                rotation: 1,
                 connection: CONNECTION_CONNECTED,
             },
         );
@@ -2415,6 +2835,115 @@ mod tests {
         assert_eq!(&event[16..20], &1u32.to_le_bytes());
         assert_eq!(event[30], CONNECTION_CONNECTED);
         assert_eq!(event[31], 0);
+    }
+
+    #[test]
+    fn rotation_fields_encode_in_both_byte_orders() {
+        // Xorg's `--rotate left` CRTC of a 1280×800 mode (xrandr-rotate.sh):
+        // 800×1280, rotation RR_Rotate_90, rotations 0x3f.
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let u16_at = |b: &[u8], o: usize| {
+                let v = [b[o], b[o + 1]];
+                match byte_order {
+                    ClientByteOrder::LittleEndian => u16::from_le_bytes(v),
+                    ClientByteOrder::BigEndian => u16::from_be_bytes(v),
+                }
+            };
+            let reply = encode_get_crtc_info_reply(
+                byte_order,
+                SequenceNumber(9),
+                &CrtcInfoReply {
+                    timestamp: 1,
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 1280,
+                    mode: 0x41,
+                    rotation: 2,
+                    rotations: 0x3f,
+                    outputs: &[],
+                    possible: &[],
+                },
+            );
+            assert_eq!(
+                [16, 18, 24, 26].map(|o| u16_at(&reply, o)),
+                [800, 1280, 2, 0x3f],
+                "{byte_order:?}"
+            );
+            let crtc = encode_crtc_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(9),
+                CrtcChangeNotify {
+                    timestamp: 1,
+                    request_window: 0x100,
+                    crtc: 0x3e,
+                    mode: 0x41,
+                    rotation: 0x12,
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 800,
+                },
+            );
+            assert_eq!(u16_at(&crtc, 20), 0x12, "{byte_order:?}");
+            let output = encode_output_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(9),
+                OutputChangeNotify {
+                    timestamp: 1,
+                    config_timestamp: 1,
+                    request_window: 0x100,
+                    output: 0x40,
+                    crtc: 0x3e,
+                    mode: 0x41,
+                    rotation: 8,
+                    connection: CONNECTION_CONNECTED,
+                },
+            );
+            assert_eq!(u16_at(&output, 28), 8, "{byte_order:?}");
+            let screen = encode_screen_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(9),
+                ScreenChangeNotify {
+                    rotation: 2,
+                    timestamp: 1,
+                    config_timestamp: 1,
+                    root: 0x100,
+                    request_window: 0x100,
+                    width: 1280,
+                    height: 800,
+                    width_mm: 338,
+                    height_mm: 211,
+                },
+            );
+            assert_eq!(screen[1], 2, "a CARD8");
+            let info = encode_get_screen_info_reply(
+                byte_order,
+                SequenceNumber(9),
+                &ScreenInfoReply {
+                    root: 0x100,
+                    timestamp: 1,
+                    config_timestamp: 1,
+                    rotations: 0x3f,
+                    rotation: 2,
+                    size_id: 0,
+                    rate: 75,
+                    sizes: &[ScreenInfoSize {
+                        width: 1280,
+                        height: 800,
+                        mm_width: 325,
+                        mm_height: 203,
+                        rates: &[75],
+                    }],
+                    has_rate: true,
+                },
+            );
+            assert_eq!(info[1], 0x3f, "setOfRotations, a CARD8");
+            assert_eq!(u16_at(&info, 24), 2, "rotation");
+        }
     }
 
     #[test]
@@ -2430,6 +2959,7 @@ mod tests {
                 output: 1,
                 crtc: 0,
                 mode: 0,
+                rotation: 1,
                 connection: CONNECTION_DISCONNECTED,
             },
         );

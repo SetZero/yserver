@@ -181,6 +181,10 @@ pub struct VkContext {
     /// `VK_QUEUE_FAMILY_EXTERNAL` sentinel is restricted to the same physical
     /// device and driver UUID.
     pub(crate) queue_family_foreign: bool,
+    /// Whether `VK_EXT_memory_budget` is enabled. Diagnostic only:
+    /// gates whether `kms::vk::vram::sample` can report this
+    /// process's device-memory use, and nothing else.
+    pub(crate) memory_budget: bool,
     /// GLX-TFP: per-driver tiling strategy for the exported image,
     /// cached on first successful allocation. LINEAR is preferred —
     /// Turnip / Adreno same-GPU dma-buf sharing only delivers live
@@ -457,6 +461,29 @@ impl VkContext {
                 ok
             })
             .collect();
+        // `VK_EXT_memory_budget` is appended separately from `wanted`
+        // because it is purely diagnostic: it feeds the per-second VRAM
+        // telemetry line (`kms::vk::vram`) and nothing branches on it.
+        // Putting it in `wanted` would run it through the filter above,
+        // whose warning says a missing extension breaks Vulkan-fed
+        // scanout — true of that list, false of this one, and a
+        // misleading warning costs more than the line it would save.
+        let mut device_extension_names = device_extension_names;
+        let memory_budget = supported_device_exts.iter().any(|p| {
+            p.extension_name_as_c_str()
+                .map(|s| s == crate::kms::vk::vram::REQUIRED_EXTENSION)
+                .unwrap_or(false)
+        });
+        if memory_budget {
+            device_extension_names.push(crate::kms::vk::vram::REQUIRED_EXTENSION);
+        } else {
+            // Not a warning: every other code path works without it.
+            log::info!(
+                "vulkan: device lacks {} — the VRAM telemetry line will be omitted",
+                crate::kms::vk::vram::REQUIRED_EXTENSION.to_string_lossy()
+            );
+        }
+
         let device_extensions: Vec<*const c_char> =
             device_extension_names.iter().map(|c| c.as_ptr()).collect();
 
@@ -556,6 +583,10 @@ impl VkContext {
         };
         let queue_family_foreign =
             device_extension_names.contains(&ash::ext::queue_family_foreign::NAME);
+        // Publish the instance so the telemetry thread can sample
+        // device-memory use. Paired with the `vram::deregister()` in
+        // `Drop`, which must run before `destroy_instance`.
+        crate::kms::vk::vram::register(&instance, physical_device, memory_budget);
 
         // Driver-id query. Diagnostic-only after the Vulkan-first
         // pivot — no path branches on it. Kept so future quirks can
@@ -591,6 +622,7 @@ impl VkContext {
             image_drm_format_modifier_ext,
             image_drm_format_modifier,
             queue_family_foreign,
+            memory_budget,
             tfp_tiling_strategy: std::sync::OnceLock::new(),
             graphics_queue_family,
             graphics_queue,
@@ -786,6 +818,10 @@ fn create_debug_messenger(
 
 impl Drop for VkContext {
     fn drop(&mut self) {
+        // Before anything is destroyed: withdraw the instance from
+        // the VRAM sampler. It blocks on a sample already in flight,
+        // so no sample can straddle `destroy_instance` below.
+        crate::kms::vk::vram::deregister();
         unsafe {
             // Wait for all queue work; tearing down with in-flight CBs
             // is undefined behaviour. Disposable probe owners may establish

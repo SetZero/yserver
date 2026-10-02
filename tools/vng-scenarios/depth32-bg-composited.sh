@@ -16,7 +16,7 @@
 # under a frame and collapse the two chains the probe exists to tell apart.
 set -u
 src=$(dirname "$0")/../depth32-bg-probe.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/depth32-bg-probe.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/depth32-bg-probe.c
 
 cc -O1 -o depth32-bg-probe "$src" -lX11 -lXcomposite > cc.log 2>&1 || {
     echo "depth32-bg-composited: compile failed" >&2

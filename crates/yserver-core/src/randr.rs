@@ -4,6 +4,14 @@ use yserver_protocol::x11::randr as proto;
 
 use crate::properties::PropertyValue;
 
+mod transform;
+
+pub use transform::{
+    CrtcTransform, FIXED_ONE, Filter, IDENTITY_MATRIX, RR_REFLECT_X, RR_REFLECT_Y, RR_ROTATE_0,
+    RR_ROTATE_90, RR_ROTATE_180, RR_ROTATE_270, SUPPORTED_ROTATIONS, crtc_matrix,
+    rotation_swaps_axes,
+};
+
 /// A client-settable RANDR output property (`RRChangeOutputProperty` /
 /// `RRConfigureOutputProperty` / `RRDeleteOutputProperty`,
 /// randr/rrproperty.c `RRPropertyRec`). Distinct from the backend-
@@ -71,6 +79,13 @@ pub struct RandrOutput {
     /// Count of leading entries in `mode_ids` that are preferred modes
     /// (Xorg `GetOutputInfo` `nPreferred`).
     pub num_preferred: u16,
+    /// `SetCrtcTransform`'s stored transform, applied by the next
+    /// `SetCrtcConfig` (`client_pending_transform`).
+    pub pending_transform: CrtcTransform,
+    /// The transform in effect (`client_current_transform`).
+    pub current_transform: CrtcTransform,
+    /// `crtc->rotation`: `RR_Rotate_*` plus `RR_Reflect_*` bits.
+    pub rotation: u16,
 }
 
 /// Real per-mode timing carried through from the kernel DRM mode, so
@@ -259,6 +274,28 @@ impl RandrOutput {
     pub fn effective_timing(&self) -> EffectiveTiming {
         EffectiveTiming::resolve(self.width, self.height, self.vrefresh, self.timing)
     }
+
+    /// The CRTC's framebuffer footprint: its mode through
+    /// [`Self::crtc_transform`] (spec D3); the mode size for identity.
+    #[must_use]
+    pub fn footprint(&self) -> (u16, u16) {
+        self.crtc_transform().footprint(self.width, self.height)
+    }
+
+    /// The matrix the CRTC scans out through: `rotation` combined with
+    /// `current_transform` as `RRTransformCompute` does (`crtc->transform`
+    /// less the CRTC origin). SetCrtcConfig refuses a combination that
+    /// overflows, so the fallback to the client transform is unreachable.
+    #[must_use]
+    pub fn crtc_transform(&self) -> CrtcTransform {
+        crtc_matrix(
+            self.rotation,
+            self.width,
+            self.height,
+            &self.current_transform,
+        )
+        .unwrap_or_else(|| self.current_transform.clone())
+    }
 }
 
 /// A virtual-screen slot held by a route that is physically gone but
@@ -376,7 +413,7 @@ impl RandrState {
         let screen_width: u16 = screen_extent(
             outputs
                 .iter()
-                .map(|o| i32::from(o.x).saturating_add(i32::from(o.width)))
+                .map(|o| i32::from(o.x).saturating_add(i32::from(o.footprint().0)))
                 .chain(
                     reserved
                         .iter()
@@ -386,7 +423,7 @@ impl RandrState {
         let screen_height: u16 = screen_extent(
             outputs
                 .iter()
-                .map(|o| i32::from(o.y).saturating_add(i32::from(o.height)))
+                .map(|o| i32::from(o.y).saturating_add(i32::from(o.footprint().1)))
                 .chain(
                     reserved
                         .iter()
@@ -444,6 +481,38 @@ impl RandrState {
         I: IntoIterator<Item = (u32, u32)>,
     {
         self.output_crtc_associations = associations.into_iter().collect();
+    }
+
+    /// Every CRTC's `(crtc_id, pending, current, rotation)`, to carry over
+    /// a rebuild from backend outputs (which start at identity, unrotated).
+    #[must_use]
+    pub fn crtc_transforms(&self) -> Vec<(u32, CrtcTransform, CrtcTransform, u16)> {
+        self.outputs
+            .iter()
+            .map(|o| {
+                (
+                    o.crtc_id,
+                    o.pending_transform.clone(),
+                    o.current_transform.clone(),
+                    o.rotation,
+                )
+            })
+            .collect()
+    }
+
+    /// Restore transforms taken by [`Self::crtc_transforms`] onto the
+    /// CRTCs that still exist.
+    pub fn restore_crtc_transforms(
+        &mut self,
+        transforms: Vec<(u32, CrtcTransform, CrtcTransform, u16)>,
+    ) {
+        for (crtc_id, pending, current, rotation) in transforms {
+            if let Some(output) = self.outputs.iter_mut().find(|o| o.crtc_id == crtc_id) {
+                output.pending_transform = pending;
+                output.current_transform = current;
+                output.rotation = rotation;
+            }
+        }
     }
 
     /// Look up a provider by its protocol XID.
@@ -541,6 +610,9 @@ impl RandrState {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         };
         Self::from_outputs(timestamp, vec![synthetic])
     }
@@ -575,26 +647,34 @@ impl RandrState {
     }
 
     /// Would shrinking the logical screen to `w`×`h` crop any enabled
-    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.)
+    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266-281.) The
+    /// box is the mode, swapped for a 90/270 rotation, but never scaled by
+    /// the client transform, as measured (spec Q3,
+    /// `tools/vng-scenarios/xrandr-scale-crop.sh` and `xrandr-rotate.sh`).
     #[must_use]
     pub fn screen_size_would_crop(&self, w: u16, h: u16) -> bool {
         self.outputs.iter().filter(|o| o.mode_id != 0).any(|o| {
-            i32::from(o.x) + i32::from(o.width) > i32::from(w)
-                || i32::from(o.y) + i32::from(o.height) > i32::from(h)
+            let (bw, bh) = if rotation_swaps_axes(o.rotation) {
+                (o.height, o.width)
+            } else {
+                (o.width, o.height)
+            };
+            i32::from(o.x) + i32::from(bw) > i32::from(w)
+                || i32::from(o.y) + i32::from(bh) > i32::from(h)
         })
     }
 
     /// Set the logical (reported) screen size after validation. Uses
     /// the CLIENT-supplied physical mm verbatim (Xorg `RRScreenSizeSet`
     /// passes `stuff->widthInMillimeters`/`heightInMillimeters` — it does
-    /// NOT recompute from pixels). Does not touch outputs.
-    pub fn set_logical_size(&mut self, timestamp: u32, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+    /// NOT recompute from pixels). Does not touch outputs, nor either
+    /// timestamp: Xorg's SetScreenSize moves neither lastSetTime nor
+    /// lastConfigTime (only SetCrtcConfig/SetScreenConfig set the former).
+    pub fn set_logical_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
         self.screen_width = w;
         self.screen_height = h;
         self.width_mm = mm_w;
         self.height_mm = mm_h;
-        self.timestamp = timestamp.max(1);
-        self.config_timestamp = self.timestamp;
     }
 
     /// Monitors for RANDR `GetMonitors` / XINERAMA: one per output with a
@@ -706,9 +786,9 @@ impl RandrState {
     }
 
     /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
-    /// `rrcrtc.c` order, EXCLUDING rotation + bounds — the handler does
-    /// those after, in that order). `Ok(None)` = disable;
-    /// `Ok(Some(mode))` = enable with this resolved mode;
+    /// `rrcrtc.c` order, EXCLUDING rotation — the handler does that
+    /// after). `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
+    /// resolved mode;
     /// `Err((code, error_value))` = protocol error + field-specific
     /// `errorValue`.
     pub fn validate_set_crtc_config(
@@ -756,24 +836,6 @@ impl RandrState {
         Ok(Some(mode))
     }
 
-    /// Bounds check: does `mode` placed at `(x, y)` fit the current
-    /// (logical) screen? Xorg `rrcrtc.c`: `x + width > screen.width` ⇒
-    /// `BadValue(errorValue=x)`; then `y + height > screen.height` ⇒
-    /// `BadValue(errorValue=y)`.
-    pub fn screen_encompasses(&self, mode: &RandrMode, x: i16, y: i16) -> Result<(), (u8, u32)> {
-        use yserver_protocol::x11::error;
-        // Xorg rrcrtc.c: `x + width > screen.width` ⇒ BadValue(x), then
-        // `y + height > screen.height` ⇒ BadValue(y). errorValue carries
-        // the raw INT16 sign-extended into the CARD32 field.
-        if i32::from(x) + i32::from(mode.width) > i32::from(self.screen_width) {
-            return Err((error::BAD_VALUE, i32::from(x) as u32));
-        }
-        if i32::from(y) + i32::from(mode.height) > i32::from(self.screen_height) {
-            return Err((error::BAD_VALUE, i32::from(y) as u32));
-        }
-        Ok(())
-    }
-
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
         let mut modes: Vec<RandrMode> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
@@ -791,6 +853,113 @@ impl RandrState {
             }
         }
         modes
+    }
+
+    /// The rotation of CRTC `crtc_id`, `RR_Rotate_0` for an unknown one.
+    #[must_use]
+    pub fn crtc_rotation(&self, crtc_id: u32) -> u16 {
+        self.outputs
+            .iter()
+            .find(|o| o.crtc_id == crtc_id)
+            .map_or(RR_ROTATE_0, |o| o.rotation)
+    }
+
+    /// `RRFirstOutput`: the primary output if it has a CRTC, else the
+    /// output of the lowest enabled CRTC.
+    #[must_use]
+    pub fn first_output(&self) -> Option<&RandrOutput> {
+        self.enabled_outputs()
+            .find(|o| o.output_id == self.primary_output)
+            .or_else(|| self.enabled_outputs().min_by_key(|o| o.crtc_id))
+    }
+
+    /// `RRFirstOutput`'s CRTC rotation for the RANDR 1.0 `GetScreenInfo`,
+    /// `RR_Rotate_0` without one.
+    #[must_use]
+    pub fn first_output_rotation(&self) -> u16 {
+        self.first_output().map_or(RR_ROTATE_0, |o| o.rotation)
+    }
+
+    /// `RR10GetData` (rrscreen.c:664-737): the RANDR 1.0 view of the first
+    /// output. One size per distinct mode width×height in the output's mode
+    /// order, each with its distinct `RRVerticalRefresh` rates; the current
+    /// size and rate are the CRTC's mode. `None` without an output.
+    #[must_use]
+    pub fn rr10_data(&self) -> Option<Rr10Data> {
+        let output = self.first_output()?;
+        let info = self.output_info(output.output_id, 0)?;
+        let (mm_w, mm_h) = if info.width_mm != 0 && info.height_mm != 0 {
+            (info.width_mm, info.height_mm)
+        } else {
+            (self.width_mm, self.height_mm)
+        };
+        let mm = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+        let mut data = Rr10Data {
+            output_id: output.output_id,
+            crtc_id: output.crtc_id,
+            sizes: Vec::new(),
+            size_id: 0,
+            rate: 0,
+        };
+        for mode in output
+            .mode_ids
+            .iter()
+            .filter_map(|id| self.mode_table.iter().find(|m| m.mode_id == *id))
+        {
+            let rate = vertical_refresh(mode.effective_timing());
+            let index = match data
+                .sizes
+                .iter()
+                .position(|s| (s.width, s.height) == (mode.width, mode.height))
+            {
+                Some(index) => index,
+                None => {
+                    data.sizes.push(Rr10Size {
+                        width: mode.width,
+                        height: mode.height,
+                        mm_width: mm(mm_w),
+                        mm_height: mm(mm_h),
+                        rates: Vec::new(),
+                    });
+                    data.sizes.len() - 1
+                }
+            };
+            let size = &mut data.sizes[index];
+            if !size.rates.iter().any(|(r, _)| *r == rate) {
+                size.rates.push((rate, mode.mode_id));
+            }
+            if mode.mode_id == output.mode_id {
+                data.size_id = u16::try_from(index).unwrap_or(u16::MAX);
+                data.rate = rate;
+            }
+        }
+        Some(data)
+    }
+
+    /// `RRDeliverScreenEvent`'s rotation, pixel and mm sizes: the first
+    /// CRTC's rotation (`crtcs[0]`), the screen swapped for 90/270
+    /// (rrscreen.c:95-121).
+    #[must_use]
+    pub fn screen_change_fields(&self) -> (u8, u16, u16, u16, u16) {
+        let rotation = self
+            .outputs
+            .iter()
+            .min_by_key(|o| o.crtc_id)
+            .map_or(RR_ROTATE_0, |o| o.rotation);
+        let mm = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+        let (w, h, mm_w, mm_h) = (
+            self.screen_width,
+            self.screen_height,
+            mm(self.width_mm),
+            mm(self.height_mm),
+        );
+        let fields = if rotation_swaps_axes(rotation) {
+            (h, w, mm_h, mm_w)
+        } else {
+            (w, h, mm_w, mm_h)
+        };
+        // xRRScreenChangeNotifyEvent.rotation is a CARD8.
+        (rotation as u8, fields.0, fields.1, fields.2, fields.3)
     }
 
     /// Look up CRTC info by `crtc_id`.
@@ -812,17 +981,51 @@ impl RandrState {
             .filter(|o| o.crtc_id == crtc_id)
             .map(|o| o.output_id)
             .collect();
+        // `RRCrtcGetScanoutSize`: the transformed footprint (rrcrtc.c:1212).
+        let (width, height) = out.footprint();
         Some(CrtcInfoData {
             timestamp: self.timestamp,
             x: out.x,
             y: out.y,
-            width: out.width,
-            height: out.height,
+            width,
+            height,
             mode_id: out.mode_id,
             outputs,
             possible_outputs,
         })
     }
+}
+
+/// [`RandrState::rr10_data`]: `RR10DataRec` for the first output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rr10Data {
+    pub output_id: u32,
+    pub crtc_id: u32,
+    pub sizes: Vec<Rr10Size>,
+    /// Index of the current mode's size.
+    pub size_id: u16,
+    /// The current mode's rate.
+    pub rate: u16,
+}
+
+/// One `RRScreenSize`: `rates` pairs each rate with the first mode of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rr10Size {
+    pub width: u16,
+    pub height: u16,
+    pub mm_width: u16,
+    pub mm_height: u16,
+    pub rates: Vec<(u16, u32)>,
+}
+
+/// `RRVerticalRefresh` (randr.c:728-739): whole Hz, rounded.
+fn vertical_refresh(timing: EffectiveTiming) -> u16 {
+    let dots = u64::from(timing.htotal) * u64::from(timing.vtotal);
+    if dots == 0 {
+        return 0;
+    }
+    let refresh = (u64::from(timing.dot_clock_hz) + dots / 2) / dots;
+    u16::try_from(refresh).unwrap_or(u16::MAX)
 }
 
 /// Data returned by [`RandrState::output_info`].
@@ -854,6 +1057,263 @@ pub struct CrtcInfoData {
     pub outputs: Vec<u32>,
     /// Outputs that can be attached to this CRTC in the current model.
     pub possible_outputs: Vec<u32>,
+}
+
+/// A client-defined monitor (RANDR 1.5 `SetMonitor`, Xorg `RRMonitorRec`
+/// with `automatic = FALSE`).
+///
+/// Lives in `ServerState::randr_client_monitors`, not here: hotplug and
+/// `SetCrtcConfig` rebuild `RandrState` wholesale, while Xorg keeps the list
+/// in the screen private until the screen closes (`RRMonitorClose`, i.e. a
+/// server reset). No client owns it — it outlives the connection that set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientMonitor {
+    pub name: u32,
+    pub primary: bool,
+    /// Not validated against the output list, as in Xorg.
+    pub outputs: Vec<u32>,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+}
+
+impl ClientMonitor {
+    /// A 0x0+0+0 box asks for the geometry of its outputs' CRTCs
+    /// (`RRMonitorAutomaticGeometry`, rrmonitor.c).
+    fn automatic_geometry(&self) -> bool {
+        self.x == 0 && self.y == 0 && self.width == 0 && self.height == 0
+    }
+}
+
+/// How a merged monitor is named on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorName {
+    /// A client monitor's atom.
+    Atom(u32),
+    /// An automatic monitor is named after its CRTC's first output
+    /// (`RRMonitorCrtcName`), interned when the reply is built.
+    Output(String),
+}
+
+/// One protocol-visible monitor: what `GetMonitors` reports and XINERAMA
+/// derives its heads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Monitor {
+    pub name: MonitorName,
+    pub primary: bool,
+    pub automatic: bool,
+    pub outputs: Vec<u32>,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+}
+
+/// `RRMonitorGeometryRec`: an x1/y1/x2/y2 box plus physical size.
+#[derive(Clone, Copy, Default)]
+struct MonitorGeometry {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    width_mm: u32,
+    height_mm: u32,
+}
+
+impl MonitorGeometry {
+    fn is_empty(&self) -> bool {
+        self.x2 == self.x1 || self.y2 == self.y1
+    }
+}
+
+impl RandrState {
+    /// `RRMonitorGetCrtcGeometry` for the CRTC driving `output`: its
+    /// transformed footprint, and the output's physical size or a 96-DPI
+    /// synthesis.
+    fn crtc_monitor_geometry(output: &RandrOutput) -> MonitorGeometry {
+        let (width, height) = output.footprint();
+        let width_mm = if output.mm_width > 0 {
+            output.mm_width
+        } else {
+            ((u32::from(width) * 254 + 480) / 960).max(1)
+        };
+        let height_mm = if output.mm_height > 0 {
+            output.mm_height
+        } else {
+            ((u32::from(height) * 254 + 480) / 960).max(1)
+        };
+        MonitorGeometry {
+            x1: i32::from(output.x),
+            y1: i32::from(output.y),
+            x2: i32::from(output.x) + i32::from(width),
+            y2: i32::from(output.y) + i32::from(height),
+            width_mm,
+            height_mm,
+        }
+    }
+
+    /// `RRMonitorGetGeometry` as shipped in Xorg 21.1: an explicit box is
+    /// reported verbatim; an automatic one is the union of the active CRTCs
+    /// driving its outputs. The multi-CRTC physical size is the 21.1
+    /// formula, integer arithmetic on the LAST CRTC's width over the
+    /// first's (xserver main fixed it to use the union in 190320795; the
+    /// 21.1 branch never took that) — measured by
+    /// `tools/vng-scenarios/xrandr-monitors.sh --outputs 2`.
+    fn client_monitor_geometry(&self, monitor: &ClientMonitor) -> MonitorGeometry {
+        if !monitor.automatic_geometry() || monitor.outputs.is_empty() {
+            return MonitorGeometry {
+                x1: i32::from(monitor.x),
+                y1: i32::from(monitor.y),
+                x2: i32::from(monitor.x) + i32::from(monitor.width),
+                y2: i32::from(monitor.y) + i32::from(monitor.height),
+                width_mm: monitor.width_mm,
+                height_mm: monitor.height_mm,
+            };
+        }
+        let mut geometry = MonitorGeometry::default();
+        let mut first = MonitorGeometry::default();
+        let mut last = MonitorGeometry::default();
+        let mut active_crtcs = 0;
+        for &id in &monitor.outputs {
+            let Some(output) = self.enabled_outputs().find(|o| o.output_id == id) else {
+                continue;
+            };
+            let this = Self::crtc_monitor_geometry(output);
+            if active_crtcs == 0 {
+                first = this;
+                geometry = this;
+            } else {
+                geometry.x1 = geometry.x1.min(this.x1);
+                geometry.x2 = geometry.x2.max(this.x2);
+                geometry.y1 = geometry.y1.min(this.y1);
+                geometry.y2 = geometry.y2.max(this.y2);
+            }
+            last = this;
+            active_crtcs += 1;
+        }
+        if active_crtcs > 1 && first.x2 != first.x1 && first.y2 != first.y1 {
+            let scale = |this: i32, first: i32, mm: u32| {
+                #[allow(clippy::cast_sign_loss)]
+                let ratio = (this / first) as u32;
+                ratio.wrapping_mul(mm)
+            };
+            geometry.width_mm = scale(last.x2 - last.x1, first.x2 - first.x1, first.width_mm);
+            geometry.height_mm = scale(last.y2 - last.y1, first.y2 - first.y1, first.height_mm);
+        }
+        geometry
+    }
+
+    /// `RRMonitorMakeList` (rrmonitor.c): the client monitors, then one
+    /// automatic monitor per active CRTC that no counted client monitor
+    /// claims an output of. The first primary client monitor — or failing
+    /// that the primary output's CRTC — leads the list. `get_active` drops
+    /// monitors with an empty box (and they then claim no CRTC).
+    ///
+    /// Primary is Xorg's, quirks included: the leading entry does not count
+    /// towards `has_primary`, so a client primary and the primary output's
+    /// uncovered CRTC are BOTH reported primary.
+    #[must_use]
+    pub fn monitors(&self, client: &[ClientMonitor], get_active: bool) -> Vec<Monitor> {
+        let geometries: Vec<MonitorGeometry> = client
+            .iter()
+            .map(|monitor| self.client_monitor_geometry(monitor))
+            .collect();
+        let counted = |m: usize| !get_active || !geometries[m].is_empty();
+
+        // One CRTC per enabled output here, so "the CRTC drives output o"
+        // is "the output is o".
+        let mut server_crtcs: Vec<Option<&RandrOutput>> =
+            self.enabled_outputs().map(Some).collect();
+        let mut client_primary = None;
+        for (m, monitor) in client.iter().enumerate() {
+            if !counted(m) {
+                continue;
+            }
+            if monitor.primary && client_primary.is_none() {
+                client_primary = Some(m);
+            }
+            for crtc in &mut server_crtcs {
+                if crtc.is_some_and(|output| monitor.outputs.contains(&output.output_id)) {
+                    *crtc = None;
+                }
+            }
+        }
+        let server_primary = server_crtcs
+            .iter()
+            .position(|crtc| crtc.is_some_and(|output| output.output_id == self.primary_output));
+
+        let from_client = |m: usize| {
+            let monitor = &client[m];
+            let geometry = geometries[m];
+            Monitor {
+                name: MonitorName::Atom(monitor.name),
+                primary: monitor.primary,
+                automatic: false,
+                outputs: monitor.outputs.clone(),
+                ..Self::monitor_box(geometry)
+            }
+        };
+        let from_server = |output: &RandrOutput| Monitor {
+            name: MonitorName::Output(output.name.clone()),
+            primary: output.output_id == self.primary_output,
+            automatic: true,
+            outputs: vec![output.output_id],
+            ..Self::monitor_box(Self::crtc_monitor_geometry(output))
+        };
+
+        let mut list = Vec::new();
+        if let Some(m) = client_primary {
+            list.push(from_client(m));
+        } else if let Some(c) = server_primary {
+            list.extend(server_crtcs[c].map(from_server));
+        }
+        let mut has_primary = false;
+        let mut push = |list: &mut Vec<Monitor>, mut monitor: Monitor| {
+            if has_primary {
+                monitor.primary = false;
+            } else if monitor.primary {
+                has_primary = true;
+            }
+            list.push(monitor);
+        };
+        for m in 0..client.len() {
+            if Some(m) != client_primary && counted(m) {
+                push(&mut list, from_client(m));
+            }
+        }
+        for (c, crtc) in server_crtcs.iter().enumerate() {
+            if c == server_primary.unwrap_or(usize::MAX) && client_primary.is_none() {
+                continue;
+            }
+            if let Some(output) = crtc {
+                push(&mut list, from_server(output));
+            }
+        }
+        list
+    }
+
+    /// The wire box of a geometry. Xorg's `BoxRec` holds shorts, so the
+    /// width/height truncate exactly as `x2 - x1` does into a CARD16.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn monitor_box(geometry: MonitorGeometry) -> Monitor {
+        Monitor {
+            name: MonitorName::Atom(0),
+            primary: false,
+            automatic: false,
+            outputs: Vec::new(),
+            x: geometry.x1 as i16,
+            y: geometry.y1 as i16,
+            width: (geometry.x2 - geometry.x1) as u16,
+            height: (geometry.y2 - geometry.y1) as u16,
+            width_mm: geometry.width_mm,
+            height_mm: geometry.height_mm,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1088,6 +1548,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7, 8, 9],
             num_preferred: 2,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1");
@@ -1115,6 +1578,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 name: "HDMI-2".into(),
@@ -1132,6 +1598,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1160,6 +1629,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![21],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }
     }
 
@@ -1215,7 +1687,7 @@ mod tests {
         );
         assert_eq!(st.screen_width, 5120);
 
-        st.set_logical_size(7, 2560, 1440, 677, 381);
+        st.set_logical_size(2560, 1440, 677, 381);
         assert_eq!(
             (st.screen_width, st.screen_height, st.width_mm, st.height_mm),
             (2560, 1440, 677, 381),
@@ -1241,6 +1713,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7, 8],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mode_table = vec![
             RandrMode {
@@ -1284,6 +1759,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 name: "B".into(),
@@ -1301,6 +1779,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1326,6 +1807,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 name: "B".into(),
@@ -1343,6 +1827,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1369,6 +1856,9 @@ mod tests {
             mm_height: 336,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -1394,6 +1884,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -1421,6 +1914,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 name: "B".into(),
@@ -1438,6 +1934,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1462,6 +1961,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         outs.push(RandrOutput {
             name: "HDMI-A-1".into(),
@@ -1479,6 +1981,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![],
             num_preferred: 0,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         });
         let st = RandrState::from_outputs(1, outs);
         let info = st
@@ -1510,6 +2015,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![],
                 num_preferred: 0,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -1527,6 +2035,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         assert_eq!(RandrState::from_outputs(1, outs).primary_output, 4);
@@ -1554,6 +2065,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -1571,6 +2085,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1601,6 +2118,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![12, 13],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let st = RandrState::from_outputs(0, outs);
 
@@ -1649,6 +2169,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![13],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         };
         let state = RandrState::from_outputs(41, vec![output]);
 
@@ -1698,6 +2221,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.outputs[0].y, 1080, "y must not be flattened");
@@ -1729,6 +2255,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         };
         let mode_table = vec![RandrMode {
             mode_id: 7,
@@ -1787,6 +2316,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         };
         let mode_table = vec![RandrMode {
             mode_id: 7,
@@ -1834,6 +2366,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 // connected but OFF (mode_id 0)
@@ -1852,6 +2387,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             RandrOutput {
                 // disconnected
@@ -1870,6 +2408,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![],
                 num_preferred: 0,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1901,6 +2442,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let st = RandrState::from_outputs(0, outs);
         assert!(
@@ -1916,15 +2460,18 @@ mod tests {
     #[test]
     fn set_logical_size_stores_client_mm_verbatim() {
         let mut st = RandrState::nested(1, 1920, 1080);
+        st.timestamp = 40;
+        st.config_timestamp = 30;
         // Caller passes client-supplied mm values; the impl must NOT
         // recompute them from pixels.
-        st.set_logical_size(42, 2560, 1440, 597, 336);
+        st.set_logical_size(2560, 1440, 597, 336);
         assert_eq!(st.screen_width, 2560);
         assert_eq!(st.screen_height, 1440);
         assert_eq!(st.width_mm, 597, "mm verbatim from client");
         assert_eq!(st.height_mm, 336, "mm verbatim from client");
-        assert_eq!(st.timestamp, 42);
-        assert_eq!(st.config_timestamp, 42);
+        // Xorg's SetScreenSize moves neither timestamp; muffin treats a moved
+        // lastSetTime as an external reconfiguration (#185).
+        assert_eq!((st.timestamp, st.config_timestamp), (40, 30));
     }
 
     use yserver_protocol::x11::error as x11_err;
@@ -1948,6 +2495,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![7, 8],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             }],
             vec![
                 RandrMode {
@@ -2007,30 +2557,6 @@ mod tests {
     }
 
     #[test]
-    fn screen_encompasses_rejects_overflow_x_then_y() {
-        let st = one_output_state(); // screen 1920x1080
-        let m1080 = RandrMode {
-            mode_id: 7,
-            width: 1920,
-            height: 1080,
-            vrefresh: 60,
-            timing: None,
-        };
-        // Place 1920x1080 at x=100 → 2020 > 1920. errorValue = x.
-        assert_eq!(
-            st.screen_encompasses(&m1080, 100, 0),
-            Err((x11_err::BAD_VALUE, 100))
-        );
-        // x ok, y overflow: at y=100 → 1180 > 1080. errorValue = y.
-        assert_eq!(
-            st.screen_encompasses(&m1080, 0, 100),
-            Err((x11_err::BAD_VALUE, 100))
-        );
-        // exact fit (x+w == screen.width) is allowed (Xorg uses `>`).
-        assert_eq!(st.screen_encompasses(&m1080, 0, 0), Ok(()));
-    }
-
-    #[test]
     fn set_crtc_config_valid_enable_resolves_mode() {
         let st = one_output_state();
         let mode = st
@@ -2044,5 +2570,161 @@ mod tests {
     fn set_crtc_config_valid_disable() {
         let st = one_output_state();
         assert_eq!(st.validate_set_crtc_config(2, 0, &[]), Ok(None));
+    }
+
+    fn scale_transform(word: i32) -> CrtcTransform {
+        CrtcTransform::new([word, 0, 0, 0, word, 0, 0, 0, FIXED_ONE], None, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn crtc_transforms_default_to_identity_without_a_filter() {
+        let st = one_output_state();
+        let out = &st.outputs[0];
+        for t in [&out.pending_transform, &out.current_transform] {
+            assert_eq!(t.matrix, IDENTITY_MATRIX);
+            assert_eq!(t.filter, None);
+            assert!(t.params.is_empty());
+        }
+        assert_eq!(out.footprint(), (1920, 1080));
+    }
+
+    #[test]
+    fn footprint_follows_the_current_transform_only() {
+        let mut st = one_output_state();
+        // xrandr --scale 2 (spec, "What Xorg does").
+        st.outputs[0].pending_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (1920, 1080));
+        st.outputs[0].current_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (3840, 2160));
+    }
+
+    #[test]
+    fn crtc_transforms_survive_a_rebuild_by_crtc_id() {
+        let mut st = one_output_state();
+        st.outputs[0].pending_transform = scale_transform(32_768);
+        st.outputs[0].current_transform = scale_transform(131_072);
+        let saved = st.crtc_transforms();
+        let mut rebuilt = one_output_state();
+        rebuilt.restore_crtc_transforms(saved);
+        assert_eq!(
+            rebuilt.outputs[0].pending_transform,
+            scale_transform(32_768)
+        );
+        assert_eq!(
+            rebuilt.outputs[0].current_transform,
+            scale_transform(131_072)
+        );
+        // A CRTC that vanished takes its transform with it.
+        let mut other = one_output_state();
+        other.restore_crtc_transforms(vec![(
+            99,
+            scale_transform(32_768),
+            scale_transform(32_768),
+            RR_ROTATE_90,
+        )]);
+        assert_eq!(
+            other.outputs[0].current_transform,
+            CrtcTransform::identity()
+        );
+    }
+
+    /// Two 1920×1440 outputs, B right of A (`xrandr-scale-crop.sh`).
+    fn crop_probe_state(b_scale: i32) -> RandrState {
+        let output = |output_id: u32, crtc_id: u32, x: i16| RandrOutput {
+            name: format!("Virtual-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: 9,
+            connected: true,
+            x,
+            y: 0,
+            width: 1920,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![9],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
+        };
+        let mut st = RandrState::from_outputs(1, vec![output(1, 3, 0), output(2, 4, 1920)]);
+        st.outputs[1].current_transform = scale_transform(b_scale);
+        st
+    }
+
+    #[test]
+    fn screen_size_crop_uses_the_untransformed_mode_box() {
+        // spec Q3: the same thresholds scaled 2x2 and at identity.
+        for b_scale in [131_072, FIXED_ONE] {
+            let st = crop_probe_state(b_scale);
+            assert!(!st.screen_size_would_crop(3840, 1440), "{b_scale}");
+            assert!(st.screen_size_would_crop(3839, 1440), "{b_scale}");
+            assert!(st.screen_size_would_crop(3840, 1439), "{b_scale}");
+            assert!(!st.screen_size_would_crop(5759, 3841), "{b_scale}");
+        }
+    }
+
+    #[test]
+    fn screen_size_crop_swaps_the_mode_box_for_a_quarter_turn() {
+        // tools/vng-scenarios/xrandr-rotate.sh on Xorg, one 1280×800 output.
+        let mut output = crop_probe_state(FIXED_ONE).outputs[0].clone();
+        (output.width, output.height) = (1280, 800);
+        let mut st = RandrState::from_outputs(1, vec![output]);
+        for rotation in [RR_ROTATE_90, RR_ROTATE_270, RR_ROTATE_90 | RR_REFLECT_X] {
+            st.outputs[0].rotation = rotation;
+            assert!(!st.screen_size_would_crop(800, 1280), "{rotation:#x}");
+            assert!(st.screen_size_would_crop(799, 1280), "{rotation:#x}");
+            assert!(st.screen_size_would_crop(800, 1279), "{rotation:#x}");
+            assert!(st.screen_size_would_crop(1280, 800), "{rotation:#x}");
+        }
+        for rotation in [RR_ROTATE_180, RR_ROTATE_0 | RR_REFLECT_X | RR_REFLECT_Y] {
+            st.outputs[0].rotation = rotation;
+            assert!(!st.screen_size_would_crop(1280, 800), "{rotation:#x}");
+            assert!(st.screen_size_would_crop(800, 1280), "{rotation:#x}");
+        }
+        // `--rotate left --scale 2x2`: footprint 1600×2560, yet 1599×2560
+        // and 2560×1600 apply — the box is the rotated mode, unscaled.
+        st.outputs[0].rotation = RR_ROTATE_90;
+        st.outputs[0].current_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (1600, 2560));
+        assert!(!st.screen_size_would_crop(1599, 2560));
+        assert!(!st.screen_size_would_crop(2560, 1600));
+        assert!(st.screen_size_would_crop(799, 2560));
+    }
+
+    #[test]
+    fn rotation_fields_of_the_randr_1_0_views() {
+        let mut output = crop_probe_state(FIXED_ONE).outputs[0].clone();
+        (output.width, output.height) = (1280, 800);
+        let mut st = RandrState::from_outputs(1, vec![output]);
+        (st.screen_width, st.screen_height, st.width_mm, st.height_mm) = (800, 1280, 211, 338);
+        st.outputs[0].rotation = RR_ROTATE_90;
+        // RRDeliverScreenEvent swaps pixels and mm for 90/270.
+        assert_eq!(st.screen_change_fields(), (2, 1280, 800, 338, 211));
+        assert_eq!(st.first_output_rotation(), RR_ROTATE_90);
+        assert_eq!(st.crtc_rotation(st.outputs[0].crtc_id), RR_ROTATE_90);
+        st.outputs[0].rotation = RR_ROTATE_180 | RR_REFLECT_X;
+        assert_eq!(st.screen_change_fields(), (0x14, 800, 1280, 211, 338));
+        st.outputs[0].mode_id = 0;
+        assert_eq!(st.first_output_rotation(), RR_ROTATE_0, "no CRTC");
+    }
+
+    #[test]
+    fn crtc_info_and_derived_extent_use_the_footprint() {
+        let st = crop_probe_state(131_072);
+        let info = st.crtc_info(4, 0).unwrap();
+        assert_eq!(
+            (info.x, info.y, info.width, info.height),
+            (1920, 0, 3840, 2880)
+        );
+        let info = st.crtc_info(3, 0).unwrap();
+        assert_eq!((info.width, info.height), (1920, 1440));
+        let mut outputs = st.outputs.clone();
+        outputs[1].current_transform = scale_transform(131_072);
+        let derived = RandrState::from_outputs(1, outputs);
+        assert_eq!((derived.screen_width, derived.screen_height), (5760, 2880));
     }
 }

@@ -139,6 +139,7 @@ pub const CLIENT_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_r
         | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
 );
 
+#[track_caller]
 fn can_import_modifier(
     vk: &VkContext,
     format: vk::Format,
@@ -170,13 +171,13 @@ fn can_import_modifier(
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
 
-    let result = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    };
+    let result = super::image_format_properties2(
+        vk,
+        "dri3::can_import_modifier",
+        Some(modifier),
+        &format_info,
+        &mut props2,
+    );
 
     if result.is_err() {
         return false;
@@ -244,7 +245,8 @@ pub fn export_capable_modifiers(vk: &VkContext, format: vk::Format) -> Vec<u64> 
 /// `EXPORTABLE` external-memory feature and uses
 /// [`super::target::EXPORT_IMAGE_USAGE`] (which must match the usage the
 /// allocation actually requests).
-fn can_export_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> bool {
+#[track_caller]
+pub(crate) fn can_export_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> bool {
     let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
         .drm_format_modifier(modifier)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -263,13 +265,13 @@ fn can_export_modifier(vk: &VkContext, format: vk::Format, modifier: u64) -> boo
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
 
-    let result = unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    };
+    let result = super::image_format_properties2(
+        vk,
+        "dri3::can_export_modifier",
+        Some(modifier),
+        &format_info,
+        &mut props2,
+    );
 
     if result.is_err() {
         return false;

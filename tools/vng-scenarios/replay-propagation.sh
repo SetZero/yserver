@@ -24,7 +24,7 @@
 #       --scenario tools/vng-scenarios/replay-propagation.sh
 set -u
 src=$(dirname "$0")/../replay-propagation-probe.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/replay-propagation-probe.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/replay-propagation-probe.c
 
 cc -O1 -o replay-propagation-probe "$src" -lX11 -lXi -lXtst > cc.log 2>&1 || {
     echo "replay-propagation: compile failed" >&2

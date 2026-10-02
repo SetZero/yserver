@@ -51,7 +51,10 @@ use crate::{
         pointer_fanout::replay_frozen_pointer_event_to_state,
     },
     properties,
-    resources::{BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, Window},
+    resources::{
+        BorderSource, COMPOSITE_OVERLAY_WINDOW, MapState, Pixmap, ROOT_WINDOW, ViewabilityDelta,
+        Window,
+    },
     server::{
         PendingPresentPixmap, PendingPresentRequest, ScreenSaverActive, ServerState, XI_FIRST_EVENT,
     },
@@ -97,6 +100,14 @@ const PRESENT_ALL_OPTIONS: u32 = 0x1f;
 // lease lookup reports BadValue. See the FreeLease arm.
 const XINPUT_LAST_REQUEST: u8 = 61;
 const XKB_LAST_REQUEST: u8 = 25;
+/// XKB request minors (`X_kb*`).
+const X_KB_USE_EXTENSION: u8 = 0;
+const X_KB_SELECT_EVENTS: u8 = 1;
+const X_KB_SET_MAP: u8 = 9;
+const X_KB_SET_COMPAT_MAP: u8 = 11;
+const X_KB_SET_INDICATOR_MAP: u8 = 14;
+const X_KB_SET_NAMES: u8 = 18;
+const X_KB_SET_GEOMETRY: u8 = 20;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -117,7 +128,7 @@ pub enum RequestOutcome {
 
 /// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
 /// without redispatching the original request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PendingCrtcConfig {
     pub token: CrtcConfigToken,
     pub completion: CrtcConfigCompletion,
@@ -126,12 +137,32 @@ pub struct PendingCrtcConfig {
 /// Protocol continuation shared by synchronous and asynchronous CRTC apply
 /// paths. It contains no backend token, so immediate completion never needs a
 /// sentinel token value.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CrtcConfigCompletion {
     pub output_id: u32,
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
     pub byte_order: yserver_protocol::x11::ClientByteOrder,
+    /// The pending transform this enable applies, snapshotted at request
+    /// time, when it differs from the current one (`RRCrtcPendingTransform`,
+    /// rrcrtc.c:765).
+    pub apply_transform: Option<Box<crate::randr::CrtcTransform>>,
+    /// The rotation this enable sets, when it differs from the CRTC's
+    /// (`RRCrtcSet`'s `rotation != crtc->rotation`, rrcrtc.c:749). A
+    /// disable keeps the rotation, as `xf86RandR12CrtcSet` does.
+    pub apply_rotation: Option<u16>,
+    /// Which request is waiting for the reply.
+    pub reply: CrtcConfigReply,
+}
+
+/// The request a CRTC configuration answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrtcConfigReply {
+    /// `RRSetCrtcConfig`.
+    CrtcConfig,
+    /// RANDR 1.0 `RRSetScreenConfig`: its own reply, and `lastSetTime`
+    /// moves on every success (rrscreen.c:1099-1101).
+    ScreenConfig,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -181,15 +212,14 @@ pub fn process_request(
             header.opcode,
         );
     }
-    // Maximum request length: u16::MAX without BIG-REQUESTS, 256K units
-    // (1 MiB) with BIG-REQUESTS — see write_big_requests_enable_reply
-    // which advertises 256 * 1024.
+    // Maximum request length: u16::MAX without BIG-REQUESTS,
+    // MAX_BIG_REQUEST_UNITS with it (the value BigRequestsEnable advertises).
     let big_enabled = state
         .clients
         .get(&client_id.0)
         .is_some_and(|c| c.big_requests_enabled);
     let max_length_units = if big_enabled {
-        256 * 1024
+        x11::MAX_BIG_REQUEST_UNITS
     } else {
         u32::from(u16::MAX)
     };
@@ -300,7 +330,9 @@ pub fn process_request(
         113 => handle_kill_client(state, backend, client_id, sequence, body),
         // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
         116 => handle_set_pointer_mapping(state, client_id, sequence, header, body),
-        118 => handle_set_modifier_mapping(state, client_id, sequence, header, body),
+        118 => {
+            handle_set_modifier_mapping(state, backend, origin, client_id, sequence, header, body)
+        }
         // ── state-read replies (read state, no backend, no mutation) ──
         14 => handle_get_geometry(state, client_id, sequence, body),
         15 => handle_query_tree(state, client_id, sequence, body),
@@ -349,7 +381,7 @@ pub fn process_request(
         91 => handle_query_colors(state, client_id, sequence, body),
         92 => handle_lookup_color(state, client_id, sequence, body),
         // ── keyboard mapping (server-wide MappingNotify + backend proxy) ──
-        100 => handle_change_keyboard_mapping(state, client_id, sequence, header, body),
+        100 => handle_change_keyboard_mapping(state, backend, client_id, sequence, header, body),
         101 => handle_get_keyboard_mapping(state, backend, origin, client_id, sequence, body),
         // ── save-set + cursor lifecycle ──
         6 => handle_change_save_set(state, client_id, sequence, header, body),
@@ -395,7 +427,7 @@ pub fn process_request(
         94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
         // ── window queries / circulation ──
         3 => handle_get_window_attributes(state, client_id, sequence, body),
-        13 => handle_circulate_window(state, client_id, sequence, header, body),
+        13 => handle_circulate_window(state, backend, client_id, sequence, header, body),
         // ── extension extension-protocol arms (standalone, not full
         //    extension dispatchers) ──
         138 => handle_ge_request(state, client_id, sequence, header), // GE
@@ -440,7 +472,7 @@ pub fn process_request(
         // ── COMPOSITE extension dispatcher ──
         144 => handle_composite_request(state, backend, origin, client_id, sequence, header, body),
         // ── XFIXES extension dispatcher ──
-        140 => handle_xfixes_request(state, backend, origin, client_id, sequence, header, body),
+        140 => dispatch_xfixes_request(state, backend, origin, client_id, sequence, header, body),
         // ── SHAPE extension dispatcher ──
         141 => handle_shape_request(state, backend, origin, client_id, sequence, header, body),
         // ── SYNC extension dispatcher ──
@@ -473,6 +505,10 @@ pub fn process_request(
         152 => handle_xcmisc_request(state, client_id, sequence, header, body),
         // ── XFree86-VidModeExtension dispatcher ──
         153 => handle_xf86vidmode_request(state, backend, client_id, sequence, header, body),
+        // ── RECORD extension dispatcher ──
+        154 => crate::core_loop::record::handle_record_request(
+            state, client_id, sequence, header, body,
+        ),
         opcode => {
             debug!(
                 "client {} #{} unknown opcode {} ({} bytes) -> BadRequest",
@@ -900,6 +936,14 @@ fn activate_redirect_backing_for(
     if window == COMPOSITE_OVERLAY_WINDOW {
         return;
     }
+    // compCheckRedirect allocates only for a realized window (compwindow.c:162); realize does it later.
+    if state
+        .resources
+        .window(window)
+        .is_none_or(|w| w.map_state != MapState::Viewable)
+    {
+        return;
+    }
     // Mode-flip on an existing redirect is routed through
     // `flip_redirect_target_mode` upstream — don't reallocate
     // here (Xorg preserves the backing per
@@ -1061,27 +1105,42 @@ pub fn redirect_subwindows_for_server(
     parent: ResourceId,
     mode: crate::server::CompositeRedirectMode,
 ) -> bool {
-    let key = (parent, true);
-    if let Some(record) = state.composite_redirects.get(&key) {
-        return record.owner == crate::resources::SERVER_OWNER;
+    let owner = crate::resources::SERVER_OWNER;
+    let records = state.composite_redirects.subwindows_records(parent);
+    if !records.is_empty() {
+        return records.iter().any(|r| r.owner == owner);
     }
     if !backend.supports_redirect_activation() {
         return false;
     }
-    state.composite_redirects.insert(
-        key,
-        crate::server::RedirectRecord {
-            mode,
-            owner: crate::resources::SERVER_OWNER,
-        },
-    );
+    // As a client's RedirectSubwindows: top first, and no record for the
+    // overlay window.
+    let targets: Vec<ResourceId> = state
+        .resources
+        .children(parent)
+        .iter()
+        .rev()
+        .copied()
+        .filter(|child| *child != COMPOSITE_OVERLAY_WINDOW)
+        .collect();
+    let before: Vec<_> = targets
+        .iter()
+        .map(|t| state.composite_redirects.window_mode(*t))
+        .collect();
+    let record = crate::server::RedirectRecord { mode, owner };
+    if state
+        .composite_redirects
+        .redirect_subwindows(parent, &targets, record)
+        .is_err()
+    {
+        return false;
+    }
     debug!(
         "the server redirects the children of 0x{:x} ({mode:?})",
         parent.0
     );
-    let children = state.resources.children(parent).to_vec();
-    for child in children {
-        activate_redirect_backing_for(state, backend, None, child, mode);
+    for (target, before) in targets.into_iter().zip(before) {
+        sync_redirect_backing(state, backend, None, target, before);
     }
     true
 }
@@ -1532,53 +1591,144 @@ fn flip_redirect_target_mode(
     }
 }
 
-/// Stage 4b.7: post-hook for `handle_map_window` /
-/// `handle_map_subwindows`. When a child window is mapped under a
-/// parent that has `RedirectSubwindows(mode)` recorded, the child
-/// inherits the redirect and needs its own backing — per Composite
-/// spec ("redirected hierarchy pixels are available whenever it is
-/// viewable", `compositeproto.txt:44-48`) and Xorg's compositional
-/// realize at `xserver/composite/compwindow.c:267`.
-///
-/// Must be called AFTER `backend.map_subwindow`. The v2 backend's
-/// `map_subwindow` unconditionally sets `scene_participating = true`
-/// (it doesn't know about the parent's redirect record). Running
-/// activation AFTER lets `set_window_scene_participation(W, false)`
-/// (Manual mode) win over `map_subwindow`'s blind flip — the
-/// codex-round-6 ordering decision.
-///
-/// Gated on `backend.supports_redirect_activation()`; no-op on v1
-/// and the host-X11 test backends.
-fn maybe_activate_child_under_redirected_parent(
+/// Xorg `compCheckRedirect` after `window`'s redirect records changed from
+/// effective mode `before`: allocate, flip or drop its backing to match.
+/// Allocation and the flip need `supports_redirect_activation()`; a
+/// teardown is a no-op for a window that never got a backing.
+pub(crate) fn sync_redirect_backing(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
-    child: ResourceId,
+    window: ResourceId,
+    before: Option<crate::server::CompositeRedirectMode>,
+) {
+    let after = state.composite_redirects.window_mode(window);
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (_, None) => crate::core_loop::process_disconnect::teardown_redirect_for_window(
+            state, backend, origin, window,
+        ),
+        _ if !backend.supports_redirect_activation() => {}
+        (None, Some(mode)) => activate_redirect_backing_for(state, backend, origin, window, mode),
+        (Some(_), Some(mode)) => flip_redirect_target_mode(state, backend, origin, window, mode),
+    }
+}
+
+/// Point GLX pixmap `glx_xid` at `new_host`, moving its export-lifetime ref along (acquire NEW, release OLD).
+fn retarget_glx_pixmap_export(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    glx_xid: u32,
+    new_host: u32,
+) {
+    let Some(drawable) = state.glx_drawables.get_mut(&glx_xid) else {
+        return;
+    };
+    let old_host = drawable.glx_export_host_xid.replace(new_host);
+    if old_host == Some(new_host) {
+        return;
+    }
+    backend.acquire_glx_pixmap_export(new_host);
+    if let Some(old_host) = old_host {
+        backend.release_glx_pixmap_export(old_host);
+    }
+}
+
+/// A window that just became viewable under an existing redirect (its own
+/// `RedirectWindow`, or its parent's `RedirectSubwindows`) gets a fresh
+/// backing, as Xorg's `compRealizeWindow` → `compCheckRedirect` →
+/// `compAllocPixmap` does (`composite/compwindow.c:274`, `:173-174`).
+///
+/// Must be called AFTER `backend.map_subwindow`: `map_subwindow` blindly
+/// sets `scene_participating = true`, and the Manual participation flip
+/// inside `activate_redirect_backing_for` must land last. Callers walk the
+/// delta's `became_viewable` parent first, so the seed finds the parent's
+/// storage (or backing) already in place.
+fn realize_redirect_backing(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
 ) {
     if !backend.supports_redirect_activation() {
         return;
     }
-    let Some(parent) = state.resources.window(child).map(|w| w.parent) else {
-        return;
-    };
-    // Already redirected? `activate_redirect_backing_for` is
-    // idempotent on this case (the v2 backend's
-    // `allocate_redirected_backing` returns the existing handle
-    // unchanged), but we skip up front to avoid the wasted call.
-    let already_redirected = state
+    if state
         .resources
-        .window(child)
-        .is_some_and(|w| w.redirected_backing.is_some());
-    if already_redirected {
+        .window(window)
+        .is_none_or(|w| w.redirected_backing.is_some())
+    {
         return;
     }
-    // Look up `(parent, subwindows = true)` in
-    // `composite_redirects`. The single-window `RedirectWindow(parent)`
-    // doesn't auto-redirect children; only `RedirectSubwindows` does.
-    let Some(record) = state.composite_redirects.get(&(parent, true)).copied() else {
+    let Some(mode) = effective_redirect_mode_for_window(state, window) else {
         return;
     };
-    activate_redirect_backing_for(state, backend, origin, child, record.mode);
+    activate_redirect_backing_for(state, backend, origin, window, mode);
+}
+
+/// Apply a viewability delta to COMPOSITE backings: the windows that became
+/// unviewable (child first) drop theirs, those that became viewable (parent
+/// first) get a fresh one. The redirect records are untouched.
+fn apply_viewability_delta_to_redirects(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_unviewable {
+        let _ = crate::core_loop::process_disconnect::unrealize_redirect_backing(
+            state, backend, origin, *window,
+        );
+    }
+    for window in &delta.became_viewable {
+        realize_redirect_backing(state, backend, origin, *window);
+    }
+}
+
+/// Host xid of a window whose storage follows its viewability; the root and the COW own theirs.
+fn storage_lifecycle_host_xid(state: &ServerState, window: ResourceId) -> Option<u32> {
+    if window == ROOT_WINDOW || window == COMPOSITE_OVERLAY_WINDOW {
+        return None;
+    }
+    state
+        .resources
+        .window(window)
+        .and_then(|w| w.host_xid)
+        .map(|h| h.as_raw())
+}
+
+/// Windows that became viewable get storage, parent first; call before their redirect backings.
+fn realize_storage_for_delta(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_viewable {
+        if let Some(xid) = storage_lifecycle_host_xid(state, *window)
+            && let Err(err) = backend.realize_window_storage(origin, xid)
+        {
+            log::warn!("realize_window_storage(0x{xid:x}) failed: {err}");
+        }
+    }
+}
+
+/// Windows that became unviewable drop storage, child first; call after their redirect backings.
+fn release_storage_for_delta(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    delta: &ViewabilityDelta,
+) {
+    for window in &delta.became_unviewable {
+        if let Some(xid) = storage_lifecycle_host_xid(state, *window)
+            && let Err(err) = backend.release_window_storage(origin, xid)
+        {
+            log::warn!("release_window_storage(0x{xid:x}) failed: {err}");
+        }
+    }
 }
 
 /// Re-apply a window's effective COMPOSITE redirect mode after a
@@ -1868,10 +2018,14 @@ fn rotate_redirected_backing_on_resize(
             new_height,
             depth,
         );
-        for drawable in state.glx_drawables.values_mut() {
-            if drawable.x_drawable == alias.client_pixmap.0 {
-                drawable.glx_export_host_xid = Some(new_backing.as_raw());
-            }
+        let glx_pixmaps: Vec<u32> = state
+            .glx_drawables
+            .iter()
+            .filter(|(_, d)| d.x_drawable == alias.client_pixmap.0)
+            .map(|(xid, _)| *xid)
+            .collect();
+        for glx_xid in glx_pixmaps {
+            retarget_glx_pixmap_export(state, backend, glx_xid, new_backing.as_raw());
         }
     }
     if let Some(w) = state.resources.window_mut(window) {
@@ -2059,18 +2213,321 @@ fn rotate_redirected_backing_on_resize(
     let _dropped = accumulate_damage_border_to_state(state, window);
 }
 
+/// A window's outer (border-inclusive) rect in its parent's content
+/// space.
+fn outer_rect(
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+) -> x11::xfixes::RegionRect {
+    let bw2 = border_width.saturating_mul(2);
+    x11::xfixes::RegionRect {
+        x,
+        y,
+        width: width.saturating_add(bw2),
+        height: height.saturating_add(bw2),
+    }
+}
+
+/// `window`'s bounding region in its parent's content space for the
+/// geometry given: its outer rect, cut to its bounding shape when it has
+/// one (the shape is relative to its content origin). Xorg's
+/// `borderSize` (`SetBorderSize`, `dix/window.c:1747-1770`).
+fn bounding_in_parent(
+    state: &ServerState,
+    window: ResourceId,
+    (x, y, width, height, border_width): (i16, i16, u16, u16, u16),
+) -> Vec<x11::xfixes::RegionRect> {
+    let outer = outer_rect(x, y, width, height, border_width);
+    let Some(shape) = state
+        .shape_windows
+        .get(&window)
+        .and_then(|s| s.bounding.as_ref())
+    else {
+        return vec![outer];
+    };
+    let bw = i16::try_from(border_width).unwrap_or(i16::MAX);
+    let shape =
+        crate::nested::offset_rects(shape.clone(), x.saturating_add(bw), y.saturating_add(bw));
+    crate::nested::intersect_regions(&[outer], &shape)
+}
+
+/// [`bounding_in_parent`] at the window's current geometry.
+fn current_bounding_in_parent(
+    state: &ServerState,
+    window: ResourceId,
+) -> Vec<x11::xfixes::RegionRect> {
+    state.resources.window(window).map_or_else(Vec::new, |w| {
+        bounding_in_parent(state, window, (w.x, w.y, w.width, w.height, w.border_width))
+    })
+}
+
+/// Expose what `moved` uncovered when it left `vacated` (in `parent`'s
+/// content space): Xorg's `miHandleValidateExposures` after a
+/// `ConfigureWindow`, for the case where nothing else restores those
+/// pixels.
+///
+/// Every window here draws into one redirect backing shared with its
+/// redirected ancestor, so the backing still holds the moved window's
+/// old pixels over whatever it was covering. (Without that sharing each
+/// window keeps its own storage and the scene composites the uncovered
+/// part from it, which is why this is only reached under a redirected
+/// ancestor.) MATE's panel shows it when the workspace switcher is
+/// dragged across the notification area: the switcher's buttons stay
+/// painted over the tray icon after the switcher moves on.
+///
+/// The walk is Xorg's clip-list split, top to bottom: a sibling stacked
+/// ABOVE `moved` was never covered by it and only takes its share out
+/// of the region; a sibling BELOW gets its share exposed, recursively
+/// through its own children; the parent gets what is left. Exposing a
+/// window paints its background over its share (unless it is `None`,
+/// `mi/miexpose.c:438-440`) and sends it Expose events — the client
+/// repaints the rest. A Manual-redirected child does not clip its
+/// parent (`TreatAsTransparent`, `mi/mivaltree.c:171`); an Automatic
+/// one clips but keeps its own backing, so it needs no exposure.
+fn expose_vacated_area(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    parent: ResourceId,
+    moved: ResourceId,
+    vacated: Vec<x11::xfixes::RegionRect>,
+) {
+    let Some(p) = state.resources.window(parent) else {
+        return;
+    };
+    let content = content_within_ancestors(state, parent);
+    let mut region = crate::nested::intersect_regions(&vacated, &[content]);
+    // Top-most first; `children` is bottom-to-top.
+    let siblings: Vec<ResourceId> = p.children.iter().rev().copied().collect();
+    let mut below_moved = false;
+    for sibling in siblings {
+        if region.is_empty() {
+            return;
+        }
+        if sibling == moved {
+            below_moved = true;
+            continue;
+        }
+        region = expose_child_share(state, backend, origin, sibling, region, below_moved);
+    }
+    expose_own_region(state, backend, origin, parent, &region);
+}
+
+/// Outer rects (parent content space) of the mapped siblings stacked
+/// above `window` that hide it: what the backend's in-backing copy
+/// treats as occluders (`copy_area_shared_backing_occluders`). A
+/// Manual-redirected sibling is transparent (`TreatAsTransparent`).
+fn higher_sibling_rects(state: &ServerState, window: ResourceId) -> Vec<x11::xfixes::RegionRect> {
+    let Some(parent) = state.resources.window(window).map(|w| w.parent) else {
+        return Vec::new();
+    };
+    let Some(p) = state.resources.window(parent) else {
+        return Vec::new();
+    };
+    let Some(at) = p.children.iter().position(|c| *c == window) else {
+        return Vec::new();
+    };
+    p.children[at + 1..]
+        .iter()
+        .filter_map(|s| state.resources.window(*s).map(|w| (*s, w)))
+        .filter(|(s, w)| {
+            w.map_state == crate::resources::MapState::Viewable
+                && !matches!(w.class, crate::resources::WindowClass::InputOnly)
+                && state.composite_redirects.window_mode(*s)
+                    != Some(crate::server::CompositeRedirectMode::Manual)
+        })
+        .flat_map(|(s, _)| current_bounding_in_parent(state, s))
+        .collect()
+}
+
+/// Take `child`'s share out of `region` (its parent's content space) and,
+/// when `expose` is set, expose that share in the child's subtree.
+/// Returns what is left of `region` for the windows beneath.
+fn expose_child_share(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    child: ResourceId,
+    region: Vec<x11::xfixes::RegionRect>,
+    expose: bool,
+) -> Vec<x11::xfixes::RegionRect> {
+    let Some(c) = state.resources.window(child) else {
+        return region;
+    };
+    if c.map_state != crate::resources::MapState::Viewable
+        || matches!(c.class, crate::resources::WindowClass::InputOnly)
+    {
+        return region;
+    }
+    let mode = state.composite_redirects.window_mode(child);
+    if mode == Some(crate::server::CompositeRedirectMode::Manual) {
+        return region;
+    }
+    let outer = current_bounding_in_parent(state, child);
+    let share = crate::nested::intersect_regions(&region, &outer);
+    if share.is_empty() {
+        return region;
+    }
+    let rest = crate::nested::subtract_regions(&region, &outer);
+    if expose && mode.is_none() {
+        // Into the child's content space; the border ring is not
+        // repainted here.
+        let bw = i16::try_from(c.border_width).unwrap_or(i16::MAX);
+        let (dx, dy) = (
+            c.x.saturating_add(bw).saturating_neg(),
+            c.y.saturating_add(bw).saturating_neg(),
+        );
+        let content = x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: c.width,
+            height: c.height,
+        };
+        let mut inner = share;
+        crate::nested::translate_region(&mut inner, dx, dy);
+        let mut inner = crate::nested::intersect_regions(&inner, &[content]);
+        let grandchildren: Vec<ResourceId> = c.children.iter().rev().copied().collect();
+        for grandchild in grandchildren {
+            if inner.is_empty() {
+                break;
+            }
+            inner = expose_child_share(state, backend, origin, grandchild, inner, true);
+        }
+        expose_own_region(state, backend, origin, child, &inner);
+    }
+    rest
+}
+
+/// Paint `window`'s background over `region` (its content space) and
+/// send it the Expose events for it.
+fn expose_own_region(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    window: ResourceId,
+    region: &[x11::xfixes::RegionRect],
+) {
+    if region.is_empty() {
+        return;
+    }
+    if let Some(bg) = state.resources.window_resolved_background(window)
+        && let Some(target) = state.resources.host_drawable_target(window)
+    {
+        for r in region {
+            let _ = backend.clear_area(
+                origin,
+                target.host_xid(),
+                bg.background_pixel,
+                bg.background_pixmap_host_xid.map(|h| h.as_raw()),
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                bg.tile_origin_offset,
+            );
+            let _dropped = accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
+        }
+    }
+    let last = region.len() - 1;
+    for (i, r) in region.iter().enumerate() {
+        let count = u16::try_from(last - i).unwrap_or(u16::MAX);
+        let r = *r;
+        let _dropped = emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
+            x11::encode_expose_event(
+                buf,
+                seq,
+                order,
+                window,
+                u16::try_from(r.x).unwrap_or(0),
+                u16::try_from(r.y).unwrap_or(0),
+                r.width,
+                r.height,
+                count,
+            );
+        });
+    }
+}
+
+/// `window`'s content rect in its own content space, intersected with
+/// each ancestor's up to the nearest redirected one: what of it can be
+/// in a clip list at all, since a child's never leaves its parent's
+/// (`mi/mivaltree.c:390`) and a redirected window's is not clipped by
+/// ITS parent (`mi/mivaltree.c:233-239`, `SetWinSize` `dix/window.c:1716`).
+fn content_within_ancestors(state: &ServerState, window: ResourceId) -> x11::xfixes::RegionRect {
+    let Some(w) = state.resources.window(window) else {
+        return x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    };
+    let mut clip = vec![x11::xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: w.width,
+        height: w.height,
+    }];
+    // The current ancestor's content origin, in `window`'s content space.
+    let (mut ox, mut oy) = (0i32, 0i32);
+    let mut cur = window;
+    while state.composite_redirects.window_mode(cur).is_none() {
+        let Some(c) = state.resources.window(cur) else {
+            break;
+        };
+        let Some(p) = state.resources.window(c.parent).filter(|_| cur != c.parent) else {
+            break;
+        };
+        let bw = i32::from(c.border_width);
+        ox -= i32::from(c.x) + bw;
+        oy -= i32::from(c.y) + bw;
+        let (Ok(x), Ok(y)) = (i16::try_from(ox), i16::try_from(oy)) else {
+            break;
+        };
+        clip = crate::nested::intersect_regions(
+            &clip,
+            &[x11::xfixes::RegionRect {
+                x,
+                y,
+                width: p.width,
+                height: p.height,
+            }],
+        );
+        cur = c.parent;
+    }
+    clip.first().copied().unwrap_or(x11::xfixes::RegionRect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    })
+}
+
+/// Whether any proper ancestor of `window` is redirected, i.e. the
+/// window (when not redirected itself) draws into that ancestor's
+/// backing rather than onto the screen.
+fn has_redirected_ancestor(state: &ServerState, window: ResourceId) -> bool {
+    let mut cur = state.resources.window(window).map(|w| w.parent);
+    while let Some(ancestor) = cur {
+        if ancestor == crate::resources::ROOT_WINDOW {
+            return state.composite_redirects.window_mode(ancestor).is_some();
+        }
+        if state.composite_redirects.window_mode(ancestor).is_some() {
+            return true;
+        }
+        cur = state.resources.window(ancestor).map(|w| w.parent);
+    }
+    false
+}
+
 fn effective_redirect_mode_for_window(
     state: &ServerState,
     window: ResourceId,
 ) -> Option<crate::server::CompositeRedirectMode> {
-    if let Some(record) = state.composite_redirects.get(&(window, false)) {
-        return Some(record.mode);
-    }
-    let parent = state.resources.window(window)?.parent;
-    state
-        .composite_redirects
-        .get(&(parent, true))
-        .map(|record| record.mode)
+    state.composite_redirects.window_mode(window)
 }
 
 /// One window's worth of identity captured *before* destroy_window
@@ -2094,23 +2551,18 @@ fn collect_destroy_order(
     let Some(w) = table.window(root) else {
         return;
     };
-    for child in w.children.clone() {
+    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
+    for child in w.children.clone().into_iter().rev() {
         collect_destroy_order(table, child, out);
     }
     out.push(root);
 }
 
+/// DestroyNotify only: the destroyed window's UnmapNotify went out before the
+/// teardown, and its inferiors get none (Xorg CrushTree).
 fn fanout_destroy_sequence_to_state(state: &mut ServerState, pending: &PendingDestroy) {
     let window = pending.window;
     let parent = pending.parent;
-    if pending.was_mapped {
-        let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
-        });
-        let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
-        });
-    }
     let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
         x11::encode_destroy_notify_event(buf, seq, order, window, window);
     });
@@ -2168,9 +2620,7 @@ pub(crate) fn purge_present_for_destroyed_windows(
                         "PRESENT teardown: trigger idle fence 0x{idle_fence_xid:x} failed: {error}"
                     );
                 }
-                if let Some(fence) = state.sync_fences.get_mut(idle_fence_xid) {
-                    fence.triggered = true;
-                }
+                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
             }
             crate::backend::PresentWake::PixmapSynced {
                 release,
@@ -2230,6 +2680,39 @@ pub(crate) fn purge_present_for_destroyed_windows(
 /// Common subtree-destroy used by both DestroyWindow (root = the
 /// requested window) and DestroySubwindows (each child of the
 /// requested parent).
+/// Free every Picture on the doomed `windows`, whichever client owns it, while the
+/// window records still exist (Xorg `PictureDestroyWindow`, `render/picture.c:67`).
+pub(crate) fn free_pictures_on_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    windows: &[ResourceId],
+) {
+    for (pic_xid, owned_pix) in state.resources.remove_pictures_on_windows(windows) {
+        let _ = backend.render_free_picture(origin, pic_xid);
+        if let Some(pix_xid) = owned_pix {
+            let _ = backend.free_pixmap(origin, pix_xid);
+        }
+    }
+}
+
+/// Release each doomed window's redirect backing and drop every redirect record keyed on it,
+/// while the window records still exist (Xorg `compDestroyWindow`, `composite/compwindow.c:600`).
+/// Surviving `NameWindowPixmap` aliases keep the backing alive until their `FreePixmap`.
+pub(crate) fn release_redirects_on_destroyed_windows(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    windows: &[ResourceId],
+) {
+    for window in windows {
+        crate::core_loop::process_disconnect::unrealize_redirect_backing(
+            state, backend, origin, *window,
+        );
+    }
+    state.composite_redirects.forget_windows(windows);
+}
+
 fn destroy_window_subtree(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -2275,39 +2758,27 @@ fn destroy_window_subtree(
             on_parent,
         });
     }
-    let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
-    purge_present_for_destroyed_windows(state, backend, &order);
-    // L2 plan B.15 — release the reason-1 hold on each destroyed
-    // window's redirected backing. Surviving `NameWindowPixmap`
-    // aliases keep the backing alive; their `client_pixmap`
-    // resources remain valid X protocol pixmaps until the client's
-    // `FreePixmap` (or the disconnect cleanup).
-    let redirect_backings: Vec<crate::backend::PixmapHandle> = order
-        .iter()
-        .filter_map(|w| {
-            state
-                .resources
-                .window(*w)
-                .and_then(|win| win.redirected_backing.as_ref().map(|b| b.host_pixmap))
-        })
-        .collect();
-    for backing in redirect_backings {
-        if let Err(err) = backend.release_redirected_backing(origin, backing) {
-            log::warn!(
-                "DestroyWindow: release_redirected_backing(0x{:x}) failed: {err}",
-                backing.as_raw()
-            );
-        }
+    // Xorg DeleteWindow unmaps the window first (`dix/window.c:1075`):
+    // UnmapNotify, then WindowsRestructured while the subtree still exists,
+    // so the pointer's Leave reaches the dying windows before any
+    // DestroyNotify. `order` ends with `root`.
+    if let Some(top) = pending.last()
+        && top.was_mapped
+    {
+        let (window, parent) = (top.window, top.parent);
+        let _dropped = fanout_event_to_clients(state, &top.on_window, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped = fanout_event_to_clients(state, &top.on_parent, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
+        });
+        let _ = state.resources.unmap_window(window);
+        backend.windows_restructured(state);
     }
-    // Drop any COMPOSITE redirect records still keyed against the
-    // destroyed windows. The actual backing teardown happened
-    // above; this just keeps `composite_redirects` clean so a
-    // future REDIRECT_WINDOW on a new XID with the same numeric
-    // value (after the X11 ID allocator wraps) doesn't see a
-    // stale entry.
-    state
-        .composite_redirects
-        .retain(|(window, _), _| !order.contains(window));
+    let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
+    free_pictures_on_destroyed_windows(state, backend, origin, &order);
+    purge_present_for_destroyed_windows(state, backend, &order);
+    release_redirects_on_destroyed_windows(state, backend, origin, &order);
     // Audit #9 — selections owned by any destroyed window in this
     // subtree must fire `XFixesSelectionNotify(SelectionWindowDestroy)`
     // and clear ownership (Xorg `xfixes/select.c` registers a
@@ -2345,6 +2816,7 @@ fn destroy_window_subtree(
             continue;
         }
         let _ = backend.free_pixmap(origin, *xid);
+        state.resources.host_pixmap_freed(*xid);
     }
     for entry in pending {
         if let Some(xid) = entry.host_xid {
@@ -2391,6 +2863,22 @@ fn handle_render_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    // RenderErrBase + BadPicture for the first unknown Picture, in Xorg's per-request order.
+    macro_rules! verify_pictures {
+        ($($id:expr),+) => {
+            if let Some(bad) = first_missing_picture(state, &[$($id),+]) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::RENDER_FIRST_ERROR + 1,
+                    bad.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+        };
+    }
     match minor {
         0 => {
             let (major, minor_ver) = backend.render_query_version(origin).unwrap_or((0, 11));
@@ -2433,16 +2921,50 @@ fn handle_render_request(
             let Some(req) = x11::render_create_picture_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            // Xorg dixLookupDrawable (render.c:575): BadDrawable if unknown, BadMatch for
+            // an InputOnly window (dix/dixutils.c:208-213).
+            let input_only = match state.resources.window(req.drawable) {
+                Some(w) => w.class == crate::resources::WindowClass::InputOnly,
+                None if state.resources.pixmap(req.drawable).is_some() => false,
+                None => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        req.drawable.0,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+            };
+            if input_only {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.drawable.0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
             let damage_drawable = render_picture_damage_drawable(state, req.drawable);
             let drawable_origin = state
                 .resources
                 .window(req.drawable)
                 .map(|w| (w.x, w.y))
                 .unwrap_or((0, 0));
-            let host_drawable_handle = state
-                .resources
-                .host_drawable_target(req.drawable)
-                .map(|t| t.host_handle());
+            // A window Picture names the window itself, never its redirect backing: the
+            // backend resolves the window's current storage or backing at each use.
+            let picture_window = state.resources.window(req.drawable).map(|_| req.drawable);
+            let host_drawable_handle = match state.resources.window(req.drawable) {
+                Some(w) => w.host_xid.map(crate::backend::AnyHandle::Window),
+                None => state
+                    .resources
+                    .host_drawable_target(req.drawable)
+                    .map(|t| t.host_handle()),
+            };
             let host_pic = host_drawable_handle.and_then(|host_drawable| {
                 backend
                     .render_create_picture(
@@ -2455,25 +2977,32 @@ fn handle_render_request(
                     .ok()
                     .flatten()
             });
-            if let Some(host_pic) = host_pic {
-                backend.set_picture_drawable_origin(host_pic.as_raw(), drawable_origin);
-                state.resources.create_picture(
-                    req.picture,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Drawable,
-                        drawable: Some(damage_drawable),
-                    },
-                );
+            // Core's registry is authoritative: no X error was sent, so the Picture exists.
+            match host_pic {
+                Some(hp) => backend.set_picture_drawable_origin(hp.as_raw(), drawable_origin),
+                None => debug!(
+                    "client {} #{} RENDER::CreatePicture 0x{:x}: backend could not back it; ops on it are no-ops",
+                    client_id.0, sequence.0, req.picture.0
+                ),
             }
+            state.resources.create_picture(
+                req.picture,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Drawable,
+                    drawable: Some(damage_drawable),
+                    window: picture_window,
+                },
+            );
         }
         5 => {
             if body.len() < 8 {
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let translated = change_picture_translate_xids(value_mask, &body[8..], |attr, xid| {
                 let resource = ResourceId(xid);
@@ -2486,7 +3015,8 @@ fn handle_render_request(
                     ChangePictureAttr::AlphaMap => state
                         .resources
                         .picture(resource)
-                        .map(|p| p.host_picture_xid.as_raw()),
+                        .and_then(|p| p.host_picture_xid)
+                        .map(|h| h.as_raw()),
                 }
             });
             let Some(translated_values) = translated else {
@@ -2498,7 +3028,8 @@ fn handle_render_request(
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_change_picture(origin, hp, &patched);
             }
@@ -2508,10 +3039,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_clip_rectangles(origin, hp, body);
             }
@@ -2520,9 +3053,12 @@ fn handle_render_request(
             let Some(pic_id) = x11::render_free_resource_id(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(pic_id);
             let st = state.resources.free_picture(pic_id);
             if let Some(st) = st {
-                let _ = backend.render_free_picture(origin, st.host_picture_xid.as_raw());
+                if let Some(hp) = st.host_picture_xid {
+                    let _ = backend.render_free_picture(origin, hp.as_raw());
+                }
                 if let Some(pix) = st.host_owned_pixmap {
                     let _ = backend.free_pixmap(origin, pix.as_raw());
                 }
@@ -2532,6 +3068,7 @@ fn handle_render_request(
             let Some(req) = x11::render_composite_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2543,22 +3080,32 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            verify_pictures!(req.src);
+            if req.mask.0 != 0 {
+                verify_pictures!(req.mask);
+            }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_mask = if req.mask.0 == 0 {
                 Some(0)
             } else {
                 state
                     .resources
                     .picture(req.mask)
-                    .map(|p| p.host_picture_xid.as_raw())
+                    .and_then(|p| p.host_picture_xid)
+                    .map(|h| h.as_raw())
             };
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let (Some(host_src), Some(host_mask), Some(host_dst)) =
                 (host_src, host_mask, host_dst)
             {
@@ -2598,6 +3145,7 @@ fn handle_render_request(
             let src_x = i16::from_le_bytes([body[16], body[17]]);
             let src_y = i16::from_le_bytes([body[18], body[19]]);
             let primitives = &body[20..];
+            verify_pictures!(src, dst);
             if dst_picture_is_sourceless(state, dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2609,14 +3157,19 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_dst = state
                 .resources
                 .picture(dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_mask_format = if ynest_mask_format == 0 {
                 Some(0u32)
             } else {
@@ -2742,6 +3295,7 @@ fn handle_render_request(
                 );
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.src, req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2753,14 +3307,19 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_src = state
                 .resources
                 .picture(req.src)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             let host_gs = state
                 .resources
                 .glyphset(req.glyphset)
@@ -2830,6 +3389,7 @@ fn handle_render_request(
             let Some(req) = x11::render_fill_rectangles_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            verify_pictures!(req.dst);
             if dst_picture_is_sourceless(state, req.dst) {
                 return emit_x11_error_with_minor(
                     state,
@@ -2841,10 +3401,14 @@ fn handle_render_request(
                     header.opcode,
                 );
             }
+            if dst_picture_window_unviewable(state, req.dst) {
+                return Ok(RequestOutcome::Handled);
+            }
             let host_dst = state
                 .resources
                 .picture(req.dst)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(host_dst) = host_dst {
                 // ClipByChildren: a FillRectangles op=Clear on a window
                 // fully covered by a mapped child (mate-panel systray
@@ -2883,12 +3447,13 @@ fn handle_render_request(
             }
             let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
             let src_pic_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            verify_pictures!(src_pic_id);
             let x = u16::from_le_bytes([body[8], body[9]]);
             let y = u16::from_le_bytes([body[10], body[11]]);
             let host_src = state
                 .resources
                 .picture(src_pic_id)
-                .map(|p| p.host_picture_xid);
+                .and_then(|p| p.host_picture_xid);
             if let Some(host_src) = host_src
                 && let Some(cursor_handle) = backend
                     .render_create_cursor(origin, host_src, x, y)
@@ -2906,10 +3471,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_transform(origin, hp, body);
             }
@@ -2928,10 +3495,12 @@ fn handle_render_request(
                 return Ok(RequestOutcome::Handled);
             }
             let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            verify_pictures!(pic_id);
             let host_pic = state
                 .resources
                 .picture(pic_id)
-                .map(|p| p.host_picture_xid.as_raw());
+                .and_then(|p| p.host_picture_xid)
+                .map(|h| h.as_raw());
             if let Some(hp) = host_pic {
                 let _ = backend.render_set_picture_filter(origin, hp, body);
             }
@@ -2944,18 +3513,17 @@ fn handle_render_request(
                 .render_create_solid_fill(origin, color)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         34 => {
             if body.len() < 24 {
@@ -2966,18 +3534,17 @@ fn handle_render_request(
                 .render_create_linear_gradient(origin, body)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         35 => {
             if body.len() < 32 {
@@ -2988,18 +3555,17 @@ fn handle_render_request(
                 .render_create_radial_gradient(origin, body)
                 .ok()
                 .flatten();
-            if let Some(host_pic) = host_pic {
-                state.resources.create_picture(
-                    pic_id,
-                    PictureState {
-                        client: client_id,
-                        host_picture_xid: host_pic,
-                        host_owned_pixmap: None,
-                        kind: crate::resources::PictureKind::Sourceless,
-                        drawable: None,
-                    },
-                );
-            }
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: host_pic,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         31 => {
             // RENDER::CreateAnimCursor — body: cid(4), [cursor(4),
@@ -3160,7 +3726,23 @@ fn handle_render_request(
             }
         }
         36 => {
-            // CreateConicalGradient — stub.
+            // CreateConicalGradient: registered so the client can name it; rendering with it
+            // is not implemented, so ops that use it stay no-ops.
+            if body.len() < 4 {
+                return Ok(RequestOutcome::Handled);
+            }
+            let pic_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            state.resources.create_picture(
+                pic_id,
+                PictureState {
+                    client: client_id,
+                    host_picture_xid: None,
+                    host_owned_pixmap: None,
+                    kind: crate::resources::PictureKind::Sourceless,
+                    drawable: None,
+                    window: None,
+                },
+            );
         }
         32 => {
             // AddTraps — backend dispatch is a stub, but match the
@@ -3172,6 +3754,7 @@ fn handle_render_request(
             // y_off(2) then variable trapezoid list.
             if body.len() >= 4 {
                 let pic = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                verify_pictures!(pic);
                 if let Some(dst_drawable) = state.resources.picture(pic).and_then(|p| p.drawable) {
                     let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
@@ -3198,57 +3781,48 @@ fn handle_render_request(
     Ok(RequestOutcome::Handled)
 }
 
-/// One monitor as reported by both RANDR `GetMonitors` and the XINERAMA
-/// extension. This is the single source of truth so their counts/order cannot
-/// diverge.
-#[derive(Clone)]
-pub(crate) struct ActiveMonitor {
-    pub name: String,
-    pub output_id: u32,
-    pub primary: bool,
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
-    pub width_mm: u32,
-    pub height_mm: u32,
-}
-
-fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
-    // One automatic monitor per ASSIGNED output (Xorg builds an automatic
-    // monitor for an output with a current CRTC). A lightweight connection
-    // query does not detach that CRTC, so a transient disconnected+assigned
-    // output remains present until the heavy topology path turns it off.
-    // `primary` is the RANDR primary output, which itself prefers an assigned
-    // output — the first output in the list may be off, so `i == 0` is wrong.
-    let primary = state.randr.primary_output;
+/// The protocol-visible monitor list (`RRMonitorMakeList`), shared by RANDR
+/// `GetMonitors` and XINERAMA so their counts/order cannot diverge.
+fn active_monitors(state: &ServerState, get_active: bool) -> Vec<crate::randr::Monitor> {
     state
         .randr
-        .enabled_outputs()
-        .map(|output| {
-            let width_mm = if output.mm_width > 0 {
-                output.mm_width
-            } else {
-                ((u32::from(output.width) * 254 + 480) / 960).max(1)
-            };
-            let height_mm = if output.mm_height > 0 {
-                output.mm_height
-            } else {
-                ((u32::from(output.height) * 254 + 480) / 960).max(1)
-            };
-            ActiveMonitor {
-                name: output.name.clone(),
-                output_id: output.output_id,
-                primary: output.output_id == primary,
-                x: output.x,
-                y: output.y,
-                width: output.width,
-                height: output.height,
-                width_mm,
-                height_mm,
-            }
-        })
-        .collect()
+        .monitors(&state.randr_client_monitors, get_active)
+}
+
+/// `RRSendConfigNotify` (rrscreen.c): a core ConfigureNotify on the root
+/// carrying its current geometry — all `SetMonitor`/`DeleteMonitor` send.
+/// No RANDR event: the monitor list has none of its own.
+fn send_root_config_notify(state: &mut ServerState) {
+    let Some(root) = state.resources.window(crate::resources::ROOT_WINDOW) else {
+        return;
+    };
+    let geometry = x11::Geometry {
+        root: crate::resources::ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width: root.width,
+        height: root.height,
+        border_width: root.border_width,
+        depth: root.depth,
+    };
+    let override_redirect = root.override_redirect;
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+        state,
+        crate::resources::ROOT_WINDOW,
+        0x0002_0000, // StructureNotifyMask
+        |buf, seq, order| {
+            x11::encode_configure_notify_event(
+                buf,
+                seq,
+                order,
+                crate::resources::ROOT_WINDOW,
+                crate::resources::ROOT_WINDOW,
+                None,
+                geometry,
+                override_redirect,
+            );
+        },
+    );
 }
 
 /// Record an unsupported RANDR minor and report whether this is the first
@@ -3369,6 +3943,11 @@ fn handle_randr_request(
     let minor = header.data;
     match minor {
         x11randr::RR_QUERY_VERSION => {
+            if let Some(r) = x11randr::parse_query_version(body) {
+                state
+                    .randr_client_versions
+                    .insert(client_id, (r.major, r.minor));
+            }
             let (reply_major, reply_minor) = x11randr::parse_query_version(body)
                 .map(|r| {
                     let reply_major = x11randr::MAJOR_VERSION;
@@ -3562,8 +4141,8 @@ fn handle_randr_request(
                     width: crtc_data.width,
                     height: crtc_data.height,
                     mode: crtc_data.mode_id,
-                    rotation: 1,
-                    rotations: 1,
+                    rotation: state.randr.crtc_rotation(req.crtc),
+                    rotations: crate::randr::SUPPORTED_ROTATIONS,
                     outputs: &crtc_data.outputs,
                     possible: &crtc_data.possible_outputs,
                 },
@@ -3575,7 +4154,75 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_CRTC_TRANSFORM => {
+            // ProcRRSetCrtcTransform (rrcrtc.c:1755-1785) + RRCrtcTransformSet
+            // (rrcrtc.c:1091-1128), then the spec's D2 contract. Every yserver
+            // CRTC supports transforms, so Xorg's `!crtc->transforms`
+            // BadValue has no counterpart.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
             let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if !crtc_exists(state, req.crtc) {
+                return error(state, RANDR_BAD_CRTC, req.crtc);
+            }
+            if crtc_is_leased(state, req.crtc) {
+                return error(state, x11::error::BAD_ACCESS, 0);
+            }
+            if !crate::randr::CrtcTransform::invertible(&req.transform) {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            let Some(spec) = req.filter else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let filter = if spec.name.is_empty() {
+                if !spec.params.is_empty() {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                None
+            } else {
+                let Some(filter) = crate::randr::Filter::from_name(&spec.name) else {
+                    return error(state, x11::error::BAD_NAME, 0);
+                };
+                if !filter.params_valid(&spec.params) {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                Some(filter)
+            };
+            let Some(transform) =
+                crate::randr::CrtcTransform::new(req.transform, filter, spec.params)
+            else {
+                return error(state, x11::error::BAD_MATCH, 0);
+            };
+            // D2: pure scale, nearest/bilinear only; the rest is refused on
+            // purpose rather than rendered approximately.
+            if !(transform.is_identity() || transform.is_pure_scale())
+                || filter == Some(crate::randr::Filter::Convolution)
+            {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            if let Some(output) = state
+                .randr
+                .outputs
+                .iter_mut()
+                .find(|o| o.crtc_id == req.crtc)
+            {
+                output.pending_transform = transform;
+            }
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_GET_CRTC_TRANSFORM => {
+            // REQUEST_SIZE_MATCH(xRRGetCrtcTransformReq) before the lookup.
+            if body.len() != 4 {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3585,55 +4232,7 @@ fn handle_randr_request(
                     u16::from(minor),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
-            if !crtc_exists(state, req.crtc) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    RANDR_BAD_CRTC,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
             }
-            if !req.is_identity_transform() {
-                // Arbitrary projective transforms need an internal
-                // composition path; they cannot be represented as direct
-                // KMS CRTC state.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "rejecting non-identity transform with BadMatch",
-                );
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
-            }
-            if req.filter_name_len != 0 || req.filter_param_count != 0 {
-                // The filter has no observable effect for an identity
-                // transform, but yserver does not retain it for GetCrtcTransform.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "accepting identity transform but not retaining its filter",
-                );
-            }
-            return Ok(RequestOutcome::Handled);
-        }
-        x11randr::RR_GET_CRTC_TRANSFORM => {
             let crtc = request_xid(body);
             if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
@@ -3646,7 +4245,24 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let buf = x11randr::encode_get_crtc_transform_reply(byte_order, sequence);
+            let Some(output) = state.randr.outputs.iter().find(|o| o.crtc_id == crtc) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            // `transform_filter_encode`: no filter, no name and no params.
+            fn part(t: &crate::randr::CrtcTransform) -> x11randr::CrtcTransformReplyPart<'_> {
+                x11randr::CrtcTransformReplyPart {
+                    matrix: t.matrix,
+                    filter_name: t.filter.map_or(&[][..], |f| f.canonical_name().as_bytes()),
+                    params: if t.filter.is_some() { &t.params } else { &[] },
+                }
+            }
+            let buf = x11randr::encode_get_crtc_transform_reply(
+                byte_order,
+                sequence,
+                true,
+                part(&output.pending_transform),
+                part(&output.current_transform),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -3989,7 +4605,6 @@ fn handle_randr_request(
             // — only the unrelated `RRNoticePropertyChange` driver hook is
             // gated on `is_pending`. The wire notify fires regardless of
             // whether this write landed in `.current` or `.pending`.
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -4063,7 +4678,6 @@ fn handle_randr_request(
                 );
             }
             entries.remove(index);
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -4430,7 +5044,11 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
+            // RRMonitorTimestamp: lastConfigTime, which Set/DeleteMonitor
+            // leave alone ("XXX should take client monitor changes into
+            // account", rrmonitor.c).
             let t = state.randr.timestamp;
+            let get_active = body.get(4).is_some_and(|&b| b != 0);
             struct MonitorRow {
                 name_atom: u32,
                 primary: bool,
@@ -4443,20 +5061,25 @@ fn handle_randr_request(
                 height_mm: u32,
                 outputs: Vec<u32>,
             }
-            let monitors_list = active_monitors(state);
+            let monitors_list = active_monitors(state, get_active);
             let rows: Vec<MonitorRow> = monitors_list
-                .iter()
+                .into_iter()
                 .map(|monitor| MonitorRow {
-                    name_atom: state.atoms.intern(&monitor.name, false).0,
+                    name_atom: match monitor.name {
+                        crate::randr::MonitorName::Atom(atom) => atom,
+                        crate::randr::MonitorName::Output(name) => {
+                            state.atoms.intern(&name, false).0
+                        }
+                    },
                     primary: monitor.primary,
-                    automatic: true,
+                    automatic: monitor.automatic,
                     x: monitor.x,
                     y: monitor.y,
                     width: monitor.width,
                     height: monitor.height,
                     width_mm: monitor.width_mm,
                     height_mm: monitor.height_mm,
-                    outputs: vec![monitor.output_id],
+                    outputs: monitor.outputs,
                 })
                 .collect();
             let monitors: Vec<x11randr::MonitorInfo<'_>> = rows
@@ -4480,6 +5103,100 @@ fn handle_randr_request(
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_MONITOR => {
+            // ProcRRSetMonitor + RRMonitorAdd as shipped in Xorg 21.1
+            // (rrmonitor.c), measured by tools/vng-scenarios/xrandr-monitors.sh.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
+            let Some(req) = x11randr::parse_set_monitor_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if usize::from(req.noutput) != req.outputs.len() {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            }
+            if state.resources.window(ResourceId(req.window)).is_none() {
+                return error(state, x11::error::BAD_WINDOW, req.window);
+            }
+            // !ValidAtom: Xorg sets no errorValue here, so the wire carries
+            // the window id the successful lookup just left in it.
+            if req.name == 0 || state.atoms.name(AtomId(req.name)).is_none() {
+                return error(state, x11::error::BAD_ATOM, req.window);
+            }
+            let name = state.atoms.name(AtomId(req.name)).unwrap_or_default();
+            // 'name' must match neither an Output nor an existing Monitor.
+            // (xserver main replaces a same-named monitor instead, 146bb9b2c;
+            // 21.1 refuses it.)
+            if state.randr.outputs.iter().any(|output| output.name == name)
+                || state
+                    .randr_client_monitors
+                    .iter()
+                    .any(|monitor| monitor.name == req.name)
+            {
+                return error(state, x11::error::BAD_VALUE, req.name);
+            }
+            if req.primary {
+                for monitor in &mut state.randr_client_monitors {
+                    monitor.primary = false;
+                }
+            }
+            state
+                .randr_client_monitors
+                .push(crate::randr::ClientMonitor {
+                    name: req.name,
+                    primary: req.primary,
+                    outputs: req.outputs,
+                    x: req.x,
+                    y: req.y,
+                    width: req.width,
+                    height: req.height,
+                    width_mm: req.width_mm,
+                    height_mm: req.height_mm,
+                });
+            send_root_config_notify(state);
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_DELETE_MONITOR => {
+            // ProcRRDeleteMonitor + RRMonitorDelete (rrmonitor.c).
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
+            let Some((window, name)) = x11randr::parse_delete_monitor_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if state.resources.window(ResourceId(window)).is_none() {
+                return error(state, x11::error::BAD_WINDOW, window);
+            }
+            if name == 0 || state.atoms.name(AtomId(name)).is_none() {
+                return error(state, x11::error::BAD_ATOM, name);
+            }
+            let Some(index) = state
+                .randr_client_monitors
+                .iter()
+                .position(|monitor| monitor.name == name)
+            else {
+                return error(state, x11::error::BAD_VALUE, name);
+            };
+            state.randr_client_monitors.remove(index);
+            send_root_config_notify(state);
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
             let Some(req) = x11randr::parse_crtc_id_request(body) else {
@@ -4851,23 +5568,60 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let timestamp = state.randr.timestamp;
-            let config_timestamp = state.randr.config_timestamp;
-            let width = state.randr.screen_width;
-            let height = state.randr.screen_height;
-            let mwidth = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-            let mheight = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
-            let buf = x11randr::encode_get_screen_info_reply(
-                byte_order,
-                sequence,
-                ROOT_WINDOW.0,
-                timestamp,
-                config_timestamp,
-                width,
-                height,
-                mwidth,
-                mheight,
-            );
+            // ProcRRGetScreenInfo (rrscreen.c:760-898) over RR10GetData.
+            let has_rate = randr_client_knows_rates(state, client_id);
+            let data = state.randr.rr10_data();
+            let rates: Vec<Vec<u16>> = data.as_ref().map_or_else(Vec::new, |d| {
+                d.sizes
+                    .iter()
+                    .map(|s| s.rates.iter().map(|(r, _)| *r).collect())
+                    .collect()
+            });
+            let sizes: Vec<x11randr::ScreenInfoSize<'_>> = data
+                .as_ref()
+                .map(|d| {
+                    d.sizes
+                        .iter()
+                        .zip(&rates)
+                        .map(|(s, rates)| x11randr::ScreenInfoSize {
+                            width: s.width,
+                            height: s.height,
+                            mm_width: s.mm_width,
+                            mm_height: s.mm_height,
+                            rates,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let now = state.timestamp_now();
+            #[allow(clippy::cast_possible_truncation)]
+            let info = match &data {
+                Some(d) => x11randr::ScreenInfoReply {
+                    root: ROOT_WINDOW.0,
+                    timestamp: state.randr.timestamp,
+                    config_timestamp: state.randr.config_timestamp,
+                    // setOfRotations is a CARD8.
+                    rotations: crate::randr::SUPPORTED_ROTATIONS as u8,
+                    rotation: state.randr.first_output_rotation(),
+                    size_id: d.size_id,
+                    rate: d.rate,
+                    sizes: &sizes,
+                    has_rate,
+                },
+                // No output with a CRTC: Rotate_0, no sizes, current time.
+                None => x11randr::ScreenInfoReply {
+                    root: ROOT_WINDOW.0,
+                    timestamp: now,
+                    config_timestamp: now,
+                    rotations: crate::randr::RR_ROTATE_0 as u8,
+                    rotation: crate::randr::RR_ROTATE_0,
+                    size_id: 0,
+                    rate: 0,
+                    sizes: &[],
+                    has_rate,
+                },
+            };
+            let buf = x11randr::encode_get_screen_info_reply(byte_order, sequence, &info);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -4962,62 +5716,36 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let ts = state.timestamp_now();
+            // RRScreenSizeNotify (rrscreen.c) returns before any event when
+            // pixel size and mm both equal the last notified ones.
+            let unchanged = (
+                state.randr.screen_width,
+                state.randr.screen_height,
+                state.randr.width_mm,
+                state.randr.height_mm,
+            ) == (req.width, req.height, req.mm_width, req.mm_height);
             state
                 .randr
-                .set_logical_size(ts, req.width, req.height, req.mm_width, req.mm_height);
+                .set_logical_size(req.width, req.height, req.mm_width, req.mm_height);
             // Pure screen-size change: fire root ConfigureNotify +
             // ScreenChangeNotify ONLY — no per-CRTC/Output change
             // (CRTC positions are unchanged). Pass an empty changed
             // list so only ScreenChangeNotify + root ConfigureNotify fire.
-            super::run::apply_screen_size_side_effects(state, backend, req.width, req.height, &[]);
+            if !unchanged {
+                super::run::apply_screen_size_side_effects(
+                    state,
+                    backend,
+                    req.width,
+                    req.height,
+                    &[],
+                );
+            }
+            backend.randr_layout_changed(state);
             // RRSetScreenSize has NO reply (it is a void request).
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_SET_SCREEN_CONFIG => {
-            // Xorg looks this up as a DRAWABLE, not a window
-            // (`dixLookupDrawable`, rrscreen.c), so a pixmap is a legal
-            // target — it just resolves to its screen. An unknown xid comes
-            // back as `BadDrawable`, because dixLookupDrawable remaps
-            // dix's `BadValue` (dix/dixutils.c). Measured on real Xorg with
-            // `tools/randr-probe`: bogus xid -> code=9 (BadDrawable), and a
-            // real pixmap -> Success.
-            let drawable = request_xid(body);
-            let id = ResourceId(drawable);
-            if state.resources.window(id).is_none() && state.resources.pixmap(id).is_none() {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_DRAWABLE,
-                    drawable,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
-            }
-            // Legacy RANDR 1.0 form: SizeID + Rotation. yserver has a
-            // single screen size. mate's restore path passes the size
-            // we advertised, so accept across the board (no-op accept).
-            //
-            // SetScreenConfig reply (32 bytes): status (in data byte) +
-            // length=0 + new_timestamp(4) + config_timestamp(4) +
-            // root(4) + subpixel_order(2) + pad(10).
-            let ts = state.timestamp_now();
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0u8, 0);
-            x11::write_u32(byte_order, &mut reply, ts);
-            x11::write_u32(byte_order, &mut reply, state.randr.timestamp);
-            x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
-            x11::write_u16(byte_order, &mut reply, 0); // SubPixelUnknown
-            reply.extend_from_slice(&[0u8; 10]);
-            debug_assert_eq!(reply.len(), 32);
-            debug!(
-                "client {} #{} RANDR::SetScreenConfig -> status=0 timestamp={} (no-op accept)",
-                client_id.0, sequence.0, ts,
-            );
-            let Some(client) = state.clients.get_mut(&client_id.0) else {
-                return Ok(RequestOutcome::Handled);
-            };
-            return Ok(write_to_client(client, client_id, &reply));
+            return set_screen_config(state, backend, client_id, sequence, byte_order, body);
         }
         x11randr::RR_SET_CRTC_CONFIG => {
             // Body layout (post-header):
@@ -5074,8 +5802,8 @@ fn handle_randr_request(
                 }
                 Ok(r) => r,
             };
-            // (2)+(3) rotation + bounds only when enabling.
-            if let Some(ref m) = resolved {
+            // (2) rotation only when enabling.
+            if resolved.is_some() {
                 if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
                     return emit_x11_error_with_minor(
                         state,
@@ -5087,8 +5815,8 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if rotation != 1 {
-                    // RR_Rotate_0 only — our CRTC is identity-only.
+                if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+                    // `(~crtc->rotations) & rotation` (rrcrtc.c:1403).
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
@@ -5099,17 +5827,9 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if let Err((code, error_value)) = state.randr.screen_encompasses(m, x, y) {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        code,
-                        error_value,
-                        u16::from(header.data),
-                        RANDR_MAJOR_OPCODE,
-                    );
-                }
+                // No screen-bounds check: Xorg skips it for a CRTC with
+                // transform support (rrcrtc.c:1436), and every yserver CRTC
+                // has it; a screen may crop a CRTC.
             }
 
             // Resolve connector name from crtc_id (validated above →
@@ -5128,6 +5848,37 @@ fn handle_randr_request(
             };
             let output_id = output_row.output_id;
             let connector = output_row.name.clone();
+            // A disable keeps the current transform (xf86RandR12CrtcSet
+            // only installs one with a mode).
+            let apply_transform = (resolved.is_some()
+                && !output_row
+                    .pending_transform
+                    .equivalent(&output_row.current_transform))
+            .then(|| Box::new(output_row.pending_transform.applied()));
+            let apply_rotation =
+                (resolved.is_some() && rotation != output_row.rotation).then_some(rotation);
+            // The combined matrix drives the footprint and the scale pass; a
+            // pixman overflow (Xorg's rescaled projective fallback) is not
+            // rendered.
+            if let Some(m) = resolved
+                && crate::randr::crtc_matrix(
+                    rotation,
+                    m.width,
+                    m.height,
+                    &output_row.pending_transform.applied(),
+                )
+                .is_none()
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    u32::from(rotation),
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -5145,41 +5896,20 @@ fn handle_randr_request(
                 set_time,
                 output_bbox_before,
                 byte_order,
+                apply_transform,
+                apply_rotation,
+                reply: CrtcConfigReply::CrtcConfig,
             };
-            match backend.begin_crtc_config(
-                output_id,
+            return start_crtc_config(
+                state,
+                backend,
+                client_id,
+                sequence,
                 &connector,
                 mode_spec,
-                i32::from(x),
-                i32::from(y),
-            ) {
-                Ok(CrtcConfigApply::Applied(changed)) => {
-                    return complete_crtc_config(
-                        state,
-                        backend,
-                        client_id,
-                        sequence,
-                        completion,
-                        Ok(changed),
-                    );
-                }
-                Ok(CrtcConfigApply::Pending(token)) => {
-                    return Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
-                        token,
-                        completion,
-                    }));
-                }
-                Err(e) => {
-                    return complete_crtc_config(
-                        state,
-                        backend,
-                        client_id,
-                        sequence,
-                        completion,
-                        Err(e),
-                    );
-                }
-            }
+                (i32::from(x), i32::from(y)),
+                completion,
+            );
         }
         16 | 45 => {
             // TODO(unimplemented): RRCreateMode (16) / RRCreateLease (45)
@@ -5389,8 +6119,6 @@ fn handle_randr_request(
                 17 => "DestroyMode",
                 18 => "AddOutputMode",
                 19 => "DeleteOutputMode",
-                43 => "SetMonitor",
-                44 => "DeleteMonitor",
                 _ => "known request",
             };
             warn_randr_unsupported_once(
@@ -5406,6 +6134,241 @@ fn handle_randr_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// `ProcRRSetScreenConfig` (rrscreen.c:903-1130): the RANDR 1.0 size,
+/// rotation and rate, applied to `RRFirstOutput`'s CRTC at 0,0 through the
+/// SetCrtcConfig path.
+fn set_screen_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::randr as x11randr;
+    const STATUS_INVALID_CONFIG_TIME: u8 = 1;
+    const STATUS_INVALID_TIME: u8 = 2;
+    const STATUS_FAILED: u8 = 3;
+    let error = |state: &mut ServerState, code: u8, value: u32| {
+        emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(x11randr::RR_SET_SCREEN_CONFIG),
+            128,
+        )
+    };
+    let status_reply = |state: &mut ServerState, status: u8| {
+        let reply = x11randr_encode_set_screen_config(state, byte_order, sequence, status);
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        Ok(write_to_client(client, client_id, &reply))
+    };
+    // REQUEST_SIZE_MATCH: the rate field exists only for a 1.1+ client.
+    let has_rate = randr_client_knows_rates(state, client_id);
+    if body.len() != if has_rate { 20 } else { 16 } {
+        return error(state, x11::error::BAD_LENGTH, 0);
+    }
+    // A DRAWABLE, not a window (`dixLookupDrawable`): a pixmap resolves to
+    // its screen, and an unknown xid is BadDrawable (measured with
+    // `tools/randr-probe`).
+    let drawable = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let id = ResourceId(drawable);
+    if state.resources.window(id).is_none() && state.resources.pixmap(id).is_none() {
+        return error(state, x11::error::BAD_DRAWABLE, drawable);
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+    let (timestamp, config_timestamp) = (u32_at(4), u32_at(8));
+    let (size_id, rotation) = (u16_at(12), u16_at(14));
+    let rate = if has_rate { u16_at(16) } else { 0 };
+    // ClientTimeToServerTime: CurrentTime is now.
+    let time = if timestamp == 0 {
+        state.timestamp_now()
+    } else {
+        timestamp
+    };
+    let Some(data) = state.randr.rr10_data() else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    if config_timestamp != state.randr.config_timestamp {
+        return status_reply(state, STATUS_INVALID_CONFIG_TIME);
+    }
+    let Some(size) = data.sizes.get(usize::from(size_id)) else {
+        return error(state, x11::error::BAD_VALUE, u32::from(size_id));
+    };
+    if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
+        return error(state, x11::error::BAD_VALUE, u32::from(rotation));
+    }
+    if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+        return error(state, x11::error::BAD_MATCH, u32::from(rotation));
+    }
+    let mode_id = if rate == 0 {
+        size.rates.first().map(|&(_, mode)| mode)
+    } else {
+        let Some(&(_, mode)) = size.rates.iter().find(|&&(r, _)| r == rate) else {
+            return error(state, x11::error::BAD_VALUE, u32::from(rate));
+        };
+        Some(mode)
+    };
+    let Some(mode) = mode_id.and_then(|id| {
+        state
+            .randr
+            .mode_table
+            .iter()
+            .find(|m| m.mode_id == id)
+            .copied()
+    }) else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    if time < state.randr.timestamp {
+        return status_reply(state, STATUS_INVALID_TIME);
+    }
+    let (min_w, min_h, max_w, max_h) = state.randr.screen_size_range();
+    if !(min_w..=max_w).contains(&mode.width) {
+        return error(state, x11::error::BAD_VALUE, u32::from(mode.width));
+    }
+    if !(min_h..=max_h).contains(&mode.height) {
+        return error(state, x11::error::BAD_VALUE, u32::from(mode.height));
+    }
+    let (width, height) = if crate::randr::rotation_swaps_axes(rotation) {
+        (mode.height, mode.width)
+    } else {
+        (mode.width, mode.height)
+    };
+    let Some(target) = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.output_id == data.output_id)
+        .cloned()
+    else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    if (width, height) != (state.randr.screen_width, state.randr.screen_height) {
+        // Every other CRTC goes off and the screen takes the new size, mm
+        // unchanged. The first output's own CRTC is reconfigured in place
+        // below rather than lit off and on.
+        let others: Vec<(u32, String)> = state
+            .randr
+            .enabled_outputs()
+            .filter(|o| o.output_id != target.output_id)
+            .map(|o| (o.output_id, o.name.clone()))
+            .collect();
+        let mut disabled = Vec::new();
+        for (output_id, name) in others {
+            match backend.begin_crtc_config(output_id, &name, None, 0, 0) {
+                Ok(CrtcConfigApply::Applied(_)) => disabled.push(output_id),
+                Ok(CrtcConfigApply::Pending(_)) | Err(_) => {
+                    return status_reply(state, STATUS_FAILED);
+                }
+            }
+        }
+        if !disabled.is_empty() {
+            let changed: Vec<(u32, u32, u32)> = state
+                .randr
+                .outputs
+                .iter()
+                .filter(|o| disabled.contains(&o.output_id))
+                .map(|o| (o.output_id, o.crtc_id, 0))
+                .collect();
+            backend.refresh_randr_state_set_time(state, time);
+            backend.randr_layout_changed(state);
+            super::run::emit_randr_change_notifications(state, &changed);
+        }
+        if let Err(e) = backend.set_logical_screen_size(width, height) {
+            log::warn!("RRSetScreenConfig: backend resize failed: {e}");
+            return status_reply(state, STATUS_FAILED);
+        }
+        let (mm_w, mm_h) = (state.randr.width_mm, state.randr.height_mm);
+        state.randr.set_logical_size(width, height, mm_w, mm_h);
+        super::run::apply_screen_size_side_effects(state, backend, width, height, &[]);
+        backend.randr_layout_changed(state);
+    }
+    // RRCrtcSet(crtc, mode, 0, 0, rotation, 1, &output) with the pending
+    // client transform, as SetCrtcConfig.
+    let Some(target) = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.output_id == data.output_id)
+        .cloned()
+    else {
+        return status_reply(state, STATUS_FAILED);
+    };
+    let pending = target.pending_transform.applied();
+    if crate::randr::crtc_matrix(rotation, mode.width, mode.height, &pending).is_none() {
+        return status_reply(state, STATUS_FAILED);
+    }
+    let completion = CrtcConfigCompletion {
+        output_id: target.output_id,
+        set_time: time,
+        output_bbox_before: super::run::enabled_output_bbox(state),
+        byte_order,
+        apply_transform: (!target
+            .pending_transform
+            .equivalent(&target.current_transform))
+        .then(|| Box::new(pending)),
+        apply_rotation: (rotation != target.rotation).then_some(rotation),
+        reply: CrtcConfigReply::ScreenConfig,
+    };
+    let mode_spec = ModeSpec {
+        width: mode.width,
+        height: mode.height,
+        vrefresh: mode.vrefresh,
+    };
+    let connector = target.name.clone();
+    start_crtc_config(
+        state,
+        backend,
+        client_id,
+        sequence,
+        &connector,
+        Some(mode_spec),
+        (0, 0),
+        completion,
+    )
+}
+
+/// Hand one CRTC configuration to the backend and complete it now, or park
+/// it until an asynchronous qualification finishes.
+#[allow(clippy::too_many_arguments)]
+fn start_crtc_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    connector: &str,
+    mode_spec: Option<ModeSpec>,
+    (x, y): (i32, i32),
+    completion: CrtcConfigCompletion,
+) -> io::Result<RequestOutcome> {
+    match backend.begin_crtc_config(completion.output_id, connector, mode_spec, x, y) {
+        Ok(CrtcConfigApply::Applied(changed)) => {
+            complete_crtc_config(state, backend, client_id, sequence, completion, Ok(changed))
+        }
+        Ok(CrtcConfigApply::Pending(token)) => {
+            Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
+                token,
+                completion,
+            }))
+        }
+        Err(e) => complete_crtc_config(state, backend, client_id, sequence, completion, Err(e)),
+    }
+}
+
+/// `RRClientKnowsRates` (rrdispatch.c:27): the client's QueryVersion was
+/// 1.1 or newer.
+fn randr_client_knows_rates(state: &ServerState, client_id: ClientId) -> bool {
+    state
+        .randr_client_versions
+        .get(&client_id)
+        .is_some_and(|&version| version >= (1, 1))
+}
+
 /// Complete the protocol-visible half of `RRSetCrtcConfig` after either a
 /// synchronous apply or an asynchronous backend result. Keeping this as one
 /// continuation prevents the async path from redispatching validation or
@@ -5419,11 +6382,36 @@ pub(crate) fn complete_crtc_config(
     result: io::Result<bool>,
 ) -> io::Result<RequestOutcome> {
     let status = match result {
-        Ok(true) => {
+        // A new transform is a change even with identical mode/x/y.
+        Ok(changed)
+            if changed
+                || completion.apply_transform.is_some()
+                || completion.apply_rotation.is_some() =>
+        {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
             backend.refresh_randr_state_set_time(state, completion.set_time);
+            if let Some(transform) = completion.apply_transform
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                // RRCrtcNotify: RRTransformCopy of pending into current.
+                output.current_transform = *transform;
+            }
+            if let Some(rotation) = completion.apply_rotation
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                output.rotation = rotation;
+            }
+            backend.randr_layout_changed(state);
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs
@@ -5439,7 +6427,7 @@ pub(crate) fn complete_crtc_config(
             );
             0
         }
-        Ok(false) => {
+        Ok(_) => {
             // A no-op succeeds without a rebuild or change notification.
             0
         }
@@ -5449,6 +6437,17 @@ pub(crate) fn complete_crtc_config(
             3
         }
     };
+    if completion.reply == CrtcConfigReply::ScreenConfig {
+        if status == 0 {
+            state.randr.timestamp = completion.set_time;
+        }
+        let reply =
+            x11randr_encode_set_screen_config(state, completion.byte_order, sequence, status);
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        return Ok(write_to_client(client, client_id, &reply));
+    }
     let timestamp = state.randr.timestamp;
     reply_set_crtc_config(
         state,
@@ -5457,6 +6456,24 @@ pub(crate) fn complete_crtc_config(
         completion.byte_order,
         status,
         timestamp,
+    )
+}
+
+/// The `SetScreenConfig` reply for `status`: `lastSetTime`,
+/// `lastConfigTime` and the root, as they stand.
+fn x11randr_encode_set_screen_config(
+    state: &ServerState,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+) -> Vec<u8> {
+    yserver_protocol::x11::randr::encode_set_screen_config_reply(
+        byte_order,
+        sequence,
+        status,
+        state.randr.timestamp,
+        state.randr.config_timestamp,
+        ROOT_WINDOW.0,
     )
 }
 
@@ -5487,6 +6504,106 @@ fn reply_set_crtc_config(
     Ok(write_to_client(client, client_id, &reply))
 }
 
+/// A SYNC protocol error: `code` is either a core error or
+/// `SYNC_FIRST_ERROR + x11sync::BAD_*`.
+fn sync_error(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    code: u8,
+    value: u32,
+) -> io::Result<RequestOutcome> {
+    emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        code,
+        value,
+        u16::from(header.data),
+        header.opcode,
+    )
+}
+
+/// Xorg's lookup of a client-writable counter for SetCounter /
+/// ChangeCounter / DestroyCounter: an unknown XID is BadCounter, a system
+/// counter BadAccess (both naming the counter; captured on Xvfb).
+fn sync_writable_counter(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    counter: u32,
+) -> Result<i64, io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if crate::core_loop::sync_await::is_system_counter(counter) {
+        return Err(sync_error(
+            state,
+            client_id,
+            sequence,
+            header,
+            x11::error::BAD_ACCESS,
+            counter,
+        ));
+    }
+    match state.sync_counters.get(&counter) {
+        Some(c) => Ok(c.value),
+        None => Err(sync_error(
+            state,
+            client_id,
+            sequence,
+            header,
+            crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+            counter,
+        )),
+    }
+}
+
+/// Xorg `RTFence` lookup: an unknown fence is BadFence naming it.
+fn sync_known_fence(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    fence: u32,
+) -> Result<(), io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if state.sync_fences.contains_key(&fence) {
+        return Ok(());
+    }
+    Err(sync_error(
+        state,
+        client_id,
+        sequence,
+        header,
+        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_FENCE,
+        fence,
+    ))
+}
+
+/// Xorg's `RTAlarm` lookup: an alarm that does not exist (never created,
+/// None, or destroyed) is BadAlarm naming it.
+fn sync_known_alarm(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    alarm: u32,
+) -> Result<(), io::Result<RequestOutcome>> {
+    use yserver_protocol::x11::sync as x11sync;
+    if state.sync_alarms.contains_key(&alarm) {
+        return Ok(());
+    }
+    Err(sync_error(
+        state,
+        client_id,
+        sequence,
+        header,
+        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_ALARM,
+        alarm,
+    ))
+}
+
 fn handle_sync_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -5503,19 +6620,17 @@ fn handle_sync_request(
     let minor = header.data;
     match minor {
         x11sync::INITIALIZE => {
-            let (client_major, client_minor) =
-                x11sync::parse_initialize(body).unwrap_or((x11sync::MAJOR_VERSION, 0));
-            let major = x11sync::MAJOR_VERSION.min(client_major);
-            let minor_ver = if major < x11sync::MAJOR_VERSION {
-                client_minor
-            } else {
-                x11sync::MINOR_VERSION
-            };
-            let reply = x11sync::encode_initialize_reply(byte_order, sequence, major, minor_ver);
+            // Xorg `ProcSyncInitialize` always answers its own version
+            // (Xvfb: client 3.1 / 3.0 / 2.0 / 4.0 all get 3.1).
+            let reply = x11sync::encode_initialize_reply(
+                byte_order,
+                sequence,
+                x11sync::MAJOR_VERSION,
+                x11sync::MINOR_VERSION,
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::LIST_SYSTEM_COUNTERS => {
@@ -5539,46 +6654,55 @@ fn handle_sync_request(
         }
         x11sync::SET_COUNTER => {
             if let Some((counter, value)) = x11sync::parse_counter_value(body) {
-                let transition = state.sync_counters.get_mut(&counter).map(|c| {
-                    let old = c.value;
+                let old = match sync_writable_counter(state, client_id, sequence, header, counter) {
+                    Ok(old) => old,
+                    Err(outcome) => return outcome,
+                };
+                if let Some(c) = state.sync_counters.get_mut(&counter) {
                     c.value = value;
-                    (old, value)
-                });
-                if let Some((old, new)) = transition {
-                    evaluate_alarms_for_counter(state, counter, old, new);
                 }
+                crate::core_loop::sync_await::counter_changed(state, counter, old, value);
             }
         }
         x11sync::CHANGE_COUNTER => {
             if let Some((counter, delta)) = x11sync::parse_counter_value(body) {
-                let transition = state.sync_counters.get_mut(&counter).map(|c| {
-                    let old = c.value;
-                    c.value = old.saturating_add(delta);
-                    (old, c.value)
-                });
-                if let Some((old, new)) = transition {
-                    evaluate_alarms_for_counter(state, counter, old, new);
+                let old = match sync_writable_counter(state, client_id, sequence, header, counter) {
+                    Ok(old) => old,
+                    Err(outcome) => return outcome,
+                };
+                // Xorg: an INT64 overflow is BadValue naming the high half
+                // of the delta (Xvfb: value 0x7fffffff for i64::MAX).
+                let Some(new) = old.checked_add(delta) else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let value_hi = (delta >> 32) as u32;
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        value_hi,
+                    );
+                };
+                if let Some(c) = state.sync_counters.get_mut(&counter) {
+                    c.value = new;
                 }
+                crate::core_loop::sync_await::counter_changed(state, counter, old, new);
             }
         }
         x11sync::QUERY_COUNTER => {
             let counter = x11sync::parse_resource(body).unwrap_or(0);
-            let value = match counter {
-                x11sync::SERVERTIME_COUNTER => i64::from(state.timestamp_now()),
-                x11sync::IDLETIME_COUNTER
-                | x11sync::IDLETIME_DEVICE_VCP
-                | x11sync::IDLETIME_DEVICE_VCK => {
-                    // X11 timestamps are 32-bit ms; saturate at u32::MAX
-                    // (~49 days idle) per X11 spec. After saturation the
-                    // value fits in i64 without sign-loss or truncation.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let elapsed_ms = std::time::Instant::now()
-                        .duration_since(state.idletime_baseline(counter))
-                        .as_millis()
-                        .min(u128::from(u32::MAX)) as i64;
-                    elapsed_ms
-                }
-                _ => state.sync_counters.get(&counter).map_or(0, |c| c.value),
+            // IDLETIME saturates at u32::MAX ms (~49 days) inside
+            // `idletime_current_idle`. An unknown counter is BadCounter.
+            let Some(value) = crate::core_loop::sync_await::counter_value(state, counter) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                    counter,
+                );
             };
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -5589,101 +6713,259 @@ fn handle_sync_request(
         }
         x11sync::DESTROY_COUNTER => {
             if let Some(counter) = x11sync::parse_resource(body) {
+                let last = match sync_writable_counter(state, client_id, sequence, header, counter)
+                {
+                    Ok(last) => last,
+                    Err(outcome) => return outcome,
+                };
                 state.sync_counters.remove(&counter);
+                crate::core_loop::sync_await::counter_destroyed(state, counter, last);
             }
         }
         x11sync::AWAIT => {
-            // Non-blocking stub.
+            // Xorg `ProcSyncAwait`: validate every wait condition, then
+            // suspend the client until one of the triggers fires. Its later
+            // requests stay queued behind this one (see `sync_await`).
+            let Some(conditions) = x11sync::parse_await(byte_order, body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if conditions.is_empty() {
+                return sync_error(state, client_id, sequence, header, x11::error::BAD_VALUE, 0);
+            }
+            let mut waits = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                // `SyncInitTrigger` order: counter, value type, value, test
+                // type. Captured on Xvfb: None / unknown → BadCounter,
+                // bad value type / test type → BadValue naming it, relative
+                // overflow → BadValue naming the high half of the wait.
+                let current = if c.counter == 0 {
+                    None
+                } else {
+                    crate::core_loop::sync_await::counter_value(state, c.counter)
+                };
+                let Some(current) = current else {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                        c.counter,
+                    );
+                };
+                let test_value = match c.value_type {
+                    x11sync::VALUE_TYPE_ABSOLUTE => c.wait_value,
+                    x11sync::VALUE_TYPE_RELATIVE => {
+                        let Some(v) = current.checked_add(c.wait_value) else {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let value_hi = (c.wait_value >> 32) as u32;
+                            return sync_error(
+                                state,
+                                client_id,
+                                sequence,
+                                header,
+                                x11::error::BAD_VALUE,
+                                value_hi,
+                            );
+                        };
+                        v
+                    }
+                    other => {
+                        return sync_error(
+                            state,
+                            client_id,
+                            sequence,
+                            header,
+                            x11::error::BAD_VALUE,
+                            other,
+                        );
+                    }
+                };
+                if c.test_type > x11sync::TEST_NEGATIVE_COMPARISON {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_VALUE,
+                        c.test_type,
+                    );
+                }
+                waits.push(crate::server::SyncAwaitCondition::Counter {
+                    counter: c.counter,
+                    test_type: c.test_type,
+                    test_value,
+                    event_threshold: c.event_threshold,
+                });
+            }
+            debug!(
+                "client {} #{} SYNC::Await {} condition(s)",
+                client_id.0,
+                sequence.0,
+                waits.len()
+            );
+            crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::CREATE_ALARM => {
-            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body) {
-                let mut a = crate::server::SyncAlarm {
-                    owner: client_id,
-                    state: x11sync::ALARM_STATE_ACTIVE,
-                    events: true,
-                    ..crate::server::SyncAlarm::default()
-                };
-                apply_alarm_attributes(state, &mut a, &attrs);
-                let counter = a.counter;
-                let class = state
-                    .client_wm_class
-                    .get(&client_id.0)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                log::trace!(
-                    "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
-                     counter={cname}(0x{counter:x}) test={test} \
-                     wait_value={wait} delta={delta} events={events}",
-                    client_id.0,
-                    cname = sync_counter_name(counter),
-                    test = sync_test_type_name(u32::from(a.test_type)),
-                    wait = a.wait_value,
-                    delta = a.delta,
-                    events = a.events,
+            // Xorg `ProcSyncCreateAlarm`: the value list must match the mask.
+            let Some((alarm, mask)) = x11sync::parse_alarm_with_mask(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
                 );
-                state.sync_alarms.insert(alarm, a);
-                // Per the X Synchronization Extension spec the trigger is
-                // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately. For IDLETIME-family
-                // counters the value is derived from last_activity rather
-                // than `sync_counters`.
-                let now_value = if matches!(
-                    counter,
-                    x11sync::IDLETIME_COUNTER
-                        | x11sync::IDLETIME_DEVICE_VCP
-                        | x11sync::IDLETIME_DEVICE_VCK
-                ) {
-                    idletime_current_idle(state, counter)
-                } else {
-                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
-                };
-                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+            };
+            if body.len() != x11sync::alarm_request_len(mask) {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
             }
+            // Xorg's defaults (`ProcSyncCreateAlarm` + `SyncInitTrigger` on
+            // None): no counter, Absolute 0, PositiveComparison, delta 1,
+            // the owner selected for events. An error discards the alarm.
+            let mut a = crate::server::SyncAlarm {
+                owner: client_id,
+                state: x11sync::ALARM_STATE_INACTIVE,
+                events: true,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON,
+                check_type: x11sync::TEST_POSITIVE_COMPARISON,
+                delta: 1,
+                ..crate::server::SyncAlarm::default()
+            };
+            let values = alarm_value_words(body);
+            if let Err((code, value)) =
+                change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values)
+            {
+                return sync_error(state, client_id, sequence, header, code, value);
+            }
+            let counter = a.counter;
+            let class = state
+                .client_wm_class
+                .get(&client_id.0)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            log::trace!(
+                "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
+                 counter={cname}(0x{counter:x}) test={test} \
+                 wait_value={wait} delta={delta} events={events}",
+                client_id.0,
+                cname = sync_counter_name(counter),
+                test = sync_test_type_name(a.test_type),
+                wait = a.wait_value,
+                delta = a.delta,
+                events = a.events,
+            );
+            if counter == 0 {
+                // "NULL counter will not trigger in CreateAlarm and sets
+                // alarm state to Inactive" (Xorg).
+                a.state = x11sync::ALARM_STATE_INACTIVE;
+                state.sync_alarms.insert(alarm, a);
+                return Ok(RequestOutcome::Handled);
+            }
+            state.sync_alarms.insert(alarm, a);
+            // The trigger is tested at creation: a comparison whose
+            // condition already holds fires at once. System counters
+            // (SERVERTIME, IDLETIME) read the clock.
+            check_new_alarm_trigger(state, alarm, counter);
         }
         x11sync::CHANGE_ALARM => {
-            if let Some((alarm, attrs)) = x11sync::parse_alarm_attributes(body)
-                && let Some(mut a) = state.sync_alarms.get(&alarm).cloned()
-            {
-                apply_alarm_attributes(state, &mut a, &attrs);
-                a.state = x11sync::ALARM_STATE_ACTIVE;
-                let counter = a.counter;
-                let class = state
-                    .client_wm_class
-                    .get(&client_id.0)
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>");
-                log::trace!(
-                    "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
-                     counter={cname}(0x{counter:x}) test={test} \
-                     wait_value={wait} delta={delta} events={events}",
-                    client_id.0,
-                    cname = sync_counter_name(counter),
-                    test = sync_test_type_name(u32::from(a.test_type)),
-                    wait = a.wait_value,
-                    delta = a.delta,
-                    events = a.events,
+            // Xorg `ProcSyncChangeAlarm`: minimum size, then the alarm
+            // lookup (BadAlarm), then the value list against the mask
+            // (BadLength naming the alarm, captured on Xvfb).
+            let Some((alarm, mask)) = x11sync::parse_alarm_with_mask(body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
                 );
+            };
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
+                return outcome;
+            }
+            if body.len() != x11sync::alarm_request_len(mask) {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    alarm,
+                );
+            }
+            // Xorg `SyncChangeAlarmAttributes`: any client may change an
+            // alarm; `events` selects AlarmNotify for the requesting client
+            // (the owner's own flag, or the event-client list). A failure
+            // part-way keeps what Xorg keeps (see change_alarm_attributes),
+            // so the copy is written back either way.
+            let Some(mut a) = state.sync_alarms.get(&alarm).cloned() else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let values = alarm_value_words(body);
+            let outcome = change_alarm_attributes(state, alarm, &mut a, client_id, mask, &values);
+            if let Err((code, value)) = outcome {
                 state.sync_alarms.insert(alarm, a);
-                // Per the X Synchronization Extension spec the trigger is
-                // tested at creation: a comparison alarm whose condition
-                // already holds fires immediately. For IDLETIME-family
-                // counters the value is derived from last_activity rather
-                // than `sync_counters`.
-                let now_value = if matches!(
-                    counter,
-                    x11sync::IDLETIME_COUNTER
-                        | x11sync::IDLETIME_DEVICE_VCP
-                        | x11sync::IDLETIME_DEVICE_VCK
-                ) {
-                    idletime_current_idle(state, counter)
-                } else {
-                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
-                };
-                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+                return sync_error(state, client_id, sequence, header, code, value);
+            }
+            let counter = a.counter;
+            let class = state
+                .client_wm_class
+                .get(&client_id.0)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            log::trace!(
+                "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
+                 counter={cname}(0x{counter:x}) test={test} \
+                 wait_value={wait} delta={delta} events={events}",
+                client_id.0,
+                cname = sync_counter_name(counter),
+                test = sync_test_type_name(a.test_type),
+                wait = a.wait_value,
+                delta = a.delta,
+                events = a.events,
+            );
+            state.sync_alarms.insert(alarm, a);
+            if counter == 0 {
+                // "NULL counter WILL trigger in ChangeAlarm" (Xorg): the
+                // alarm goes Inactive with an AlarmNotify.
+                alarm_trigger_fired(state, alarm, 0);
+            } else {
+                check_new_alarm_trigger(state, alarm, counter);
             }
         }
         x11sync::QUERY_ALARM => {
+            // Xorg `ProcSyncQueryAlarm`: exact size, then the lookup.
+            if body.len() != 4 {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            }
             let alarm_id = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm_id) {
+                return outcome;
+            }
             let alarm = state
                 .sync_alarms
                 .get(&alarm_id)
@@ -5694,6 +6976,7 @@ fn handle_sync_request(
                 sequence,
                 alarm.counter,
                 alarm.wait_value,
+                alarm.test_type,
                 alarm.delta,
                 alarm.events,
                 alarm.state,
@@ -5705,9 +6988,24 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::DESTROY_ALARM => {
-            if let Some(alarm) = x11sync::parse_resource(body) {
-                state.sync_alarms.remove(&alarm);
+            // Xorg `ProcSyncDestroyAlarm`: exact size, then the lookup.
+            if body.len() != 4 {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
             }
+            let alarm = x11sync::parse_resource(body).unwrap_or(0);
+            if let Err(outcome) = sync_known_alarm(state, client_id, sequence, header, alarm) {
+                return outcome;
+            }
+            // Xorg `FreeAlarm`: any client may destroy it; a Destroyed
+            // AlarmNotify goes to the owner and the selecting clients.
+            crate::core_loop::sync_await::destroy_alarm(state, alarm);
         }
         x11sync::CREATE_FENCE => {
             if let Some(req) = x11sync::parse_create_fence(body) {
@@ -5726,7 +7024,12 @@ fn handle_sync_request(
         }
         x11sync::DESTROY_FENCE => {
             if let Some(fence) = x11sync::parse_resource(body) {
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
+                }
+                crate::core_loop::sync_await::fence_destroyed(state, fence);
                 state.sync_fences.remove(&fence);
+                backend.dri3_destroy_fence(fence);
                 debug!(
                     "client {} #{} SYNC::DestroyFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
@@ -5735,15 +7038,15 @@ fn handle_sync_request(
         }
         x11sync::TRIGGER_FENCE => {
             if let Some(fence) = x11sync::parse_resource(body) {
-                if let Some(f) = state.sync_fences.get_mut(&fence) {
-                    f.triggered = true;
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
                 }
                 // For DRI3-imported xshmfence-backed fences, the
-                // memory-only `f.triggered=true` above is invisible to
-                // Mesa's local `xshmfence_await`. Forward the trigger
-                // to the backend so it writes the shared 4-byte
-                // counter + futex-wakes any local waiter — Mesa's
-                // `loader_dri3_copy_drawable` blocks on exactly that.
+                // server-side triggered bit is invisible to Mesa's local
+                // `xshmfence_await`. Forward the trigger to the backend so
+                // it writes the shared 4-byte counter + futex-wakes any
+                // local waiter — Mesa's `loader_dri3_copy_drawable` blocks
+                // on exactly that.
                 if let Err(e) = backend.dri3_trigger_fence(fence) {
                     log::warn!("SYNC::TriggerFence 0x{fence:x}: backend trigger failed: {e}");
                 }
@@ -5751,38 +7054,43 @@ fn handle_sync_request(
                     "client {} #{} SYNC::TriggerFence fence=0x{:x}",
                     client_id.0, sequence.0, fence
                 );
-                // Wake any pending Await whose list contains this
-                // fence. We don't actually unblock the client's
-                // request stream (see SyncPendingAwait doc-comment)
-                // but we do log the satisfaction so test harnesses
-                // can assert sequencing.
-                let mut satisfied: Vec<crate::server::SyncPendingAwait> = Vec::new();
-                state.sync_pending_awaits.retain(|a| {
-                    if a.fences.contains(&fence) {
-                        satisfied.push(a.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                for a in &satisfied {
-                    debug!(
-                        "SYNC::AwaitSatisfied client={} seq={} on fence=0x{:x}",
-                        a.client.0, a.sequence.0, fence
-                    );
-                }
+                // Xorg `miSyncTriggerFence`: wakes every AwaitFence on it.
+                crate::core_loop::sync_await::fence_triggered(state, fence);
             }
         }
         x11sync::RESET_FENCE => {
-            if let Some(fence) = x11sync::parse_resource(body)
-                && let Some(f) = state.sync_fences.get_mut(&fence)
-            {
-                f.triggered = false;
+            if let Some(fence) = x11sync::parse_resource(body) {
+                if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                    return outcome;
+                }
+                // Xorg `ProcSyncResetFence`: only a triggered fence can be
+                // reset (Xvfb: BadMatch naming the fence); a shared-memory
+                // fence is tested, and reset, in that memory.
+                if !crate::core_loop::sync_await::fence_is_triggered(state, &*backend, fence) {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        x11::error::BAD_MATCH,
+                        fence,
+                    );
+                }
+                backend.dri3_reset_fence(fence);
+                if let Some(f) = state.sync_fences.get_mut(&fence) {
+                    f.triggered = false;
+                }
             }
         }
         x11sync::QUERY_FENCE => {
             let fence = x11sync::parse_resource(body).unwrap_or(0);
-            let triggered = state.sync_fences.get(&fence).is_some_and(|f| f.triggered);
+            if let Err(outcome) = sync_known_fence(state, client_id, sequence, header, fence) {
+                return outcome;
+            }
+            // Xorg `ProcSyncQueryFence` → `CheckTriggered`: shared memory
+            // for a DRI3 xshmfence, the server's bit otherwise.
+            let triggered =
+                crate::core_loop::sync_await::fence_is_triggered(state, &*backend, fence);
             let reply = x11sync::encode_query_fence_reply(byte_order, sequence, triggered);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -5790,47 +7098,45 @@ fn handle_sync_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11sync::AWAIT_FENCE => {
-            // Spec: server must defer further processing of this
-            // client's requests until *any* fence in the list is
-            // triggered. We don't actually suspend the request
-            // stream (real blocking needs core-loop integration —
-            // see SyncPendingAwait doc-comment), but we *do*
-            //
-            // 1. Short-circuit when at least one fence is already
-            //    triggered: the await is trivially satisfied, log
-            //    it and move on. No state change.
-            // 2. Otherwise record the await on `sync_pending_awaits`
-            //    so a later TriggerFence on any of these fences
-            //    fires an `AwaitSatisfied` log line — useful for
-            //    tests that need to assert sequencing.
-            if let Some(fences) = x11sync::parse_await_fence(body) {
-                let any_triggered = fences
-                    .iter()
-                    .any(|f| state.sync_fences.get(f).is_some_and(|s| s.triggered));
-                if any_triggered {
-                    debug!(
-                        "client {} #{} SYNC::AwaitFence n={} -> already triggered",
-                        client_id.0,
-                        sequence.0,
-                        fences.len()
-                    );
-                } else {
-                    state
-                        .sync_pending_awaits
-                        .push(crate::server::SyncPendingAwait {
-                            client: client_id,
-                            sequence,
-                            fences: fences.clone(),
-                        });
-                    debug!(
-                        "client {} #{} SYNC::AwaitFence n={} -> pending (request stream NOT \
-                         suspended — known gap)",
-                        client_id.0,
-                        sequence.0,
-                        fences.len()
+            // Xorg `ProcSyncAwaitFence`: suspend the client until any of
+            // the fences triggers (or is destroyed). Captured on Xvfb:
+            // empty list → BadValue, None / unknown fence → BadFence.
+            let Some(fences) = x11sync::parse_await_fence(byte_order, body) else {
+                return sync_error(
+                    state,
+                    client_id,
+                    sequence,
+                    header,
+                    x11::error::BAD_LENGTH,
+                    0,
+                );
+            };
+            if fences.is_empty() {
+                return sync_error(state, client_id, sequence, header, x11::error::BAD_VALUE, 0);
+            }
+            for &fence in &fences {
+                if !state.sync_fences.contains_key(&fence) {
+                    return sync_error(
+                        state,
+                        client_id,
+                        sequence,
+                        header,
+                        crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_FENCE,
+                        fence,
                     );
                 }
             }
+            debug!(
+                "client {} #{} SYNC::AwaitFence n={}",
+                client_id.0,
+                sequence.0,
+                fences.len()
+            );
+            let waits = fences
+                .into_iter()
+                .map(|fence| crate::server::SyncAwaitCondition::Fence { fence })
+                .collect();
+            crate::core_loop::sync_await::begin_await(state, &*backend, client_id, waits);
         }
         x11sync::SET_PRIORITY => {
             // Stub.
@@ -5858,53 +7164,149 @@ fn handle_sync_request(
     Ok(RequestOutcome::Handled)
 }
 
-/// Merge a `CreateAlarm`/`ChangeAlarm` value-list into an alarm,
-/// resolving the `wait_value` against the watched counter's current
-/// value (Relative alarms add `value` to the counter; Absolute alarms
-/// take `value` directly). Only attributes whose mask bit was set are
-/// applied. muffin sets every attribute in a single `CreateAlarm`, so
-/// the per-field defaults below are not load-bearing for the Cinnamon
-/// path.
-fn apply_alarm_attributes(
+/// Xorg `SyncChangeAlarmAttributes` + `SyncInitTrigger` for CreateAlarm
+/// (on a fresh alarm) and ChangeAlarm (on a copy the caller writes back
+/// whatever the outcome). `values` is the value list, one word each and
+/// two for VALUE and DELTA, already length-checked against `mask`.
+///
+/// Order and partial effects, as Xorg (captured on Xvfb):
+/// 1. The list is walked in mask-bit order; an `events` word other than
+///    True/False is BadValue naming it, an unknown bit BadValue naming the
+///    mask bits above it. Nothing is changed yet.
+/// 2. `events` selects AlarmNotify for `client` — it stays selected even
+///    if the request then fails.
+/// 3. With DELTA or TEST_TYPE in the mask, a positive test with a
+///    negative delta or a negative test with a positive delta is
+///    BadMatch; nothing else is changed.
+/// 4. Delta, value type, value and test type are stored.
+/// 5. The trigger is initialised: an unknown counter is BadCounter, an
+///    invalid value type BadValue naming it; the wait value resolves
+///    (Relative without a counter is BadMatch; an INT64 overflow is
+///    BadValue naming the value's high word, with the wrapped sum stored);
+///    an invalid test type is BadValue naming it. Only then do the counter
+///    and the test the trigger runs change, and the alarm goes Active.
+///
+/// So a failing ChangeAlarm can leave step 4 behind: a stored bad test
+/// type is what QueryAlarm reports, while the alarm keeps running its old
+/// test.
+fn change_alarm_attributes(
     state: &ServerState,
+    alarm_id: u32,
     alarm: &mut crate::server::SyncAlarm,
-    attrs: &yserver_protocol::x11::sync::AlarmAttributes,
-) {
+    client: ClientId,
+    mask: u32,
+    values: &[u32],
+) -> Result<(), (u8, u32)> {
     use yserver_protocol::x11::sync as x11sync;
-    if let Some(counter) = attrs.counter {
-        alarm.counter = counter;
+    let int64 = |hi: u32, lo: u32| (i64::from(hi.cast_signed()) << 32) | i64::from(lo);
+    let mut words = values.iter().copied();
+    let mut next = || words.next().unwrap_or(0);
+    let (mut counter, mut value_type, mut raw_wait, mut test_type, mut delta) = (
+        alarm.counter,
+        alarm.value_type,
+        alarm.raw_wait,
+        alarm.test_type,
+        alarm.delta,
+    );
+    let mut select = None;
+    let mut remaining = mask;
+    while remaining != 0 {
+        let bit = 1u32 << remaining.trailing_zeros();
+        remaining &= !bit;
+        match bit {
+            x11sync::CA_COUNTER => counter = next(),
+            x11sync::CA_VALUE_TYPE => value_type = next(),
+            x11sync::CA_VALUE => raw_wait = int64(next(), next()),
+            x11sync::CA_TEST_TYPE => test_type = next(),
+            x11sync::CA_DELTA => delta = int64(next(), next()),
+            x11sync::CA_EVENTS => {
+                let events = next();
+                if events > 1 {
+                    return Err((x11::error::BAD_VALUE, events));
+                }
+                select = Some(events == 1);
+            }
+            _ => return Err((x11::error::BAD_VALUE, remaining)),
+        }
     }
-    if let Some(test_type) = attrs.test_type {
-        alarm.test_type = u8::try_from(test_type).unwrap_or(0);
+    if let Some(want) = select {
+        crate::core_loop::sync_await::select_alarm_events(alarm, client, want);
     }
-    if let Some(delta) = attrs.delta {
-        alarm.delta = delta;
+    if mask & (x11sync::CA_DELTA | x11sync::CA_TEST_TYPE) != 0 {
+        let positive = matches!(
+            test_type,
+            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_POSITIVE_TRANSITION
+        );
+        let negative = matches!(
+            test_type,
+            x11sync::TEST_NEGATIVE_COMPARISON | x11sync::TEST_NEGATIVE_TRANSITION
+        );
+        if (positive && delta < 0) || (negative && delta > 0) {
+            return Err((x11::error::BAD_MATCH, alarm_id));
+        }
     }
-    if let Some(events) = attrs.events {
-        alarm.events = events;
+    alarm.delta = delta;
+    alarm.value_type = value_type;
+    alarm.raw_wait = raw_wait;
+    alarm.test_type = test_type;
+
+    let mut new_counter = alarm.counter;
+    if mask & x11sync::CA_COUNTER != 0 {
+        if counter != 0
+            && !crate::core_loop::sync_await::is_system_counter(counter)
+            && !state.sync_counters.contains_key(&counter)
+        {
+            return Err((
+                crate::nested::SYNC_FIRST_ERROR + x11sync::BAD_COUNTER,
+                counter,
+            ));
+        }
+        new_counter = counter;
     }
-    if attrs.value.is_some() || attrs.value_type.is_some() {
-        let value = attrs.value.unwrap_or(0);
-        let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
-        alarm.wait_value = if relative {
-            let current = if matches!(
-                alarm.counter,
-                x11sync::IDLETIME_COUNTER
-                    | x11sync::IDLETIME_DEVICE_VCP
-                    | x11sync::IDLETIME_DEVICE_VCK
-            ) {
-                idletime_current_idle(state, alarm.counter)
-            } else {
-                state
-                    .sync_counters
-                    .get(&alarm.counter)
-                    .map_or(0, |c| c.value)
-            };
-            current.saturating_add(value)
+    let current = if new_counter == 0 {
+        None
+    } else {
+        crate::core_loop::sync_await::counter_value(state, new_counter)
+    };
+    if mask & x11sync::CA_VALUE_TYPE != 0
+        && value_type != x11sync::VALUE_TYPE_ABSOLUTE
+        && value_type != x11sync::VALUE_TYPE_RELATIVE
+    {
+        return Err((x11::error::BAD_VALUE, value_type));
+    }
+    if mask & (x11sync::CA_VALUE_TYPE | x11sync::CA_VALUE) != 0 {
+        if value_type == x11sync::VALUE_TYPE_ABSOLUTE {
+            alarm.wait_value = raw_wait;
         } else {
-            value
-        };
+            let Some(value) = current else {
+                return Err((x11::error::BAD_MATCH, alarm_id));
+            };
+            let (sum, overflow) = value.overflowing_add(raw_wait);
+            alarm.wait_value = sum;
+            if overflow {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return Err((x11::error::BAD_VALUE, (raw_wait >> 32) as u32));
+            }
+        }
     }
+    if mask & x11sync::CA_TEST_TYPE != 0 {
+        if test_type > x11sync::TEST_NEGATIVE_COMPARISON {
+            return Err((x11::error::BAD_VALUE, test_type));
+        }
+        alarm.check_type = test_type;
+    }
+    alarm.counter = new_counter;
+    alarm.state = x11sync::ALARM_STATE_ACTIVE;
+    Ok(())
+}
+
+/// The value list of a length-checked CreateAlarm / ChangeAlarm body.
+fn alarm_value_words(body: &[u8]) -> Vec<u32> {
+    body.get(8..)
+        .unwrap_or_default()
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect()
 }
 
 fn handle_xinerama_request(
@@ -5924,7 +7326,11 @@ fn handle_xinerama_request(
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
 
-    let screens: Vec<xin::ScreenInfo> = active_monitors(state)
+    // RRXineramaScreenCount counts every monitor (`RRMonitorCountList`,
+    // get_active FALSE); QueryScreens lists only the non-empty ones
+    // (rrxinerama.c) — a 0x0 client monitor is counted but not listed.
+    let screen_count = active_monitors(state, false).len();
+    let screens: Vec<xin::ScreenInfo> = active_monitors(state, true)
         .into_iter()
         .map(|monitor| xin::ScreenInfo {
             x_org: monitor.x,
@@ -5957,7 +7363,7 @@ fn handle_xinerama_request(
         }
         xin::IS_ACTIVE => {
             require_len!(0);
-            xin::encode_is_active_reply(byte_order, sequence, !screens.is_empty())
+            xin::encode_is_active_reply(byte_order, sequence, screen_count > 0)
         }
         xin::QUERY_SCREENS => {
             require_len!(0);
@@ -5994,7 +7400,7 @@ fn handle_xinerama_request(
                 );
             }
             #[allow(clippy::cast_possible_truncation)]
-            let count = screens.len() as u8;
+            let count = screen_count as u8;
             xin::encode_get_screen_count_reply(byte_order, sequence, count, window)
         }
         xin::GET_SCREEN_SIZE => {
@@ -6087,9 +7493,11 @@ fn sync_alarm_state_name(state: u8) -> &'static str {
     }
 }
 
-/// This is the frame-timing signal mutter/muffin waits on before
-/// compositing a client frame and emitting `_NET_WM_FRAME_DRAWN`, and
-/// also the idle/wake pair used by mate-power-manager.
+/// Run the alarms watching `counter` for a change from `old` to `new`
+/// (Xorg `SyncChangeCounter` → each alarm trigger's `CheckTrigger`). This
+/// is the frame-timing signal mutter/muffin waits on before compositing a
+/// client frame and emitting `_NET_WM_FRAME_DRAWN`, and also the
+/// idle/wake pair used by mate-power-manager.
 pub(crate) fn evaluate_alarms_for_counter(
     state: &mut ServerState,
     counter: u32,
@@ -6097,107 +7505,116 @@ pub(crate) fn evaluate_alarms_for_counter(
     new: i64,
 ) {
     use yserver_protocol::x11::sync as x11sync;
-    let candidates: Vec<u32> = state
+    let mut candidates: Vec<u32> = state
         .sync_alarms
         .iter()
-        .filter(|(_, a)| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE)
+        .filter(|(_, a)| {
+            a.counter == counter
+                && a.state == x11sync::ALARM_STATE_ACTIVE
+                && x11sync::trigger_fires(a.check_type, old, new, a.wait_value)
+        })
         .map(|(id, _)| *id)
         .collect();
-    if candidates.is_empty() {
+    candidates.sort_unstable();
+    for alarm_id in candidates {
+        alarm_trigger_fired(state, alarm_id, new);
+    }
+}
+
+/// The trigger test CreateAlarm / ChangeAlarm run on the one alarm they
+/// set up: its counter's current value, as both old and new (so only a
+/// comparison can already hold).
+fn check_new_alarm_trigger(state: &mut ServerState, alarm_id: u32, counter: u32) {
+    use yserver_protocol::x11::sync as x11sync;
+    let now_value = crate::core_loop::sync_await::counter_value(state, counter).unwrap_or(0);
+    if counter == x11sync::SERVERTIME_COUNTER {
+        state.sync_servertime_last = Some(now_value);
+    }
+    let holds = state
+        .sync_alarms
+        .get(&alarm_id)
+        .is_some_and(|a| x11sync::trigger_fires(a.check_type, now_value, now_value, a.wait_value));
+    if holds {
+        alarm_trigger_fired(state, alarm_id, now_value);
+    }
+}
+
+/// Xorg `SyncAlarmTriggerFired`: alarm `alarm_id` went off with its
+/// counter at `value` (0 and no counter for a counterless alarm). A
+/// counterless alarm, or a comparison with delta 0, goes Inactive;
+/// otherwise the wait value advances by delta until the test no longer
+/// holds (Inactive, value kept, on INT64 overflow). The `AlarmNotify`
+/// carries the new state and the old wait value; the new wait value is
+/// stored after it is sent.
+pub(crate) fn alarm_trigger_fired(state: &mut ServerState, alarm_id: u32, value: i64) {
+    use yserver_protocol::x11::sync as x11sync;
+    let Some(a) = state.sync_alarms.get(&alarm_id) else {
+        return;
+    };
+    if a.state != x11sync::ALARM_STATE_ACTIVE {
         return;
     }
-    let time = state.timestamp_now();
-    for alarm_id in candidates {
-        let Some(a) = state.sync_alarms.get(&alarm_id) else {
-            continue;
-        };
-        let test_type: u32 = a.test_type.into();
-        if !x11sync::trigger_fires(test_type, old, new, a.wait_value) {
-            continue;
-        }
-        let owner = a.owner;
-        let events = a.events;
-        let fired_wait = a.wait_value;
-        let delta = a.delta;
-
-        // Per Xorg sync.c:548-555: state → Inactive when
-        // delta==0 AND test_type is Comparison.
-        // Transitions with delta=0 stay Active — once the edge passes,
-        // the alarm sits quiescent waiting for the next crossing.
-        // Per Xorg sync.c:589-597: re-arm overflow → state Inactive
-        // (test_value left unmodified).
-        let is_comparison = matches!(
-            test_type,
-            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
-        );
-        let (new_wait, new_state) = if delta == 0 && is_comparison {
-            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
-        } else if delta == 0 {
-            // Transition + delta=0: stay Active, wait_value unchanged.
-            (fired_wait, x11sync::ALARM_STATE_ACTIVE)
-        } else {
-            // delta != 0: re-arm by adding delta until trigger stops firing.
-            // Overflow on the addition → state Inactive, wait_value reverts
-            // to fired_wait (Xorg sync.c:589-597).
-            let mut w = fired_wait;
-            let mut guard = 0u32;
-            let mut overflowed = false;
-            while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
-                match w.checked_add(delta) {
-                    Some(next) if next != w => {
-                        w = next;
-                        guard += 1;
-                    }
-                    Some(_) => break, // unreachable: delta != 0 (outer branch) + no overflow ⇒ next != w; defensive
-                    None => {
-                        overflowed = true;
-                        break;
-                    }
+    // Xorg reads the stored test type for the "delta 0 on a comparison"
+    // rule but re-arms with the trigger's check function; the two differ
+    // only after a ChangeAlarm that failed on an invalid test type.
+    let (test_type, check_type) = (a.test_type, a.check_type);
+    let (owner, counter, fired_wait, delta) = (a.owner, a.counter, a.wait_value, a.delta);
+    let is_comparison = matches!(
+        test_type,
+        x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
+    );
+    let (new_wait, new_state) = if counter == 0 || (delta == 0 && is_comparison) {
+        (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+    } else if delta == 0 {
+        // Transition + delta 0: stays Active with the same wait value;
+        // it fires again on the next crossing.
+        (fired_wait, x11sync::ALARM_STATE_ACTIVE)
+    } else {
+        let mut w = fired_wait;
+        let mut guard = 0u32;
+        let mut overflowed = false;
+        // The guard bounds what Xorg does not: after that failed
+        // ChangeAlarm a delta of the wrong sign passes the (unmatched)
+        // sign check, and Xorg's loop then steps toward INT64 overflow
+        // one delta at a time — a hung server (seen on Xvfb).
+        while x11sync::comparison_satisfied(check_type, value, w) && guard < 1_000_000 {
+            match w.checked_add(delta) {
+                Some(next) => {
+                    w = next;
+                    guard += 1;
+                }
+                None => {
+                    overflowed = true;
+                    break;
                 }
             }
-            if overflowed {
-                (fired_wait, x11sync::ALARM_STATE_INACTIVE)
-            } else {
-                (w, x11sync::ALARM_STATE_ACTIVE)
-            }
-        };
-
-        if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
-            a.wait_value = new_wait;
-            a.state = new_state;
         }
-
-        let owner_class = state
-            .client_wm_class
-            .get(&owner.0)
-            .map(String::as_str)
-            .unwrap_or("<unknown>");
-        log::debug!(
-            "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
-             counter={counter_name}(0x{counter:x}) test={test} \
-             old={old} new={new} wait={fired_wait} \
-             → state={state_name} (events={events})",
-            owner_id = owner.0,
-            counter_name = sync_counter_name(counter),
-            test = sync_test_type_name(test_type),
-            state_name = sync_alarm_state_name(new_state),
-        );
-
-        if events {
-            let _dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-                let evt = x11sync::encode_alarm_notify_event(
-                    order,
-                    crate::nested::SYNC_FIRST_EVENT,
-                    seq,
-                    alarm_id,
-                    new,
-                    fired_wait,
-                    time,
-                    new_state,
-                );
-                buf.extend_from_slice(&evt);
-            });
+        if overflowed {
+            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else {
+            (w, x11sync::ALARM_STATE_ACTIVE)
         }
+    };
+    let owner_class = state
+        .client_wm_class
+        .get(&owner.0)
+        .map(String::as_str)
+        .unwrap_or("<unknown>");
+    log::debug!(
+        "sync: alarm 0x{alarm_id:x} fired client {owner_id}/{owner_class:?} \
+         counter={counter_name}(0x{counter:x}) test={test} \
+         value={value} wait={fired_wait} → state={state_name}",
+        owner_id = owner.0,
+        counter_name = sync_counter_name(counter),
+        test = sync_test_type_name(test_type),
+        state_name = sync_alarm_state_name(new_state),
+    );
+    if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+        a.state = new_state;
+    }
+    crate::core_loop::sync_await::send_alarm_notify(state, alarm_id, value);
+    if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
+        a.wait_value = new_wait;
     }
 }
 
@@ -6255,7 +7672,68 @@ fn fmt_shape_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> Strin
     s
 }
 
+/// SHAPE requests, and the exposures a viewable window's new bounding
+/// shape makes: Xorg's `miSetShape` (`mi/miwindow.c:637-677`) revalidates
+/// the tree, so what the window no longer covers is exposed beneath it
+/// and what it newly covers is exposed to it. GDK clips a native window
+/// inside a client-side one with its bounding shape and shifts that
+/// shape on every scroll; the dialog repaints its button bar below the
+/// viewport only on that Expose.
 fn handle_shape_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::shape as x11shape;
+    // Rectangles, Mask and Combine carry the destination kind at byte 1,
+    // Offset at byte 0; all four the destination window at bytes 4..8.
+    let kind_at = match header.data {
+        x11shape::RECTANGLES | x11shape::MASK | x11shape::COMBINE => Some(1),
+        x11shape::OFFSET => Some(0),
+        _ => None,
+    };
+    let reshaped = kind_at
+        .filter(|at| body.get(*at) == Some(&x11shape::KIND_BOUNDING))
+        .and_then(|_| body.get(4..8))
+        .map(|b| ResourceId(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .filter(|w| {
+            state
+                .resources
+                .window(*w)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable)
+        })
+        .and_then(|w| {
+            let parent = state.resources.window(w)?.parent;
+            // A top-level keeps its own storage, and the scene recomposites
+            // what its shape uncovers — as for a move.
+            (parent != crate::resources::ROOT_WINDOW || has_redirected_ancestor(state, w))
+                .then(|| (w, parent, current_bounding_in_parent(state, w)))
+        });
+    let outcome =
+        handle_shape_request_ops(state, backend, origin, client_id, sequence, header, body)?;
+    if let Some((window, parent, before)) = reshaped {
+        let inside = content_within_ancestors(state, parent);
+        let before = crate::nested::intersect_regions(&before, &[inside]);
+        let after =
+            crate::nested::intersect_regions(&current_bounding_in_parent(state, window), &[inside]);
+        let vacated = crate::nested::subtract_regions(&before, &after);
+        if !vacated.is_empty() {
+            expose_vacated_area(state, backend, origin, parent, window, vacated);
+        }
+        let gained = crate::nested::subtract_regions(&after, &before);
+        let gained = crate::nested::subtract_regions(&gained, &higher_sibling_rects(state, window));
+        if !gained.is_empty() {
+            let _rest = expose_child_share(state, backend, origin, window, gained, true);
+        }
+    }
+    Ok(outcome)
+}
+
+fn handle_shape_request_ops(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
@@ -6305,6 +7783,9 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg miSetShape re-evaluates the pointer before ShapeNotify
+                // goes out (`mi/miwindow.c:680`); so do the other SHAPE ops.
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -6320,6 +7801,7 @@ fn handle_shape_request(
                 if req.src == 0 {
                     let changed = crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                    backend.windows_restructured(state);
                     if changed {
                         emit_shape_notify(state, window, req.dest_kind);
                     }
@@ -6391,6 +7873,7 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -6432,6 +7915,7 @@ fn handle_shape_request(
                 );
                 let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
@@ -6450,6 +7934,7 @@ fn handle_shape_request(
                 }
                 if translated {
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                    backend.windows_restructured(state);
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
             }
@@ -6534,6 +8019,177 @@ fn handle_shape_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// Xorg `ProcXFixesDispatch`: a client may only use the requests of the
+/// XFIXES major version it negotiated — before its first `QueryVersion`
+/// that is `QueryVersion` alone. Anything else is BadRequest.
+fn dispatch_xfixes_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    let client_major = state
+        .xfixes_client_major
+        .get(&client_id.0)
+        .copied()
+        .unwrap_or(0);
+    if !x11xfixes::request_allowed(client_major, header.data) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(header.data),
+            header.opcode,
+        );
+    }
+    handle_xfixes_request(state, backend, origin, client_id, sequence, header, body)
+}
+
+/// Xorg `VERIFY_CURSOR` for XFIXES: resolve a cursor XID to its host
+/// handle, or send BadCursor naming it. `Err(outcome)` carries the error
+/// already written.
+fn xfixes_verify_cursor(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    cursor: u32,
+) -> Result<Option<u32>, io::Result<RequestOutcome>> {
+    if state.resources.cursor_exists(ResourceId(cursor)) {
+        return Ok(state.resources.cursor_host_xid(ResourceId(cursor)));
+    }
+    Err(emit_x11_error_with_minor(
+        state,
+        client_id,
+        sequence,
+        x11::error::BAD_CURSOR,
+        cursor,
+        u16::from(header.data),
+        header.opcode,
+    ))
+}
+
+/// Xorg `ReplaceCursor` for XFIXES `ChangeCursor` / `ChangeCursorByName`:
+/// every cursor XID and every displayed use of host cursor `old_host`
+/// switches to `source`'s cursor. Replacing a cursor with itself is a
+/// no-op, and the old host cursor is released once nothing names it.
+fn xfixes_replace_cursor(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    old_host: u32,
+    source: ResourceId,
+) {
+    let Some(new_host) = state.resources.cursor_host_xid(source) else {
+        return;
+    };
+    if old_host == new_host {
+        return;
+    }
+    state.resources.retarget_cursor_host(old_host, source);
+    let _ = backend.replace_cursor(origin, old_host, new_host);
+    if !state.resources.cursor_host_referenced(old_host) {
+        let _ = backend.free_cursor(origin, old_host);
+    }
+}
+
+/// Xorg `ExpandRegion` (`xfixes/region.c`): grow each rectangle of
+/// `source` by the four margins and union the results. Coordinates are
+/// computed wide and clamped to the protocol's 16-bit range.
+fn xfixes_expand_region_rects(
+    source: &[yserver_protocol::x11::xfixes::RegionRect],
+    left: u16,
+    right: u16,
+    top: u16,
+    bottom: u16,
+) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
+    use yserver_protocol::x11::xfixes::RegionRect;
+    let clamp_i16 = |v: i32| {
+        i16::try_from(v.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or_default()
+    };
+    let grown: Vec<RegionRect> = source
+        .iter()
+        .map(|r| {
+            let x1 = i32::from(r.x) - i32::from(left);
+            let y1 = i32::from(r.y) - i32::from(top);
+            let x2 = i32::from(r.x) + i32::from(r.width) + i32::from(right);
+            let y2 = i32::from(r.y) + i32::from(r.height) + i32::from(bottom);
+            let (x1, y1, x2, y2) = (clamp_i16(x1), clamp_i16(y1), clamp_i16(x2), clamp_i16(y2));
+            RegionRect {
+                x: x1,
+                y: y1,
+                width: u16::try_from(i32::from(x2) - i32::from(x1)).unwrap_or(0),
+                height: u16::try_from(i32::from(y2) - i32::from(y1)).unwrap_or(0),
+            }
+        })
+        .collect();
+    grown.iter().fold(Vec::new(), |acc, rect| {
+        crate::nested::union_regions(&acc, &[*rect])
+    })
+}
+
+/// Send XFIXES `DisplayCursorNotify` for a backend-reported sprite change
+/// to every (client, window) that selected it — one event per selection,
+/// as Xorg's `CursorDisplayCursor` walks its `cursorEvents` list. Called
+/// after each request and at the end of each loop iteration.
+pub(crate) fn emit_xfixes_cursor_notify(state: &mut ServerState, backend: &mut dyn Backend) {
+    use yserver_protocol::x11::xfixes as x11xfixes;
+    let Some(change) = backend.take_displayed_cursor_change() else {
+        return;
+    };
+    let mut selections: Vec<(u32, u32)> = state
+        .xfixes_cursor_masks
+        .iter()
+        .filter(|(_, mask)| **mask & x11xfixes::DISPLAY_CURSOR_NOTIFY_MASK != 0)
+        .map(|((client, window), _)| (*client, window.0))
+        .collect();
+    if selections.is_empty() {
+        return;
+    }
+    selections.sort_unstable();
+    let name = state
+        .resources
+        .cursor_name_for_host(change.host_xid)
+        .map_or(0, |atom| atom.0);
+    let timestamp = state.timestamp_now();
+    for (client, window) in selections {
+        let _dropped = fanout_event_to_clients(state, &[ClientId(client)], |buf, seq, order| {
+            x11xfixes::encode_cursor_notify_event(
+                buf,
+                order,
+                crate::nested::XFIXES_FIRST_EVENT,
+                seq,
+                window,
+                change.serial,
+                timestamp,
+                name,
+            );
+        });
+    }
+}
+
+/// Drop `client`'s XFIXES per-client state on disconnect. Xorg frees the
+/// client's `CursorHideCountRec` resource, which re-displays the sprite
+/// once no other client holds a hide.
+pub(crate) fn release_xfixes_client_state(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client: ClientId,
+) {
+    state.xfixes_client_major.remove(&client.0);
+    if state.xfixes_cursor_hide_counts.remove(&client.0).is_some()
+        && state.xfixes_cursor_hide_counts.is_empty()
+    {
+        backend.set_cursor_hidden(false);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_xfixes_request(
     state: &mut ServerState,
@@ -6552,16 +8208,43 @@ fn handle_xfixes_request(
     let minor = header.data;
     match minor {
         x11xfixes::QUERY_VERSION => {
+            // Xorg `ProcXFixesQueryVersion`: REQUEST_SIZE_MATCH, then the
+            // lower-of-the-two rule with a sticky per-client major.
+            let Some((client_major, client_minor)) =
+                x11xfixes::parse_query_version(byte_order, body)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            let previous = state
+                .xfixes_client_major
+                .get(&client_id.0)
+                .copied()
+                .unwrap_or(0);
+            let negotiated = x11xfixes::negotiate_version(previous, client_major, client_minor);
+            state
+                .xfixes_client_major
+                .insert(client_id.0, negotiated.client_major);
+            debug!(
+                "client {} #{} XFIXES::QueryVersion client={client_major}.{client_minor} -> {}.{}",
+                client_id.0, sequence.0, negotiated.reply_major, negotiated.reply_minor,
+            );
             let reply = x11xfixes::encode_query_version_reply(
                 byte_order,
                 sequence,
-                x11xfixes::MAJOR_VERSION,
-                x11xfixes::MINOR_VERSION,
+                negotiated.reply_major,
+                negotiated.reply_minor,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
-            let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::SELECT_SELECTION_INPUT => {
@@ -6603,6 +8286,30 @@ fn handle_xfixes_request(
         }
         x11xfixes::SELECT_CURSOR_INPUT => {
             if let Some(req) = x11xfixes::parse_select_cursor_input(body) {
+                // Xorg `ProcXFixesSelectCursorInput`: window first, then
+                // the mask (captured on Xvfb: BadWindow, BadValue).
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+                if req.event_mask & !x11xfixes::CURSOR_ALL_EVENTS_MASK != 0 {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.event_mask,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
                 let key = (client_id.0, ResourceId(req.window));
                 if req.event_mask == 0 {
                     state.xfixes_cursor_masks.remove(&key);
@@ -6642,26 +8349,31 @@ fn handle_xfixes_request(
         x11xfixes::GET_CURSOR_IMAGE_AND_NAME => {
             // Superset of GetCursorImage (opcode 25). Real X screen
             // recorders (gpu-screen-recorder, …) call this to grab the
-            // cursor; with no reply they block forever in poll().
-            // TODO: plumb the active cursor's name atom through
-            // `ActiveCursorImage`; until then report it as unnamed
-            // (atom 0 / empty name — a valid X state), which is all the
-            // recorders need (they consume the image).
+            // cursor; with no reply they block forever in poll(). The
+            // name is the displayed cursor's XFIXES name (Xorg
+            // `pCursor->name`), empty when it was never named.
             let reply = match backend.get_active_cursor_image() {
-                Some(img) => x11xfixes::encode_get_cursor_image_and_name_reply(
-                    byte_order,
-                    sequence,
-                    img.x,
-                    img.y,
-                    img.width,
-                    img.height,
-                    img.hot_x,
-                    img.hot_y,
-                    img.serial,
-                    0,
-                    &[],
-                    img.bgra_bytes.as_ref(),
-                ),
+                Some(img) => {
+                    let atom = state
+                        .resources
+                        .cursor_name_for_host(img.host_xid)
+                        .unwrap_or(AtomId(0));
+                    let name = state.atoms.name(atom).map(str::as_bytes).unwrap_or(&[]);
+                    x11xfixes::encode_get_cursor_image_and_name_reply(
+                        byte_order,
+                        sequence,
+                        img.x,
+                        img.y,
+                        img.width,
+                        img.height,
+                        img.hot_x,
+                        img.hot_y,
+                        img.serial,
+                        atom.0,
+                        name,
+                        img.bgra_bytes.as_ref(),
+                    )
+                }
                 None => {
                     x11xfixes::encode_get_cursor_image_and_name_empty_reply(byte_order, sequence)
                 }
@@ -7026,9 +8738,12 @@ fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
-                let Some(client_clip) =
-                    backend.picture_client_clip_rects(picture_state.host_picture_xid.as_raw())
-                else {
+                // An unbacked Picture has no clip set, like a fresh one.
+                let client_clip = match picture_state.host_picture_xid {
+                    Some(hp) => backend.picture_client_clip_rects(hp.as_raw()),
+                    None => Some(None),
+                };
+                let Some(client_clip) = client_clip else {
                     return emit_x11_error(
                         state,
                         client_id,
@@ -7284,6 +8999,8 @@ fn handle_xfixes_request(
                     crate::nested::set_shape_rects(state, window, req.dest_kind, source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg SetWindowShapeRegion goes through miSetShape too.
+                backend.windows_restructured(state);
             }
         }
         x11xfixes::SET_PICTURE_CLIP_REGION => {
@@ -7292,7 +9009,8 @@ fn handle_xfixes_request(
                 let host_pic = state
                     .resources
                     .picture(pic_id)
-                    .map(|p| p.host_picture_xid.as_raw());
+                    .and_then(|p| p.host_picture_xid)
+                    .map(|h| h.as_raw());
                 if let Some(hp) = host_pic {
                     if req.region == 0 {
                         // RENDER CPClipMask = 0x40; value=None clears the clip.
@@ -7334,11 +9052,99 @@ fn handle_xfixes_request(
                 }
             }
         }
+        x11xfixes::CHANGE_CURSOR => {
+            // Xorg `ProcXFixesChangeCursor`: both cursors must exist
+            // (source checked first), then every use of `destination` —
+            // its XIDs, window cursors, grabs — becomes `source`.
+            let Some((source, destination)) = x11xfixes::parse_change_cursor(byte_order, body)
+            else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            if let Err(outcome) = xfixes_verify_cursor(state, client_id, sequence, header, source) {
+                return outcome;
+            }
+            let dest_host =
+                match xfixes_verify_cursor(state, client_id, sequence, header, destination) {
+                    Ok(host) => host,
+                    Err(outcome) => return outcome,
+                };
+            if let Some(dest_host) = dest_host {
+                xfixes_replace_cursor(state, backend, origin, dest_host, ResourceId(source));
+            }
+        }
         x11xfixes::CHANGE_CURSOR_BY_NAME => {
+            // Xorg `ProcXFixesChangeCursorByName`: the source must exist;
+            // a name that was never interned matches nothing (MakeAtom
+            // with create=FALSE) and succeeds silently.
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_change_cursor_by_name(body) {
-                let host_cursor = state.resources.cursor_host_xid(ResourceId(cursor_xid));
-                if let Some(host_cursor) = host_cursor {
-                    let _ = backend.xfixes_change_cursor_by_name(origin, host_cursor, name_bytes);
+                if let Err(outcome) =
+                    xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+                {
+                    return outcome;
+                }
+                let name = std::str::from_utf8(name_bytes).unwrap_or("");
+                let atom = state.atoms.intern(name, true);
+                if atom.0 != 0 {
+                    for host in state.resources.cursor_hosts_named(atom) {
+                        xfixes_replace_cursor(state, backend, origin, host, ResourceId(cursor_xid));
+                    }
+                }
+            }
+        }
+        x11xfixes::EXPAND_REGION => {
+            let Some(req) = x11xfixes::parse_expand_region(byte_order, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            // VERIFY_REGION source then destination: XFixes BadRegion
+            // (error base + 0).
+            for region in [req.source, req.destination] {
+                if !state.xfixes_regions.contains_key(&region) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        crate::nested::XFIXES_FIRST_ERROR,
+                        region,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                }
+            }
+            let source = state.xfixes_regions[&req.source].rects.clone();
+            // An empty source leaves the destination untouched (Xorg only
+            // rewrites it inside `if (nBoxes)`; confirmed on Xvfb).
+            if !source.is_empty() {
+                let rects =
+                    xfixes_expand_region_rects(&source, req.left, req.right, req.top, req.bottom);
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "ExpandRegion src=0x{:08x} dst=0x{:08x} l={} r={} t={} b={} rects{}",
+                    req.source,
+                    req.destination,
+                    req.left,
+                    req.right,
+                    req.top,
+                    req.bottom,
+                    format_region_rects(&rects),
+                );
+                if let Some(dest) = state.xfixes_regions.get_mut(&req.destination) {
+                    dest.rects = rects;
                 }
             }
         }
@@ -7349,6 +9155,11 @@ fn handle_xfixes_request(
             // GetCursorName can read it back. yserver mirrors the same
             // shape: intern, store on `Cursor.name_atom`.
             if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_set_cursor_name(body) {
+                if let Err(outcome) =
+                    xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+                {
+                    return outcome;
+                }
                 let name = std::str::from_utf8(name_bytes).unwrap_or("");
                 let atom = state.atoms.intern(name, false);
                 state
@@ -7374,6 +9185,11 @@ fn handle_xfixes_request(
                 .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                 .unwrap_or(0);
+            if let Err(outcome) =
+                xfixes_verify_cursor(state, client_id, sequence, header, cursor_xid)
+            {
+                return outcome;
+            }
             let atom = state
                 .resources
                 .cursor_name_atom(ResourceId(cursor_xid))
@@ -7394,15 +9210,74 @@ fn handle_xfixes_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
+            // Xorg `ProcXFixesHideCursor` / `ProcXFixesShowCursor`: the
+            // window only names the screen (one here); the hide count is
+            // per client. The sprite hides on the first count anywhere and
+            // returns when the last one goes (ShowCursor to zero, or the
+            // client disconnecting).
+            let Some(window) = x11xfixes::parse_window(byte_order, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            };
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            if minor == x11xfixes::HIDE_CURSOR {
+                let was_visible = state.xfixes_cursor_hide_counts.is_empty();
+                *state
+                    .xfixes_cursor_hide_counts
+                    .entry(client_id.0)
+                    .or_insert(0) += 1;
+                if was_visible {
+                    backend.set_cursor_hidden(true);
+                }
+            } else {
+                // Showing without a prior hide is BadMatch (Xvfb: error 8,
+                // value = the window).
+                let Some(count) = state.xfixes_cursor_hide_counts.get_mut(&client_id.0) else {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        window,
+                        u16::from(minor),
+                        header.opcode,
+                    );
+                };
+                *count -= 1;
+                if *count == 0 {
+                    state.xfixes_cursor_hide_counts.remove(&client_id.0);
+                    if state.xfixes_cursor_hide_counts.is_empty() {
+                        backend.set_cursor_hidden(false);
+                    }
+                }
+            }
             debug!(
-                "client {} #{} XFIXES::{}Cursor (stub)",
+                "client {} #{} XFIXES::{}Cursor window=0x{window:x} hide_counts={:?}",
                 client_id.0,
                 sequence.0,
                 if minor == x11xfixes::HIDE_CURSOR {
                     "Hide"
                 } else {
                     "Show"
-                }
+                },
+                state.xfixes_cursor_hide_counts,
             );
         }
         other if other > x11xfixes::DELETE_POINTER_BARRIER => {
@@ -7417,8 +9292,10 @@ fn handle_xfixes_request(
             );
         }
         other => {
+            // Every 5.0 request has an arm above; the gate in
+            // `dispatch_xfixes_request` keeps higher minors out.
             debug!(
-                "client {} #{} XFIXES::known unsupported minor={}",
+                "client {} #{} XFIXES::unexpected minor={}",
                 client_id.0, sequence.0, other
             );
         }
@@ -7460,212 +9337,115 @@ fn handle_composite_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &reply));
         }
-        x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS => {
-            if let Some((window, update)) = x11composite::parse_window_update(body) {
-                let subwindows = minor == x11composite::REDIRECT_SUBWINDOWS;
-                // Xorg compRedirectWindow (composite/compalloc.c:145-147): a
-                // client request to redirect the overlay window returns
-                // Success without installing any redirect. The COW reaches
-                // scanout via the normal paint path; it is never itself
-                // redirected. Match that exactly — NOT BadMatch (which would
-                // be a yserver-invented error). Scoped to RedirectWindow;
-                // RedirectSubwindows(COW) is benign (COW has no children to
-                // redirect) and Xorg doesn't special-case it either.
-                if !subwindows && ResourceId(window) == COMPOSITE_OVERLAY_WINDOW {
+        x11composite::REDIRECT_WINDOW
+        | x11composite::REDIRECT_SUBWINDOWS
+        | x11composite::UNREDIRECT_WINDOW
+        | x11composite::UNREDIRECT_SUBWINDOWS => {
+            let Some((window_raw, update)) = x11composite::parse_window_update(body) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let window = ResourceId(window_raw);
+            let subwindows = matches!(
+                minor,
+                x11composite::REDIRECT_SUBWINDOWS | x11composite::UNREDIRECT_SUBWINDOWS
+            );
+            let redirect = matches!(
+                minor,
+                x11composite::REDIRECT_WINDOW | x11composite::REDIRECT_SUBWINDOWS
+            );
+            let error = |state: &mut ServerState, code: u8| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    window_raw,
+                    u16::from(minor),
+                    COMPOSITE_MAJOR_OPCODE,
+                )
+            };
+            let Some(parent) = state.resources.window(window).map(|w| w.parent) else {
+                return error(state, x11::error::BAD_WINDOW);
+            };
+            // compositeproto: update=0 → Automatic, update=1 → Manual. An
+            // unredirect with any other value matches no record (BadValue
+            // below, as Xorg).
+            let mode = match update {
+                0 => crate::server::CompositeRedirectMode::Automatic,
+                1 => crate::server::CompositeRedirectMode::Manual,
+                _ => return error(state, x11::error::BAD_VALUE),
+            };
+            // Xorg compRedirectWindow (composite/compalloc.c:145-150): the
+            // overlay window is never redirected and asking succeeds; the
+            // root has no parent to redirect into (BadMatch). Unredirect has
+            // no such checks: neither ever holds a record, so it BadValues.
+            if redirect && !subwindows {
+                if window == COMPOSITE_OVERLAY_WINDOW {
                     return Ok(RequestOutcome::Handled);
                 }
-                // compositeproto: update=0 → Automatic, update=1 → Manual.
-                // Both wire constants are spec-legal; reject anything else
-                // with BadValue. We don't yet have a compositor consumer
-                // for the redirected-backing pixmap, so registering the
-                // record is enough — NameWindowPixmap consults the record
-                // and that's the part real compositing WMs need to make
-                // progress (xfwm4, picom, xcompmgr, mate-panel's
-                // notification-area-applet for its tray window).
-                let mode = match update {
-                    0 => crate::server::CompositeRedirectMode::Automatic,
-                    1 => crate::server::CompositeRedirectMode::Manual,
-                    _ => {
-                        return emit_x11_error_with_minor(
-                            state,
-                            client_id,
-                            sequence,
-                            x11::error::BAD_VALUE,
-                            u32::from(update),
-                            u16::from(minor),
-                            COMPOSITE_MAJOR_OPCODE,
-                        );
-                    }
-                };
-                let key = (ResourceId(window), subwindows);
-                let prev = state.composite_redirects.get(&key).copied();
-                // Xorg compRedirectWindow (composite/compalloc.c:155-158)
-                // permits only one Manual redirect on a window, regardless
-                // of whether the existing redirect came from RedirectWindow
-                // or was inherited from RedirectSubwindows(parent). Muffin
-                // deliberately probes with RedirectWindow(frame, Manual)
-                // after root RedirectSubwindows(Manual); Xorg returns
-                // BadAccess even though both requests are from Muffin.
-                //
-                // Treating the two key shapes as independent is not merely
-                // an error-code mismatch: a root child can inherit Manual,
-                // receive the redundant direct record, and later be
-                // reparented below a frame. The direct record then makes
-                // reparent reconciliation preserve a stale inner backing,
-                // so the application paints frames that the compositor
-                // never samples (Warframe fullscreen -> windowed: black).
-                let inherited_manual = !subwindows
-                    && state
-                        .resources
-                        .window(ResourceId(window))
-                        .and_then(|w| state.composite_redirects.get(&(w.parent, true)))
-                        .is_some_and(|record| {
-                            matches!(record.mode, crate::server::CompositeRedirectMode::Manual)
-                        });
-                let same_key_manual = prev.is_some_and(|record| {
-                    matches!(record.mode, crate::server::CompositeRedirectMode::Manual)
-                });
-                if matches!(mode, crate::server::CompositeRedirectMode::Manual)
-                    && (same_key_manual || inherited_manual)
-                {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_ACCESS,
-                        window,
-                        u16::from(minor),
-                        COMPOSITE_MAJOR_OPCODE,
-                    );
-                }
-                if let Some(existing) = prev
-                    && existing.owner != client_id
-                {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_ACCESS,
-                        window,
-                        u16::from(minor),
-                        COMPOSITE_MAJOR_OPCODE,
-                    );
-                }
-                let mode_flip = matches!(prev, Some(p) if p.mode != mode);
-                let mode_flip_suffix = if mode_flip {
-                    match prev {
-                        Some(p) => format!(" [mode-flip from {:?}]", p.mode),
-                        None => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
-                debug!(
-                    "client {} #{} COMPOSITE::Redirect{}(0x{:x}, mode={:?}{})",
-                    client_id.0,
-                    sequence.0,
-                    if subwindows { "Subwindows" } else { "Window" },
-                    window,
-                    mode,
-                    mode_flip_suffix,
-                );
-                state.composite_redirects.insert(
-                    key,
-                    crate::server::RedirectRecord {
-                        mode,
-                        owner: client_id,
-                    },
-                );
-                // Stage 4b: backing activation + scene-participation
-                // flip, gated on `Backend::supports_redirect_activation()`.
-                // v1 returns `false` (keeping the post-`3751c11`
-                // MATE-fix shape: record only, no backing routing);
-                // v2 returns `true` and the helper allocates + flips
-                // participation.
-                if backend.supports_redirect_activation() {
-                    // Stage 4b.8: same-owner mode-flip is preserved
-                    // across the flip per Xorg's compCheckRedirect
-                    // (`xserver/composite/compwindow.c:172` +
-                    // `compositeproto.txt:80`). Backing pixmap +
-                    // NameWindowPixmap aliases survive; only the
-                    // window's + backing's `scene_participating`
-                    // flags flip. No re-seed (B's content is
-                    // preserved as-is — re-running the seed-copy
-                    // would clobber the compositor's in-flight
-                    // paint per the plan's codex-round-6 decision).
-                    let targets: Vec<ResourceId> = if subwindows {
-                        // Snapshot children to a Vec — the helper takes
-                        // `&mut state`, so the borrow on `state.resources`
-                        // from `children(..)` can't be held across calls.
-                        state.resources.children(ResourceId(window)).to_vec()
-                    } else {
-                        vec![ResourceId(window)]
-                    };
-                    for target in targets {
-                        if mode_flip {
-                            flip_redirect_target_mode(state, backend, origin, target, mode);
-                        } else {
-                            activate_redirect_backing_for(state, backend, origin, target, mode);
-                        }
-                    }
+                if parent == window {
+                    return error(state, x11::error::BAD_MATCH);
                 }
             }
-        }
-        x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
-            if let Some((window, _update)) = x11composite::parse_window_update(body) {
-                let subwindows = minor == x11composite::UNREDIRECT_SUBWINDOWS;
+            // Xorg's order is lastChild first, ours bottom first. The COW
+            // gets no record from a subwindows redirect (compRedirectWindow
+            // returns Success for it).
+            let targets: Vec<ResourceId> = if subwindows {
                 state
-                    .composite_redirects
-                    .remove(&(ResourceId(window), subwindows));
-                // L2 plan B.6c + Stage 4b: release each affected
-                // backing's reason-1 hold. Single-window: just the
-                // named window. Subtree: walk children of the
-                // parent symmetric to the RedirectSubwindows arm
-                // above. Backing-side participation drop happens
-                // inside `release_redirected_backing` per the
-                // Stage-4 round-3 finding; the window-side
-                // participation restore happens below, gated on
-                // `supports_redirect_activation()`.
-                let targets: Vec<ResourceId> = if subwindows {
-                    state.resources.children(ResourceId(window)).to_vec()
-                } else {
-                    vec![ResourceId(window)]
-                };
-                debug!(
-                    "client {} #{} COMPOSITE::Unredirect{}(0x{:x}) targets={}",
-                    client_id.0,
-                    sequence.0,
-                    if subwindows { "Subwindows" } else { "Window" },
-                    window,
-                    targets.len(),
+                    .resources
+                    .children(window)
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|child| *child != COMPOSITE_OVERLAY_WINDOW)
+                    .collect()
+            } else {
+                vec![window]
+            };
+            let before: Vec<_> = targets
+                .iter()
+                .map(|t| state.composite_redirects.window_mode(*t))
+                .collect();
+            let record = crate::server::RedirectRecord {
+                mode,
+                owner: client_id,
+            };
+            let redirects = &mut state.composite_redirects;
+            let ok = match (redirect, subwindows) {
+                // Only one Manual redirect per window or subwindows list,
+                // whichever client holds it (compalloc.c:155-158, :336-339):
+                // muffin probes RedirectWindow(frame, Manual) after its own
+                // RedirectSubwindows(root, Manual) and expects BadAccess.
+                (true, false) => redirects.redirect_window(window, record).is_ok(),
+                (true, true) => redirects
+                    .redirect_subwindows(window, &targets, record)
+                    .is_ok(),
+                (false, false) => redirects.unredirect_window(window, client_id, mode),
+                (false, true) => redirects.unredirect_subwindows(window, &targets, client_id, mode),
+            };
+            debug!(
+                "client {} #{} COMPOSITE::{}Redirect{}(0x{:x}, mode={:?}) -> {} targets={}",
+                client_id.0,
+                sequence.0,
+                if redirect { "" } else { "Un" },
+                if subwindows { "Subwindows" } else { "Window" },
+                window_raw,
+                mode,
+                if ok { "ok" } else { "refused" },
+                targets.len(),
+            );
+            if !ok {
+                return error(
+                    state,
+                    if redirect {
+                        x11::error::BAD_ACCESS
+                    } else {
+                        x11::error::BAD_VALUE
+                    },
                 );
-                for target in &targets {
-                    crate::core_loop::process_disconnect::teardown_redirect_for_window(
-                        state, backend, None, *target,
-                    );
-                }
-                if backend.supports_redirect_activation() {
-                    // Restore window scene-participation to the
-                    // window's `mapped` state. Spec §285+360 —
-                    // redirect-state change as scene-structure
-                    // damage source; the v2 setter fires that
-                    // damage internally.
-                    for target in &targets {
-                        let snap = state
-                            .resources
-                            .window(*target)
-                            .map(|w| (w.host_xid, w.map_state != MapState::Unmapped));
-                        if let Some((Some(host), participating)) = snap
-                            && let Err(err) =
-                                backend.set_window_scene_participation(origin, host, participating)
-                        {
-                            log::warn!(
-                                "unredirect: set_window_scene_participation(0x{:x}, {participating}) failed: {err}",
-                                target.0
-                            );
-                        }
-                    }
-                }
+            }
+            for (target, before) in targets.into_iter().zip(before) {
+                sync_redirect_backing(state, backend, origin, target, before);
             }
         }
         x11composite::CREATE_REGION_FROM_BORDER_CLIP => {
@@ -7691,11 +9471,8 @@ fn handle_composite_request(
                 client_id.0, sequence.0, window_raw, pixmap_raw,
             );
             let snapshot = state.resources.window(window).map(|w| {
-                let parent_redirected = state
-                    .composite_redirects
-                    .keys()
-                    .any(|(rwid, sub)| *sub && *rwid == w.parent);
-                let self_redirected = state.composite_redirects.contains_key(&(window, false));
+                // Xorg compext.c:246 `if (!cw) return BadMatch;`.
+                let redirected = state.composite_redirects.window_mode(window).is_some();
                 let (pixmap_width, pixmap_height) = w
                     .redirected_backing
                     .as_ref()
@@ -7707,7 +9484,7 @@ fn handle_composite_request(
                     pixmap_width,
                     pixmap_height,
                     w.depth,
-                    parent_redirected || self_redirected,
+                    redirected,
                     w.map_state,
                 )
             });
@@ -7807,6 +9584,7 @@ fn handle_composite_request(
                 },
             );
             let _ = state.resources.set_pixmap_host_xid(pixmap, host_pixmap_xid);
+            state.resources.mark_pixmap_composite_name(pixmap);
             if let Some(w) = state.resources.window_mut(window) {
                 w.composite_named_pixmaps
                     .push(crate::resources::NamedCompositePixmap {
@@ -8026,7 +9804,18 @@ fn handle_mit_shm_request(
                 return Ok(RequestOutcome::Handled);
             };
             let byte_order = client.byte_order;
-            let reply = shm::encode_query_version_reply(byte_order, sequence, false);
+            // Xorg reports the server's effective uid/gid, stored in the
+            // 16-bit wire fields (truncating, as the C assignment does).
+            // SAFETY: geteuid/getegid take no arguments and cannot fail.
+            let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+            #[allow(clippy::cast_possible_truncation)]
+            let reply = shm::encode_query_version_reply(
+                byte_order,
+                sequence,
+                false,
+                euid as u16,
+                egid as u16,
+            );
             return Ok(write_to_client(client, client_id, &reply));
         }
         shm::ATTACH => {
@@ -9074,7 +10863,14 @@ fn handle_xtest_request(
                     header.opcode,
                 );
             };
-            let same = effective_window_cursor(state, window) == comparison;
+            // Xorg compares cursor objects: after XFIXES ChangeCursor two
+            // XIDs can name the same cursor, so compare their host handles.
+            let effective = effective_window_cursor(state, window);
+            let same = effective == comparison
+                || matches!((effective, comparison), (Some(a), Some(b))
+                    if state.resources.cursor_host_xid(a).is_some()
+                        && state.resources.cursor_host_xid(a)
+                            == state.resources.cursor_host_xid(b));
             debug!(
                 "client {} #{} XTEST::CompareCursor window=0x{:x} cursor=0x{:x} same={same}",
                 client_id.0, sequence.0, window.0, cursor.0,
@@ -9316,16 +11112,13 @@ fn dispatch_fake_input_with_body(
             );
         }
         x11xtest::FAKE_MOTION_NOTIFY => {
-            // detail==0 means absolute coords; detail==1 means relative.
-            // We only support absolute for now — relative needs the
-            // backend's current cursor position which isn't on the trait
-            // surface. xts does most motion as absolute.
-            if fi.detail != 0 {
-                log::debug!("XTEST FakeInput: relative MotionNotify not supported, dropping");
-                return;
-            }
-            backend.on_host_input(
-                state,
+            // detail 0 = absolute, detail 1 = relative (Xorg xtest.c: rootX/
+            // rootY become the valuators, POINTER_ABSOLUTE only for 0). A
+            // relative fake moves the sprite by the delta from its current
+            // position, unaccelerated (XTEST doesn't set POINTER_ACCELERATE);
+            // the backend clips to the screen. The delta also rides as the
+            // raw relative motion, so XI2 RawMotion reports it.
+            let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
@@ -9333,8 +11126,23 @@ fn dispatch_fake_input_with_body(
                     relative: false,
                     dx: 0,
                     dy: 0,
-                },
-            );
+                }
+            } else {
+                let (x, y) = state.pointer_root;
+                let (dx, dy) = (i32::from(fi.root_x), i32::from(fi.root_y));
+                HostInputEvent::PointerMotion {
+                    x: i32::from(x) + dx,
+                    y: i32::from(y) + dy,
+                    time: fi.time,
+                    relative: true,
+                    dx,
+                    dy,
+                }
+            };
+            backend.on_host_input(state, motion);
+            // Like WarpPointer: the physical-input tracker must continue
+            // from the faked position, or the next real motion jumps back.
+            backend.resync_input_position();
         }
         other => {
             log::debug!("XTEST FakeInput: unknown event type {other}, dropping");
@@ -9547,9 +11355,8 @@ pub(crate) fn emit_screen_saver_notify(
 
 /// Current idle value for an IDLETIME-family counter, expressed as
 /// milliseconds since `state.idletime_baseline(counter)`. Used by
-/// CREATE_ALARM, CHANGE_ALARM, and apply_alarm_attributes' Relative
-/// branch for resolving counter values that aren't stored in
-/// `state.sync_counters`.
+/// CREATE_ALARM / CHANGE_ALARM (Relative values, trigger checks) for
+/// counter values that aren't stored in `state.sync_counters`.
 pub(crate) fn idletime_current_idle(state: &ServerState, counter: u32) -> i64 {
     let baseline = state.idletime_baseline(counter);
     #[allow(clippy::cast_possible_truncation)]
@@ -9588,7 +11395,12 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
         return;
     }
     // Global IDLETIME: always reset on any input.
-    evaluate_alarms_for_counter(state, x11sync::IDLETIME_COUNTER, prior_global_idle_ms, 0);
+    crate::core_loop::sync_await::counter_changed(
+        state,
+        x11sync::IDLETIME_COUNTER,
+        prior_global_idle_ms,
+        0,
+    );
     state
         .idletime_last_evaluated
         .insert(x11sync::IDLETIME_COUNTER, 0);
@@ -9599,7 +11411,7 @@ pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
         3 => x11sync::IDLETIME_DEVICE_VCK,
         _ => return,
     };
-    evaluate_alarms_for_counter(state, device_counter, prior_device_idle_ms, 0);
+    crate::core_loop::sync_await::counter_changed(state, device_counter, prior_device_idle_ms, 0);
     state.idletime_last_evaluated.insert(device_counter, 0);
 }
 
@@ -10336,9 +12148,7 @@ fn supersede_covered_pending_presents(
                         "PRESENT supersede: trigger idle fence 0x{idle_fence_xid:x} failed: {e}"
                     );
                 }
-                if let Some(f) = state.sync_fences.get_mut(idle_fence_xid) {
-                    f.triggered = true;
-                }
+                crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
             }
             crate::backend::PresentWake::PixmapSynced {
                 release,
@@ -10461,8 +12271,9 @@ fn default_present_crtc_for_window(state: &ServerState, window: ResourceId) -> u
     for output in state.randr.enabled_outputs() {
         let output_x = i32::from(output.x);
         let output_y = i32::from(output.y);
-        let output_right = output_x.saturating_add(i32::from(output.width));
-        let output_bottom = output_y.saturating_add(i32::from(output.height));
+        let (footprint_w, footprint_h) = output.footprint();
+        let output_right = output_x.saturating_add(i32::from(footprint_w));
+        let output_bottom = output_y.saturating_add(i32::from(footprint_h));
         let width = window_right.min(output_right) - window_x.max(output_x);
         let height = window_bottom.min(output_bottom) - window_y.max(output_y);
         let area = if width > 0 && height > 0 {
@@ -10959,8 +12770,6 @@ fn execute_present_pixmap_copy(
         explicit_sync: matches!(req, PendingPresentRequest::PixmapSynced(_)),
         options: masked_options,
     };
-    backend.note_present_scanout_candidate(candidate);
-
     let completion = crate::backend::CompletedPresentEvent {
         client_id,
         serial,
@@ -10977,6 +12786,27 @@ fn execute_present_pixmap_copy(
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     };
+
+    if window_unviewable(state, ResourceId(window)) {
+        // Xorg: flip check fails on the empty clipList and the Copy clips to nothing,
+        // but idle and CompleteModeCopy are still delivered (present_execute.c:119-156).
+        if let Some(eff) = effective_target_msc {
+            state.present_complete_gate.insert(
+                present_id,
+                crate::server::PresentCompleteGate {
+                    crtc_id,
+                    crtc_epoch,
+                    msc_offset,
+                    effective_target_msc: eff,
+                    owner: client_id,
+                    dst_window_xid: window,
+                },
+            );
+        }
+        backend.enqueue_present_completion(completion, completion_dst_host_xid);
+        return Ok(());
+    }
+    backend.note_present_scanout_candidate(candidate);
 
     // M2b attempts direct ownership before recording the fallback Copy. The
     // completion gate must exist before the backend can own the page flip;
@@ -11147,9 +12977,7 @@ fn execute_present_pixmap_copy_or_reroute(
                              failed: {e}"
                         );
                     }
-                    if let Some(f) = state.sync_fences.get_mut(&idle_fence_xid) {
-                        f.triggered = true;
-                    }
+                    crate::core_loop::sync_await::fence_triggered(state, idle_fence_xid);
                 }
                 crate::backend::PresentWake::PixmapSynced {
                     release,
@@ -12732,9 +14560,8 @@ pub(crate) fn discard_stale_present_event(
     backend.signal_present_wake(event.present_id);
     if let crate::backend::PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        fence.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
 }
 
@@ -12788,9 +14615,8 @@ pub(crate) fn complete_present_with_clock(
     if emit_idle
         && let PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(f) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        f.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
     fire_present_completion_events_at(state, event, clock, mode, emit_idle, true);
 }
@@ -12808,9 +14634,8 @@ pub(crate) fn retire_present_idle(
     backend.signal_present_wake(event.present_id);
     if let PresentWake::Pixmap { idle_fence_xid } = &event.wake
         && *idle_fence_xid != 0
-        && let Some(fence) = state.sync_fences.get_mut(idle_fence_xid)
     {
-        fence.triggered = true;
+        crate::core_loop::sync_await::fence_triggered(state, *idle_fence_xid);
     }
     let clock = refresh_present_crtc_completion_clock(
         state,
@@ -13855,7 +15680,7 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     attribs.push((g::GLX_HEIGHT, height));
     attribs.push((g::GLX_SCREEN, 0));
     if let Some(d) = drawable {
-        attribs.push((g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_2D_EXT));
+        attribs.push((g::GLX_TEXTURE_TARGET_EXT, d.texture_target));
         attribs.push((g::GLX_EVENT_MASK, d.event_mask));
         attribs.push((g::GLX_FBCONFIG_ID, d.fbconfig));
         if d.kind == crate::server::GlxDrawableKind::Pbuffer {
@@ -14924,10 +16749,27 @@ fn handle_glx_request(
             );
         }
         x11glx::IS_DIRECT => {
-            // We always claim direct rendering; the actual GL execution
-            // happens client-side via libGLX_mesa hitting our DRI3
-            // backend.
-            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, true);
+            // Xorg answers the context's recorded isDirect and
+            // GLXBadContext for an XID that is not a context
+            // (glxcmds.c:702-726, glx/vnd_dispatch_stubs.c:509-525). Mesa's
+            // glXImportContextEXT sends this first and returns NULL for a
+            // direct context without ever sending QueryContext.
+            let context = match glx_request_context(state, body) {
+                Ok(context) => context,
+                Err((code, value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let is_direct = state.glx_contexts[&context].is_direct;
+            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, is_direct);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -14975,37 +16817,46 @@ fn handle_glx_request(
         x11glx::CREATE_CONTEXT
         | x11glx::CREATE_NEW_CONTEXT
         | x11glx::CREATE_CONTEXT_ATTRIBS_ARB => {
-            // Allocate a GlxContext resource keyed by the client-
-            // chosen XID at body[0..4]. The fbconfig at body[4..8]
-            // and renderType at body[8..12] are recorded for the
-            // eventual MakeCurrent reply but otherwise unused — we
-            // never execute server-side GL.
-            let xid = if body.len() >= 4 {
-                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
-            } else {
-                0
+            // Allocate a GlxContext resource keyed by the client-chosen
+            // XID. We never execute server-side GL; the recorded config,
+            // share list, render type and isDirect flag are what
+            // QueryContext / IsDirect report back (Xorg DoCreateContext
+            // stores the same fields, glxcmds.c:318-325).
+            let Some(req) = x11glx::parse_create_context(minor, body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
             };
-            let fbconfig = if body.len() >= 8 {
-                u32::from_le_bytes([body[4], body[5], body[6], body[7]])
-            } else {
-                0
-            };
-            let render_type = if body.len() >= 12 {
-                u32::from_le_bytes([body[8], body[9], body[10], body[11]])
-            } else {
-                0
+            let (visual_id, fbconfig) = match req.config {
+                x11glx::ContextConfigRef::Visual(visual) => {
+                    (visual, glx_visual_fbconfig(visual).unwrap_or(0))
+                }
+                x11glx::ContextConfigRef::FbConfig(fbconfig) => {
+                    (glx_fbconfig_visual(fbconfig), fbconfig)
+                }
             };
             state.glx_contexts.insert(
-                xid,
+                req.context,
                 crate::server::GlxContext {
                     owner: client_id,
+                    screen: req.screen,
+                    visual_id,
                     fbconfig,
-                    render_type,
+                    render_type: req.render_type,
+                    share_list: req.share_list,
+                    is_direct: req.is_direct,
                 },
             );
             debug!(
-                "client {} #{} GLX::CreateContext xid=0x{:x} fbconfig=0x{:x}",
-                client_id.0, sequence.0, xid, fbconfig
+                "client {} #{} GLX::CreateContext minor={minor} xid=0x{:x} fbconfig=0x{:x} \
+                 visual=0x{visual_id:x} share=0x{:x} direct={}",
+                client_id.0, sequence.0, req.context, fbconfig, req.share_list, req.is_direct
             );
         }
         x11glx::DESTROY_CONTEXT => {
@@ -15099,43 +16950,31 @@ fn handle_glx_request(
                     );
                 }
 
-                // For CREATE_PIXMAP: resolve the host_xid NOW and store it on
-                // the GlxDrawable so release is robust to the X pixmap being
-                // freed (X11 FreePixmap) before glXDestroyPixmap/disconnect —
-                // re-resolving x_drawable→host_xid at release time would fail
-                // once the resource is gone, leaking the export ref forever.
-                let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
-                    state
-                        .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
-                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+                if minor == x11glx::CREATE_PIXMAP {
+                    insert_glx_pixmap_record(
+                        state,
+                        backend,
+                        client_id,
+                        req.glx_window,
+                        req.x_window,
+                        req.fbconfig,
+                        x11glx::GLX_TEXTURE_2D_EXT,
+                    );
                 } else {
-                    None
-                };
-
-                state.glx_drawables.insert(
-                    req.glx_window,
-                    crate::server::GlxDrawable {
-                        owner: client_id,
-                        kind: if minor == x11glx::CREATE_PIXMAP {
-                            crate::server::GlxDrawableKind::Pixmap
-                        } else {
-                            crate::server::GlxDrawableKind::Window
+                    state.glx_drawables.insert(
+                        req.glx_window,
+                        crate::server::GlxDrawable {
+                            owner: client_id,
+                            kind: crate::server::GlxDrawableKind::Window,
+                            x_drawable: req.x_window,
+                            fbconfig: req.fbconfig,
+                            width: 0,
+                            height: 0,
+                            event_mask: 0,
+                            glx_export_host_xid: None,
+                            texture_target: x11glx::GLX_TEXTURE_2D_EXT,
                         },
-                        x_drawable: req.x_window,
-                        fbconfig: req.fbconfig,
-                        width: 0,
-                        height: 0,
-                        event_mask: 0,
-                        glx_export_host_xid: acquire_host_xid,
-                    },
-                );
-
-                // Acquire an export-lifetime ref on the backing so the
-                // ExportedBacking entry (and its dmabuf fd) outlives any early
-                // FreePixmap until glXDestroyPixmap.
-                if let Some(host_xid) = acquire_host_xid {
-                    backend.acquire_glx_pixmap_export(host_xid);
+                    );
                 }
 
                 debug!(
@@ -15169,6 +17008,7 @@ fn handle_glx_request(
                         height: req.height,
                         event_mask: 0,
                         glx_export_host_xid: None,
+                        texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
                     },
                 );
                 // #96 tier-2: back the pbuffer with a real GPU pixmap under its
@@ -15213,6 +17053,117 @@ fn handle_glx_request(
                     client_id.0, sequence.0
                 );
             }
+        }
+        x11glx::CREATE_GLX_PIXMAP => {
+            // GLX 1.0 glXCreateGLXPixmap: the visual-based counterpart of
+            // CreatePixmap. Checks run in Xorg's order — GLXVND's
+            // dispatch_CreateGLXPixmap (size, LEGAL_NEW_RESOURCE, screen →
+            // BadMatch; glx/vnd_dispatch_stubs.c:143-169), then
+            // __glXDisp_CreateGLXPixmap (visual → BadValue) and
+            // DoCreateGLXPixmap (dixLookupDrawable → BadDrawable, a window →
+            // BadPixmap; glxcmds.c:1198-1220, :1267-1280). Xorg compares
+            // neither the pixmap depth nor its visual with the config.
+            let glx_error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                )
+            };
+            let Some(req) = x11glx::parse_create_glx_pixmap(body) else {
+                return glx_error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let owned = state.clients.get(&client_id.0).is_some_and(|c| {
+                crate::server::IdAllocator::validate_owned(
+                    req.glx_pixmap,
+                    c.resource_id_base,
+                    c.resource_id_mask,
+                )
+            });
+            if !owned || state.xid_occupied(req.glx_pixmap) {
+                return glx_error(state, x11::error::BAD_ID_CHOICE, req.glx_pixmap);
+            }
+            // yserver has exactly one screen (screenInfo.numScreens == 1).
+            if req.screen != 0 {
+                return glx_error(state, x11::error::BAD_MATCH, req.screen);
+            }
+            let Some(fbconfig) = glx_visual_fbconfig(req.visual) else {
+                return glx_error(state, x11::error::BAD_VALUE, req.visual);
+            };
+            if state.resources.pixmap(ResourceId(req.pixmap)).is_none() {
+                let code = if state.resources.window(ResourceId(req.pixmap)).is_some() {
+                    x11::error::BAD_PIXMAP
+                } else {
+                    x11::error::BAD_DRAWABLE
+                };
+                return glx_error(state, code, req.pixmap);
+            }
+            // Xorg never runs determineTextureTarget for the GLX 1.0 form,
+            // so the target stays 0 and GetDrawableAttributes reports
+            // GLX_TEXTURE_RECTANGLE_EXT (glxcmds.c:1896-1897).
+            insert_glx_pixmap_record(
+                state,
+                backend,
+                client_id,
+                req.glx_pixmap,
+                req.pixmap,
+                fbconfig,
+                x11glx::GLX_TEXTURE_RECTANGLE_EXT,
+            );
+            debug!(
+                "client {} #{} GLX::CreateGLXPixmap glx_xid=0x{:x} x_pixmap=0x{:x} \
+                 visual=0x{:x} fbconfig=0x{fbconfig:x}",
+                client_id.0, sequence.0, req.glx_pixmap, req.pixmap, req.visual
+            );
+        }
+        x11glx::DESTROY_GLX_PIXMAP => {
+            // GLX 1.0 glXDestroyGLXPixmap. Only a live GLX pixmap — created
+            // by either CreateGLXPixmap or CreatePixmap, which Xorg keeps as
+            // the same GLX_DRAWABLE_PIXMAP type — may be destroyed; any other
+            // XID is GLXBadPixmap (glx/vnd_dispatch_stubs.c:189-205,
+            // glxcmds.c validGlxDrawable / DoDestroyDrawable).
+            let Some(xid) = x11glx::parse_single_xid(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            };
+            let is_glx_pixmap = state
+                .glx_drawables
+                .get(&xid)
+                .is_some_and(|d| d.kind == crate::server::GlxDrawableKind::Pixmap);
+            if !is_glx_pixmap {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    crate::nested::GLX_FIRST_ERROR + x11glx::ERROR_GLX_BAD_PIXMAP,
+                    xid,
+                    u16::from(minor),
+                    crate::nested::GLX_MAJOR_OPCODE,
+                );
+            }
+            // Release the export ref through the host xid stored at create
+            // time, never by re-resolving the X pixmap: it may already be
+            // freed (see the DESTROY_PIXMAP arm).
+            if let Some(record) = state.glx_drawables.remove(&xid)
+                && let Some(host_xid) = record.glx_export_host_xid
+            {
+                backend.release_glx_pixmap_export(host_xid);
+            }
+            debug!(
+                "client {} #{} GLX::DestroyGLXPixmap glx_xid=0x{xid:x}",
+                client_id.0, sequence.0
+            );
         }
         x11glx::DELETE_WINDOW | x11glx::DESTROY_PIXMAP | x11glx::DESTROY_PBUFFER => {
             let xid = if body.len() >= 4 {
@@ -15352,10 +17303,39 @@ fn handle_glx_request(
             );
         }
         x11glx::QUERY_CONTEXT => {
-            // Reply with zero attribs — Mesa direct-rendering doesn't
-            // act on what comes back here.
-            let reply = x11glx::encode_get_drawable_attributes_reply(byte_order, sequence, &[]);
-            debug!("client {} #{} GLX::QueryContext", client_id.0, sequence.0);
+            // GLX 1.3 QueryContext, the request behind
+            // glXImportContextEXT (GLX_EXT_import_context, which, like Xorg
+            // without +iglx, we do not advertise). Xorg's DoQueryContext reports five
+            // attributes, in this order, for a live context of ANY client
+            // (glxcmds.c:1659-1708); an XID that is not a context is
+            // GLXBadContext (glx/vnd_dispatch_stubs.c:492-508).
+            let context = match glx_request_context(state, body) {
+                Ok(context) => context,
+                Err((code, value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        value,
+                        u16::from(minor),
+                        crate::nested::GLX_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let ctx = &state.glx_contexts[&context];
+            let attribs = [
+                (x11glx::GLX_SHARE_CONTEXT_EXT, ctx.share_list),
+                (x11glx::GLX_VISUAL_ID, ctx.visual_id),
+                (x11glx::GLX_SCREEN, ctx.screen),
+                (x11glx::GLX_FBCONFIG_ID, ctx.fbconfig),
+                (x11glx::GLX_RENDER_TYPE, ctx.render_type),
+            ];
+            let reply = x11glx::encode_query_context_reply(byte_order, sequence, &attribs);
+            debug!(
+                "client {} #{} GLX::QueryContext 0x{context:x} -> {attribs:x?}",
+                client_id.0, sequence.0
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -15403,9 +17383,13 @@ fn handle_glx_request(
                         let host_xid_for_export = current_host_xid.or(stored_host_xid);
                         if let Some(current_host_xid) = current_host_xid
                             && stored_host_xid != Some(current_host_xid)
-                            && let Some(d_mut) = state.glx_drawables.get_mut(&glx_drawable)
                         {
-                            d_mut.glx_export_host_xid = Some(current_host_xid);
+                            retarget_glx_pixmap_export(
+                                state,
+                                backend,
+                                glx_drawable,
+                                current_host_xid,
+                            );
                         }
                         // Ensure the backing is promoted to exportable storage so
                         // indirect GL texture sampling can read live content.
@@ -15521,8 +17505,12 @@ fn handle_glx_request(
                             req.context,
                             crate::server::GlxContext {
                                 owner: client_id,
+                                screen: req.screen,
+                                visual_id: glx_fbconfig_visual(req.fbconfig),
                                 fbconfig: req.fbconfig,
                                 render_type: req.render_type,
+                                share_list: req.share_list,
+                                is_direct: req.is_direct,
                             },
                         );
                         debug!(
@@ -15574,30 +17562,15 @@ fn handle_glx_request(
                                 crate::nested::GLX_MAJOR_OPCODE,
                             );
                         }
-                        // Resolve host_xid at create time (same lifetime
-                        // semantics as CREATE_PIXMAP — see comment there).
-                        let acquire_host_xid = state
-                            .resources
-                            .pixmap(yserver_protocol::x11::ResourceId(req.pixmap))
-                            .and_then(|p| p.host_xid.map(|h| h.as_raw()));
-
-                        state.glx_drawables.insert(
+                        insert_glx_pixmap_record(
+                            state,
+                            backend,
+                            client_id,
                             req.glx_pixmap,
-                            crate::server::GlxDrawable {
-                                owner: client_id,
-                                kind: crate::server::GlxDrawableKind::Pixmap,
-                                x_drawable: req.pixmap,
-                                fbconfig: req.fbconfig,
-                                width: 0,
-                                height: 0,
-                                event_mask: 0,
-                                glx_export_host_xid: acquire_host_xid,
-                            },
+                            req.pixmap,
+                            req.fbconfig,
+                            x11glx::GLX_TEXTURE_2D_EXT,
                         );
-
-                        if let Some(host_xid) = acquire_host_xid {
-                            backend.acquire_glx_pixmap_export(host_xid);
-                        }
 
                         debug!(
                             "client {} #{} GLX::CreateGLXPixmapWithConfigSGIX \
@@ -15718,6 +17691,26 @@ const XI1_USE_X_KEYBOARD: u16 = 255;
 /// keyboard. Mirrors `crate::xinput::initial_xi_devices`.
 fn xi1_device_valid(id: u16) -> bool {
     (2..=5).contains(&id)
+}
+
+/// The virtual core pointer (2) and keyboard (3) are the masters.
+fn xi1_device_is_master(id: u16) -> bool {
+    matches!(id, 2 | 3)
+}
+
+/// `XI2LASTEVENT` for XI 2.4 (`XI_GestureSwipeEnd`, XI2.h).
+const XI2_LAST_EVENT: u32 = 32;
+
+/// Xorg `XICheckInvalidMaskBits` (Xi/xiselectev.c): the lowest set bit
+/// above [`XI2_LAST_EVENT`] in an XI2 event mask (a bit array, bit n in
+/// byte n/8), if any.
+fn xi2_first_invalid_mask_bit(mask: &[u8]) -> Option<u32> {
+    mask.iter().enumerate().find_map(|(i, &byte)| {
+        let first_bit = u32::try_from(i * 8).ok()?;
+        (0..8u32)
+            .map(|b| first_bit + b)
+            .find(|&bit| bit > XI2_LAST_EVENT && byte & (1 << (bit - first_bit)) != 0)
+    })
 }
 
 /// Keyboards (3, 5) carry a KeyClass; pointers don't.
@@ -15868,6 +17861,251 @@ fn xi1_send_extension_event_resolve_targets(
     std::collections::HashSet::new()
 }
 
+/// XIWarpPointer (XI 2.0 minor 41) — Xorg `ProcXIWarpPointer`
+/// (Xi/xiwarppointer.c): core WarpPointer for one device, with FP16.16
+/// coordinates. Only a master pointer or a floating slave may be warped;
+/// yserver's only candidate is the master pointer (2), whose sprite is the
+/// core one, so this runs the core warp path with the XI source-rectangle
+/// rule.
+fn handle_xi_warp_pointer(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    // Length is gated to exactly 9 units above, so the body is 32 bytes.
+    let u32_at = |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+    let fp1616_pixels = |o: usize| u32_at(o).cast_signed() / 65536;
+    let u16_at = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+    let deviceid = u16_at(28);
+    if deviceid != crate::xinput::DEVICEID_MASTER_POINTER {
+        return xi1_error(
+            state,
+            client_id,
+            sequence,
+            XI1_ERROR_BAD_DEVICE,
+            u32::from(deviceid),
+            41,
+        );
+    }
+    let req = WarpRequest {
+        src: ResourceId(u32_at(0)),
+        dst: ResourceId(u32_at(4)),
+        src_x: fp1616_pixels(8),
+        src_y: fp1616_pixels(12),
+        src_w: u16_at(16),
+        src_h: u16_at(18),
+        dst_x: fp1616_pixels(20),
+        dst_y: fp1616_pixels(24),
+    };
+    if let Some(bad) = warp_pointer_bad_window(state, &req) {
+        return xi1_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+    }
+    if warp_pointer_src_allows(state, &req, WarpSrcRule::XInput2) {
+        apply_pointer_warp(state, backend, origin, &req);
+    }
+    debug!(
+        "client {} #{} XIWarpPointer dst=0x{:x} ({}, {})",
+        client_id.0, sequence.0, req.dst.0, req.dst_x, req.dst_y
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// XISetFocus (XI 2.0 minor 49) — Xorg `ProcXISetFocus`
+/// (Xi/xisetdevfocus.c): `SetInputFocus(dev, focus, RevertToParent,
+/// time, followOK=TRUE)` on a device with a focus class, i.e. a keyboard.
+/// Pointers and unknown ids are BadDevice (Xorg sets no errorValue).
+///
+/// The master keyboard's focus is the core focus, so device 3 runs core
+/// SetInputFocus. The slave keyboard (5) keeps its own focus
+/// (`xi1_device_focus`, shared with XI1 SetDeviceFocus) and may follow
+/// the keyboard. FollowKeyboard on the master keyboard itself would make
+/// it follow itself: Xorg stores `FollowKeyboardWin` and then crashes
+/// dereferencing it (Xvfb 21.1.24 segfaults at address 0x7), so yserver
+/// answers BadValue instead.
+fn handle_xi_set_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use crate::core_loop::xi1_focus;
+    const MINOR: u8 = 49;
+    // Length is gated to at least 4 units above.
+    let focus = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let req_time = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let deviceid = u16::from_le_bytes([body[8], body[9]]);
+    if !xi1_device_has_keys(deviceid) {
+        return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, MINOR);
+    }
+    let revert_to = xi1_focus::REVERT_TO_PARENT;
+    if deviceid == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+        if focus == xi1_focus::FOCUS_FOLLOW_KEYBOARD {
+            return xi1_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                focus,
+                MINOR,
+            );
+        }
+        if let Some((code, value)) = core_focus_window_error(state, ResourceId(focus)) {
+            return xi1_error(state, client_id, sequence, code, value, MINOR);
+        }
+        apply_core_input_focus(
+            state,
+            client_id,
+            sequence,
+            ResourceId(focus),
+            revert_to,
+            req_time,
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    if focus != xi1_focus::FOCUS_FOLLOW_KEYBOARD
+        && let Some((code, value)) = core_focus_window_error(state, ResourceId(focus))
+    {
+        return xi1_error(state, client_id, sequence, code, value, MINOR);
+    }
+    // Timestamp gate (dix/events.c:4920-4922), as XI1 SetDeviceFocus.
+    let now = state.timestamp_now();
+    let time = if req_time == 0 { now } else { req_time };
+    let prev = xi1_focus::device_focus(state, deviceid);
+    if xi1_focus::time_after(time, now) || xi1_focus::time_after(prev.time, time) {
+        debug!(
+            "client {} #{} XISetFocus device={deviceid} stale time {time} \
+             (now={now} last={}) — ignored",
+            client_id.0, sequence.0, prev.time
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+    xi1_focus::set_device_focus(state, deviceid, focus, revert_to, time);
+    debug!(
+        "client {} #{} XISetFocus device={deviceid} focus=0x{focus:x}",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// XIChangeHierarchy (XI 2.0 minor 43) — Xorg `ProcXIChangeHierarchy`
+/// (Xi/xichangehierarchy.c) over yserver's fixed device set: masters 2/3
+/// (the virtual core pair) and one fixed slave each (4/5).
+///
+/// The change list is walked exactly as Xorg walks it — same length
+/// checks, unknown change types skipped, processing stops at the first
+/// failing change — and every change gets the answer Xorg gives for the
+/// same devices:
+/// - RemoveMaster: return_mode must be Float/AttachToMaster (BadValue);
+///   the virtual core pair can never be removed (BadDevice), and a slave
+///   is not a master (BadDevice, errorValue = id).
+/// - AttachSlave / DetachSlave: masters are BadDevice (errorValue = id);
+///   yserver's slaves are fixed, which Xorg answers for its own fixed
+///   slaves (the XTest devices, ids 4/5 on Xvfb) with BadDevice,
+///   errorValue = id.
+/// - AddMaster: Xorg creates a new pair; yserver can't add devices, so it
+///   gives Xorg's answer when no device can be allocated (BadAlloc).
+///
+/// Unknown device ids are BadDevice with errorValue 0 (dixLookupDevice
+/// sets none). No change ever succeeds, so no HierarchyChanged event is
+/// sent. The change records are opaque to the request swapper and are
+/// read in the client's byte order (Xorg swaps only type/length/name_len
+/// and reads the device ids unswapped — for a big-endian client on a
+/// little-endian server that only changes the errorValue of the same
+/// BadDevice error).
+fn handle_xi_change_hierarchy(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    const MINOR: u8 = 43;
+    const ADD_MASTER: u16 = 1;
+    const REMOVE_MASTER: u16 = 2;
+    const ATTACH_SLAVE: u16 = 3;
+    const DETACH_SLAVE: u16 = 4;
+    const ATTACH_TO_MASTER: u8 = 1;
+    const FLOATING: u8 = 2;
+    let rd16 = |o: usize| {
+        let b = [body[o], body[o + 1]];
+        match byte_order {
+            ClientByteOrder::LittleEndian => u16::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u16::from_be_bytes(b),
+        }
+    };
+    let fail = |state: &mut ServerState, code: u8, value: u32| {
+        xi1_error(state, client_id, sequence, code, value, MINOR)
+    };
+    // Length is gated to at least 2 units above: num_changes + pad.
+    let num_changes = body[0];
+    let mut pos = 4usize;
+    for _ in 0..num_changes {
+        let len = body.len() - pos;
+        if len < 4 {
+            return fail(state, x11::error::BAD_LENGTH, 0);
+        }
+        let change_type = rd16(pos);
+        let change_bytes = usize::from(rd16(pos + 2)) * 4;
+        if len < change_bytes {
+            return fail(state, x11::error::BAD_LENGTH, 0);
+        }
+        // CHANGE_SIZE_MATCH: fixed-size records must state their own size.
+        let size_matches = |size: usize| len >= size && change_bytes == size;
+        match change_type {
+            ADD_MASTER => {
+                if len < 8 || usize::from(rd16(pos + 4)) > len - 8 {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                return fail(state, x11::error::BAD_ALLOC, 0);
+            }
+            REMOVE_MASTER => {
+                if !size_matches(12) {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                let return_mode = body[pos + 6];
+                if return_mode != ATTACH_TO_MASTER && return_mode != FLOATING {
+                    return fail(state, x11::error::BAD_VALUE, 0);
+                }
+                let deviceid = rd16(pos + 4);
+                // A slave is "not a master" (errorValue = id); the virtual
+                // core pair can't be removed and unknown ids don't exist
+                // (Xorg sets no errorValue for either).
+                let value = if xi1_device_valid(deviceid) && !xi1_device_is_master(deviceid) {
+                    u32::from(deviceid)
+                } else {
+                    0
+                };
+                return fail(state, XI1_ERROR_BAD_DEVICE, value);
+            }
+            ATTACH_SLAVE | DETACH_SLAVE => {
+                if !size_matches(8) {
+                    return fail(state, x11::error::BAD_LENGTH, 0);
+                }
+                let deviceid = rd16(pos + 4);
+                // Masters and the fixed slaves report their id; unknown
+                // ids report 0.
+                let value = if xi1_device_valid(deviceid) {
+                    u32::from(deviceid)
+                } else {
+                    0
+                };
+                return fail(state, XI1_ERROR_BAD_DEVICE, value);
+            }
+            _ => {}
+        }
+        pos += change_bytes;
+    }
+    debug!(
+        "client {} #{} XIChangeHierarchy: {num_changes} change(s), nothing to do",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
 fn handle_xi2_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -15920,14 +18158,32 @@ fn handle_xi2_request(
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     match minor {
         1 => {
-            // XI GetExtensionVersion
+            // XI GetExtensionVersion, as Xorg's ProcXGetExtensionVersion
+            // (Xi/getvers.c): the length must match `nbytes`, and the reply
+            // is the server's XI version (XIVersion, 2.4) with RepType =
+            // X_GetExtensionVersion. libXi reads this version to decide
+            // whether XI 2.2 fields (a raw event's sourceid) are valid.
             debug!(
                 "client {} #{} XIGetExtensionVersion",
                 client_id.0, sequence.0
             );
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+            let nbytes = body
+                .get(0..2)
+                .map_or(0, |b| usize::from(u16::from_le_bytes([b[0], b[1]])));
+            if usize::try_from(header.length_units).ok() != Some((8 + nbytes).div_ceil(4)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    1,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let mut reply = x11::fixed_reply(byte_order, sequence, 1, 0);
+            x11::write_u16(byte_order, &mut reply, XI2_SERVER_MAJOR_VERSION);
+            x11::write_u16(byte_order, &mut reply, XI2_SERVER_MINOR_VERSION);
             reply.push(1);
             reply.extend_from_slice(&[0; 19]);
             buf.extend_from_slice(&reply);
@@ -16028,29 +18284,45 @@ fn handle_xi2_request(
             if body.len() >= 8 {
                 let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                 let num_masks = u16::from_le_bytes([body[4], body[5]]) as usize;
+                // Xorg ProcXISelectEvents checks every mask before
+                // setting any, so a rejected request changes nothing.
+                let mut masks: Vec<(u16, u64)> = Vec::with_capacity(num_masks);
                 let mut pos = 8;
+                for _ in 0..num_masks {
+                    if pos + 4 > body.len() {
+                        break;
+                    }
+                    let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
+                    let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
+                    pos += 4;
+                    let byte_len = mask_len.saturating_mul(4);
+                    if pos + byte_len > body.len() {
+                        break;
+                    }
+                    let mask_bytes = &body[pos..pos + byte_len];
+                    // XICheckInvalidMaskBits: a bit past XI2LASTEVENT is
+                    // BadValue with the bit number as errorValue.
+                    if let Some(bit) = xi2_first_invalid_mask_bit(mask_bytes) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            bit,
+                            46,
+                            header.opcode,
+                        );
+                    }
+                    // The mask is a bit array (bit n in byte n/8), so the
+                    // bytes are little-endian whatever the client order.
+                    let mut word = [0u8; 8];
+                    let keep = byte_len.min(8);
+                    word[..keep].copy_from_slice(&mask_bytes[..keep]);
+                    masks.push((deviceid, u64::from_le_bytes(word)));
+                    pos += byte_len;
+                }
                 if let Some(client) = state.clients.get_mut(&client_id.0) {
-                    for _ in 0..num_masks {
-                        if pos + 4 > body.len() {
-                            break;
-                        }
-                        let deviceid = u16::from_le_bytes([body[pos], body[pos + 1]]);
-                        let mask_len = u16::from_le_bytes([body[pos + 2], body[pos + 3]]) as usize;
-                        pos += 4;
-                        let byte_len = mask_len.saturating_mul(4);
-                        if pos + byte_len > body.len() {
-                            break;
-                        }
-                        let mask = if mask_len > 0 {
-                            u32::from_le_bytes([
-                                body[pos],
-                                body[pos + 1],
-                                body[pos + 2],
-                                body[pos + 3],
-                            ])
-                        } else {
-                            0
-                        };
+                    for (deviceid, mask) in masks {
                         debug!(
                             "client {} XISelectEvents window=0x{:x} deviceid={} mask=0x{:x}",
                             client_id.0, window.0, deviceid, mask
@@ -16061,12 +18333,11 @@ fn handle_xi2_request(
                             client.xi2_masks.insert((window, deviceid), mask);
                             if window == ROOT_WINDOW
                                 && matches!(deviceid, 0..=2)
-                                && (mask & XI2_DEVICE_CHANGED_MASK) != 0
+                                && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
                             {
                                 send_device_changed_bootstrap = true;
                             }
                         }
-                        pos += byte_len;
                     }
                 }
             }
@@ -16110,6 +18381,7 @@ fn handle_xi2_request(
             } else {
                 (XI2_SERVER_MAJOR_VERSION, XI2_SERVER_MINOR_VERSION)
             };
+            record_xi2_client_version(state, client_id, (reply_major, reply_minor));
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             x11::write_u16(byte_order, &mut reply, reply_major);
             x11::write_u16(byte_order, &mut reply, reply_minor);
@@ -16681,24 +18953,39 @@ fn handle_xi2_request(
                 return Ok(RequestOutcome::Handled);
             }
             let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+            // Xorg ProcXIGetSelectedEvents: one xXIEventMask per device
+            // in device-id order, each trimmed to the words that hold set
+            // bits. deviceid/mask_len follow the client byte order; the
+            // mask itself is a bit array (bit n in byte n/8), written as
+            // little-endian bytes for every client.
+            let mut selected: Vec<(u16, u64)> = state
+                .clients
+                .get(&client_id.0)
+                .map(|client| {
+                    client
+                        .xi2_masks
+                        .iter()
+                        .filter(|&(&(win, _), &mask)| win == window && mask != 0)
+                        .map(|(&(_, dev), &mask)| (dev, mask))
+                        .collect()
+                })
+                .unwrap_or_default();
+            selected.sort_unstable_by_key(|&(dev, _)| dev);
             let mut masks = Vec::new();
-            if let Some(client) = state.clients.get(&client_id.0) {
-                for (&(win, dev), &mask) in &client.xi2_masks {
-                    if win == window {
-                        x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, dev);
-                        x11::write_u16(ClientByteOrder::LittleEndian, &mut masks, 1);
-                        x11::write_u32(ClientByteOrder::LittleEndian, &mut masks, mask);
-                    }
-                }
+            for &(dev, mask) in &selected {
+                let mask_len: u16 = if mask >> 32 == 0 { 1 } else { 2 };
+                x11::write_u16(byte_order, &mut masks, dev);
+                x11::write_u16(byte_order, &mut masks, mask_len);
+                masks.extend_from_slice(&mask.to_le_bytes()[..4 * usize::from(mask_len)]);
             }
-            let num_masks = (masks.len() / 8) as u16;
+            let num_masks = u16::try_from(selected.len()).unwrap_or(u16::MAX);
             let mut reply = x11::fixed_reply(
                 byte_order,
                 sequence,
                 0,
                 x11::checked_units(masks.len())? as u32,
             );
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, num_masks);
+            x11::write_u16(byte_order, &mut reply, num_masks);
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&masks);
             buf.extend_from_slice(&reply);
@@ -16874,6 +19161,14 @@ fn handle_xi2_request(
             } else {
                 (0, 0, 0, 0, false)
             };
+            // First word of the grab's event mask (mask_len at body[18..20],
+            // mask words from body[20]) — event types 0..=31.
+            let grab_xi2_mask = match body.get(18..24) {
+                Some(b) if u16::from_le_bytes([b[0], b[1]]) > 0 => {
+                    u32::from_le_bytes([b[2], b[3], b[4], b[5]])
+                }
+                _ => 0,
+            };
             // Xorg `dix/events.c:5240` (GrabDevice): a device already
             // grabbed by ANOTHER client → AlreadyGrabbed(1); do NOT
             // overwrite the grab. Same-client re-grab still replaces
@@ -16931,6 +19226,7 @@ fn handle_xi2_request(
                         source: crate::server::ActiveKeyboardGrabSource::Explicit,
                         owner_events,
                         via_xi2: true,
+                        xi2_mask: grab_xi2_mask,
                     });
                 } else {
                     state.set_pointer_grab(crate::server::ActivePointerGrab {
@@ -16943,7 +19239,7 @@ fn handle_xi2_request(
                         via_xi2: true,
                         implicit: false,
                         passive: false,
-                        xi2_mask: u32::MAX,
+                        xi2_mask: u64::MAX,
                     });
                 }
                 // Core↔XI bridge — Xorg `ActivateKeyboardGrab` /
@@ -17032,6 +19328,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -17052,6 +19350,7 @@ fn handle_xi2_request(
                                 1, // mode = NotifyGrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -17193,6 +19492,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -17213,6 +19514,7 @@ fn handle_xi2_request(
                                 2, // mode = NotifyUngrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -17325,6 +19627,13 @@ fn handle_xi2_request(
             // Modifiers tail starts after the header (28) and the mask
             // (mask_len * 4 bytes).
             let mods_start = 28 + mask_len * 4;
+            // First mask word: event types 0..=31.
+            let grab_xi2_mask = if mask_len > 0 {
+                body.get(28..32)
+                    .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            } else {
+                0
+            };
             let mut modifier_masks: Vec<u16> = Vec::with_capacity(num_modifiers.max(1).into());
             if num_modifiers == 0 {
                 // "no modifiers" — single grab with modifier-mask 0.
@@ -17389,6 +19698,7 @@ fn handle_xi2_request(
                             pointer_mode: paired_device_mode,
                             keyboard_mode: grab_mode,
                             via_xi2: true,
+                            xi2_mask: grab_xi2_mask,
                         });
                     }
                 }
@@ -19219,6 +21529,14 @@ fn handle_xi2_request(
                                 crate::server::QueuedInputEvent::HostKey(event) => {
                                     let _ = replay_frozen_key_to_focus(state, event);
                                 }
+                                // Only a device event activates a grab, so
+                                // the stored slot never holds a raw event;
+                                // processing one is plain master delivery.
+                                crate::server::QueuedInputEvent::RawKey(event) => {
+                                    let _ = crate::core_loop::key_fanout::deliver_raw_key_master(
+                                        state, event,
+                                    );
+                                }
                             }
                         }
                         let xid_map = backend.xid_map().clone();
@@ -19711,7 +22029,36 @@ fn handle_xi2_request(
             // Without this the round-trip silently dropped the change
             // (XTS XChangeDeviceKeyMapping-3).
             let kpk = *body.get(2).unwrap_or(&0);
-            store_keymap_overrides(state, first, kpk, count, &body[4.min(body.len())..]);
+            // Xorg XkbApplyMappingChange changes and notifies nothing for
+            // zero keys.
+            let xkb_change = if count == 0 {
+                None
+            } else {
+                apply_keymap_change(
+                    state,
+                    backend,
+                    first,
+                    kpk,
+                    count,
+                    &body[4.min(body.len())..],
+                )
+            };
+            // Same XKB notifications as the core request (Xorg: both reach
+            // XkbApplyMappingChange): MapNotify first, ControlsNotify last.
+            let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+            if let Some(change) = &xkb_change {
+                crate::core_loop::xkb_layout::send_xkb_map_notify(
+                    state,
+                    xkb_event_base,
+                    change.map_notify,
+                );
+            }
+            // The core MappingNotify only when the master keyboard changed
+            // (Xorg XkbSendLegacyMapNotify → XIShouldNotify), as for
+            // SetDeviceModifierMapping.
+            if count != 0 && dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+                legacy_keyboard_mapping_notify(state, xkb_change.as_ref(), first, count);
+            }
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -19734,8 +22081,21 @@ fn handle_xi2_request(
                 );
             }
             crate::core_loop::xi1_focus::emit_device_mapping_notify(
-                state, client_id, dev, 1, first, count,
+                state,
+                Some(client_id),
+                dev,
+                1,
+                first,
+                count,
             );
+            if let Some(change) = &xkb_change {
+                crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+                    state,
+                    xkb_event_base,
+                    change,
+                    (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
+                );
+            }
             debug!(
                 "client {} #{} XI1 ChangeDeviceKeyMapping device={dev}",
                 client_id.0, sequence.0
@@ -19786,7 +22146,8 @@ fn handle_xi2_request(
                 });
             debug_assert_eq!(keycodes.len(), 8 * usize::from(kpm));
             let length_words = u32::from(kpm) * 2; // 8*kpm bytes / 4
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, length_words);
+            // Byte 1 = RepType = X_GetDeviceModifierMapping (Xi/getmmap.c).
+            let mut reply = x11::fixed_reply(byte_order, sequence, minor, length_words);
             reply.push(kpm); // byte 8: numKeyPerModifier
             reply.extend_from_slice(&[0u8; 23]); // bytes 9..=31: pad
             reply.extend_from_slice(&keycodes);
@@ -19814,51 +22175,80 @@ fn handle_xi2_request(
             if !xi1_device_has_keys(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            // Xorg `BadDeviceMap` rejects any keycode outside
-            // `[min_keycode, max_keycode]` UNLESS it's the special
-            // `0` sentinel (slot has no key). xts5
-            // SetDeviceModifierMapping-8 probes both MinKeyCode-1
-            // and MaxKeyCode+1 expecting BadValue.
             let need = 8usize * usize::from(kpm);
             let keycodes: Vec<u8> = (0..need).filter_map(|i| body.get(4 + i).copied()).collect();
             if keycodes.len() != need {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, minor);
             }
-            for &kc in &keycodes {
-                if kc != 0 && !(XI1_KEY_MIN..=XI1_KEY_MAX).contains(&kc) {
+            // Xorg ProcXSetDeviceModifierMapping → change_modmap, the core
+            // request's path: a keycode outside the keycode range (xts5
+            // SetDeviceModifierMapping-8 probes MinKeyCode-1) or listed
+            // twice is BadValue; a held modifier key is MappingBusy.
+            // Busy changed nothing and notifies nothing (Xi/setmmap.c). On
+            // success the DeviceMappingNotify goes out before the XKB and
+            // core notifications: to the requester (xts5 does
+            // `Expect_Event` then `Expect_Reply`, so ahead of the reply too)
+            // and to every other client that selected it.
+            // request_kind=0 = MappingModifier.
+            let notify_device = |state: &mut ServerState| {
+                if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+                    state, client_id, dev,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    let _dropped =
+                        fanout_event_to_clients(state, &[client_id], |buf, seq, order| {
+                            crate::xinput::encode_xi1_device_mapping_notify(
+                                buf,
+                                order,
+                                crate::server::XI_FIRST_EVENT
+                                    + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                                device_byte,
+                                seq,
+                                time,
+                                0,
+                                0,
+                                0,
+                            );
+                        });
+                }
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state,
+                    Some(client_id),
+                    dev,
+                    0,
+                    0,
+                    0,
+                );
+            };
+            let status = match change_modifier_mapping(
+                state,
+                backend,
+                origin,
+                kpm,
+                &keycodes,
+                Some(dev),
+                notify_device,
+            ) {
+                ModmapChangeOutcome::Success => 0,
+                ModmapChangeOutcome::Busy => 1,
+                ModmapChangeOutcome::BadValue(value) => {
                     return xi1_error(
                         state,
                         client_id,
                         sequence,
                         x11::error::BAD_VALUE,
-                        u32::from(kc),
+                        value,
                         minor,
                     );
                 }
-            }
-            state.xi1_modifier_map.insert(dev, (kpm, keycodes));
-            // xts5 does `Expect_Event` then `Expect_Reply`, so emit
-            // event BEFORE the reply. request_kind=0 = MappingModifier.
-            if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
-                state, client_id, dev,
-            ) {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
-                    0,
-                    0,
-                    0,
-                );
-            }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 0, 0, 0);
+            };
+            // xSetDeviceModifierMappingReply: RepType @1, success @8.
+            let mut reply = x11::fixed_reply(byte_order, sequence, minor, 0);
+            reply.push(status);
+            reply.extend_from_slice(&[0u8; 23]);
+            buf.extend_from_slice(&reply);
         }
         // GetDeviceButtonMapping: { deviceid }. Real reply: the 7-button
         // identity map the device advertises in ListInputDevices — the
@@ -19984,7 +22374,14 @@ fn handle_xi2_request(
                     0,
                 );
             }
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 2, 0, 0);
+            crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                state,
+                Some(client_id),
+                dev,
+                2,
+                0,
+                0,
+            );
         }
         // QueryDeviceState: { deviceid }. Snapshot of the device's
         // key / button / valuator state (Xorg Xi/queryst.c) — the same
@@ -20581,32 +22978,32 @@ fn handle_xi2_request(
         }
         50 => {
             // XIGetFocus { deviceid:CARD16 } -> xXIGetFocusReply
-            // { focus:WINDOW @8, 20 bytes pad }. Returns the raw stored
-            // per-device focus (None=0 / PointerRoot=1 / window), the same
-            // source XI1 GetDeviceFocus (minor 20) reads; Xorg
-            // (Xi/xifocus.c) doesn't resolve the sentinel here either.
+            // { focus:WINDOW @8, 20 bytes pad }. Xorg ProcXIGetFocus
+            // (Xi/xisetdevfocus.c) reports the device's raw focus (None=0 /
+            // PointerRoot=1 / FollowKeyboard=3 / window) without resolving
+            // the sentinels. Only keyboards have a focus class; pointers
+            // and unknown ids are BadDevice with no errorValue. The master
+            // keyboard's focus is the core focus; the slave keyboard's is
+            // its own (shared with XI1 GetDeviceFocus).
             let dev = if body.len() >= 2 {
                 u16::from_le_bytes([body[0], body[1]])
             } else {
                 0
             };
-            if !xi1_device_valid(dev) {
-                return xi1_error(
-                    state,
-                    client_id,
-                    sequence,
-                    XI1_ERROR_BAD_DEVICE,
-                    u32::from(dev),
-                    minor,
-                );
+            if !xi1_device_has_keys(dev) {
+                return xi1_error(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, 0, minor);
             }
-            let f = crate::core_loop::xi1_focus::device_focus(state, dev);
+            let focus = if dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+                state.core_focus.raw
+            } else {
+                crate::core_loop::xi1_focus::device_focus(state, dev).focus
+            };
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u32(byte_order, &mut reply, f.focus); // bytes 8-11
+            x11::write_u32(byte_order, &mut reply, focus); // bytes 8-11
             reply.extend_from_slice(&[0u8; 20]); // bytes 12-31 pad
             debug!(
-                "client {} #{} XIGetFocus device={dev} -> focus=0x{:x}",
-                client_id.0, sequence.0, f.focus
+                "client {} #{} XIGetFocus device={dev} -> focus=0x{focus:x}",
+                client_id.0, sequence.0
             );
             buf.extend_from_slice(&reply);
         }
@@ -20652,7 +23049,17 @@ fn handle_xi2_request(
                 }
             }
         }
-        _ if minor == 0 || minor > XINPUT_LAST_REQUEST => {
+        41 => {
+            return handle_xi_warp_pointer(state, backend, origin, client_id, sequence, body);
+        }
+        43 => {
+            return handle_xi_change_hierarchy(state, client_id, sequence, byte_order, body);
+        }
+        49 => return handle_xi_set_focus(state, client_id, sequence, body),
+        // Every minor in 1..=XINPUT_LAST_REQUEST has an arm above; like
+        // Xorg's ProcIDispatch, anything else is BadRequest.
+        _ => {
+            debug_assert!(minor == 0 || minor > XINPUT_LAST_REQUEST);
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -20662,13 +23069,6 @@ fn handle_xi2_request(
                 u16::from(minor),
                 header.opcode,
             );
-        }
-        _ => {
-            debug!(
-                "client {} #{} known unsupported XI request minor={}",
-                client_id.0, sequence.0, minor
-            );
-            return Ok(RequestOutcome::Handled);
         }
     }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -20704,25 +23104,101 @@ fn handle_xkb_request(
         "client {} #{} XkbProxy minor={}",
         client_id.0, sequence.0, minor
     );
-    if minor == 1 && body.len() >= 12 {
-        let device_spec = u16::from_le_bytes([body[0], body[1]]);
-        let affect_which = u16::from_le_bytes([body[2], body[3]]);
-        let clear = u16::from_le_bytes([body[4], body[5]]);
-        let old = state
-            .xkb_select_event_masks
-            .get(&(client_id.0, device_spec))
-            .copied()
-            .unwrap_or(0);
-        let new_mask = crate::core_loop::xkb_layout::xkb_select_merge(old, affect_which, clear);
-        if new_mask == 0 {
-            state
-                .xkb_select_event_masks
-                .remove(&(client_id.0, device_spec));
-        } else {
-            state
-                .xkb_select_event_masks
-                .insert((client_id.0, device_spec), new_mask);
+    // Xorg's per-request order: the request size (REQUEST_AT_LEAST_SIZE,
+    // for the handlers ported so far), then BadAccess for a client that
+    // hasn't called XkbUseExtension (every XKB request but UseExtension).
+    let min_body = match minor {
+        X_KB_SELECT_EVENTS => 12,
+        X_KB_SET_MAP => 32,
+        X_KB_SET_COMPAT_MAP => 12,
+        X_KB_SET_INDICATOR_MAP => 8,
+        X_KB_SET_NAMES | X_KB_SET_GEOMETRY => 24,
+        _ => 0,
+    };
+    if body.len() < min_body {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    if minor != X_KB_USE_EXTENSION
+        && !crate::core_loop::xkb_select::xkb_initialized(state, client_id)
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ACCESS,
+            0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(x11::ClientByteOrder::LittleEndian, |c| c.byte_order);
+    if minor == X_KB_USE_EXTENSION {
+        // Whether the client is supported is the core loop's decision (it
+        // tracks the client's XKB state), and so is the reply, which must
+        // be in the client's byte order. The backend still sees the request:
+        // a nested backend initialises XKB on its host connection with it.
+        let supported = crate::core_loop::xkb_select::use_extension(state, client_id, body);
+        let _backend_reply = {
+            let atoms = &mut state.atoms;
+            let mut intern = |name: &str| atoms.intern(name, false).0;
+            backend.xkb_proxy(origin, minor, body, &mut intern)
+        };
+        let Some(client) = state.clients.get_mut(&client_id.0) else {
+            return Ok(RequestOutcome::Handled);
+        };
+        let mut buf = Vec::with_capacity(32);
+        x11::write_xkb_use_extension_reply(&mut buf, byte_order, sequence, supported)?;
+        return Ok(write_to_client(client, client_id, &buf));
+    }
+    // SelectEvents is applied here; on success the request still reaches
+    // the backend (a nested backend forwards it to its host).
+    if minor == X_KB_SELECT_EVENTS
+        && let Err((code, value)) =
+            crate::core_loop::xkb_select::select_events(state, client_id, body)
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    // The Set* requests the backend's keyboard description implements (a
+    // port of Xorg's handler): its events, then its error.
+    let ancient = crate::core_loop::xkb_select::xkb_ancient(state, client_id);
+    let set_outcome = {
+        let atoms = &state.atoms;
+        let atom_name = |atom: u32| atoms.name(x11::AtomId(atom)).map(str::to_owned);
+        backend.xkb_set(minor, body, ancient, &atom_name)
+    };
+    if let Some(outcome) = set_outcome {
+        send_xkb_set_events(state, &*backend, header.opcode, minor, &outcome.events);
+        if let Some((code, value)) = outcome.error {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(minor),
+                header.opcode,
+            );
         }
+        return Ok(RequestOutcome::Handled);
     }
     // XkbLatchLockState (minor 5): a group lock switches the authoritative
     // keyboard group and broadcasts XkbStateNotify to subscribed clients.
@@ -20778,9 +23254,7 @@ fn handle_xkb_request(
             backend.xkb_get_kbd_by_name(body, &mut intern)
         };
         if let Some((mut bytes, notify)) = kbn {
-            if bytes.len() >= 4 {
-                bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
-            }
+            stamp_reply_sequence(&mut bytes, byte_order, sequence);
             // Broadcast NewKeyboardNotify on a successful load, BEFORE writing
             // the reply (Xorg order is reply-then-notify, but the notify fans
             // out to a different client set; ordering across clients is
@@ -20867,16 +23341,130 @@ fn handle_xkb_request(
             .flatten()
     };
     if let Some(mut bytes) = reply {
-        if bytes.len() >= 4 {
-            bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+        stamp_reply_sequence(&mut bytes, byte_order, sequence);
+        // GetControls: the per-key repeat is the core keyboard feedback's
+        // (Xorg keeps XKB `per_key_repeat` and `autoRepeats` in sync), which
+        // lives here, not in the backend.
+        if minor == 6 && bytes.len() >= 92 {
+            bytes[60..92].copy_from_slice(&state.keyboard_control.auto_repeats);
         }
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
         };
-        let _byte_order = client.byte_order;
         return Ok(write_to_client(client, client_id, &bytes));
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Write `sequence` into bytes 2..4 of a reply a backend built, in the
+/// client's byte order.
+fn stamp_reply_sequence(
+    bytes: &mut [u8],
+    byte_order: x11::ClientByteOrder,
+    sequence: SequenceNumber,
+) {
+    if let Some(field) = bytes.get_mut(2..4) {
+        field.copy_from_slice(&match byte_order {
+            x11::ClientByteOrder::LittleEndian => sequence.0.to_le_bytes(),
+            x11::ClientByteOrder::BigEndian => sequence.0.to_be_bytes(),
+        });
+    }
+}
+
+/// Send what an XKB Set* request did, in Xorg's order: each
+/// `XkbSendNewKeyboardNotify` / `XkbSendNotification` with its legacy core
+/// MappingNotify, the per-key repeat re-derivation copied to the core
+/// keyboard feedback, `_XkbSetCompatMap`'s CompatMapNotify and
+/// `XkbApplyLedMapChanges`' indicator notifications. `major`/`minor` are the
+/// request's (the events' cause).
+fn send_xkb_set_events(
+    state: &mut ServerState,
+    backend: &dyn Backend,
+    major: u8,
+    minor: u8,
+    events: &[crate::backend::XkbSetEvent],
+) {
+    use crate::{
+        backend::XkbSetEvent,
+        core_loop::xkb_select::{self, LegacyCause},
+    };
+    let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    for event in events {
+        match event {
+            XkbSetEvent::NewKeyboard(info) => {
+                let recipients = xkb_select::new_keyboard_recipients(state, info.changed);
+                let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+                    let _ = x11::write_xkb_new_keyboard_notify(
+                        buf,
+                        order,
+                        seq,
+                        base,
+                        1,
+                        info.min_keycode,
+                        info.max_keycode,
+                        info.old_min_keycode,
+                        info.old_max_keycode,
+                        major,
+                        minor,
+                        info.changed,
+                    );
+                });
+                let num = info
+                    .max_keycode
+                    .wrapping_sub(info.min_keycode)
+                    .wrapping_add(1);
+                xkb_select::send_legacy_map_notify(
+                    state,
+                    LegacyCause::NewKeyboardNotify,
+                    info.changed,
+                    info.min_keycode,
+                    num,
+                );
+            }
+            XkbSetEvent::Notification(change) => {
+                let m = change.map_notify;
+                if m.changed != 0 {
+                    crate::core_loop::xkb_layout::send_xkb_map_notify(state, base, m);
+                    xkb_select::send_legacy_map_notify(
+                        state,
+                        LegacyCause::MapNotify,
+                        m.changed,
+                        m.first_key_sym,
+                        m.n_key_syms,
+                    );
+                }
+                crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+                    state,
+                    base,
+                    change,
+                    (major, minor),
+                );
+            }
+            XkbSetEvent::Repeats(repeats) => {
+                let _ = crate::core_loop::xkb_layout::apply_repeats_to_core(state, repeats);
+            }
+            XkbSetEvent::CompatMap(notify) => {
+                crate::core_loop::xkb_layout::send_xkb_compat_map_notify(state, base, *notify);
+            }
+            XkbSetEvent::IndicatorMaps(change) => {
+                crate::core_loop::xkb_layout::send_indicator_maps_change(state, base, change);
+            }
+            XkbSetEvent::Names(notify) => {
+                crate::core_loop::xkb_layout::send_xkb_names_notify(state, base, *notify);
+            }
+            XkbSetEvent::IndicatorNames {
+                leds_defined,
+                state: lit,
+            } => {
+                crate::core_loop::xkb_layout::send_indicator_names_change(
+                    state,
+                    base,
+                    *leds_defined,
+                    *lit,
+                );
+            }
+        }
+    }
 }
 
 fn handle_reparent_window(
@@ -20890,6 +23478,39 @@ fn handle_reparent_window(
     let Some(request) = x11::reparent_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    // Xorg ReparentWindow unmaps a mapped window first (`dix/window.c:2519`):
+    // UnmapNotify, and the pointer leaves it while it is still in the old
+    // place. Its map state is only hidden for that hit-test; the reparent
+    // below keeps the window mapped, and the MapNotify after ReparentNotify
+    // stands for Xorg's MapWindow.
+    let unmapped = if state.resources.check_reparent_window(request).is_ok() {
+        state.resources.window(request.window).and_then(|w| {
+            (w.map_state != MapState::Unmapped).then_some((
+                w.parent,
+                w.map_state,
+                w.override_redirect,
+            ))
+        })
+    } else {
+        None
+    };
+    if let Some((old_parent, map_state, _)) = unmapped {
+        let window = request.window;
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, old_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, old_parent, window, false);
+            });
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = MapState::Unmapped;
+        }
+        backend.windows_restructured(state);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = map_state;
+        }
+    }
     let result = match state.resources.reparent_window(request) {
         Ok(result) => result,
         Err(crate::resources::ReparentWindowError::BadWindow) => {
@@ -20921,7 +23542,7 @@ fn handle_reparent_window(
         subscribers_by_id(state, result.new_parent, 0x0008_0000)
     };
     debug!(
-        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?}",
+        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?} viewable+{} viewable-{}",
         client_id.0,
         sequence.0,
         result.window.0,
@@ -20932,6 +23553,8 @@ fn handle_reparent_window(
         result.host_xid,
         result.old_map_state,
         result.new_map_state,
+        result.delta.became_viewable.len(),
+        result.delta.became_unviewable.len(),
     );
     if let Some(xid) = result.host_xid {
         let new_host_parent = if result.new_parent == ROOT_WINDOW {
@@ -20992,120 +23615,39 @@ fn handle_reparent_window(
             backend.sync_top_level_order(state);
         }
     }
+    // Before the reconcile below, so a GRANT backing finds the leaf that carries its route.
+    realize_storage_for_delta(state, backend, origin, &result.delta);
     let window = result.window;
     let new_parent = result.new_parent;
     let old_parent = result.old_parent;
     let rx = result.x;
     let ry = result.y;
     let override_redirect = result.override_redirect;
-    // Phase 2: Xorg-style redirect reconciliation on reparent.
-    // Mirrors compUnredirectOneSubwindow + compRedirectOneSubwindow
-    // at /home/jos/Projects/xserver/composite/compwindow.c:453-454.
-    // The window's redirect state under RedirectSubwindows is
-    // inherited from its parent — when the parent changes, the
-    // inheritance changes too. RedirectWindow(W) is per-window
-    // and not affected.
-    //
-    // Without this, a window created under
-    // RedirectSubwindows(root, Manual) and reparented into a
-    // non-redirected ancestor (e.g. an XEMBED tray client like
-    // nm-applet reparenting into mate-panel's notification
-    // socket) keeps a stale backing. Paints land in that stale
-    // backing; the compositor reads the new ancestor's pixmap
-    // (which never received them) when building COW.
-    //
-    // Gated on `supports_redirect_activation()` for the same
-    // reason as `activate_redirect_backing_for` at
-    // process_request.rs:3289 — backends that don't opt in
-    // (v1, host-X11, and RecordingBackend in its default
-    // configuration) don't manage redirect state, so the
-    // redirect helpers would panic / silently misbehave there.
-    // Phase 2 tests opt in via
-    // `RecordingBackend::with_redirect_activation()` (see
-    // Task 6) and `KmsBackend::for_tests()` (which already
-    // returns `true`).
+    // Xorg compReparentWindow (composite/compwindow.c:453-454): the old
+    // parent's subwindows records leave the window, the new parent's join
+    // it; its own RedirectWindow records stay. A root child that leaves
+    // muffin's RedirectSubwindows(root, Manual) for a frame is no longer
+    // redirected, so no stale inner backing keeps its paints from the
+    // compositor (nm-applet into mate-panel's tray socket; Warframe
+    // fullscreen -> windowed: black).
+    let before = state.composite_redirects.window_mode(window);
+    state
+        .composite_redirects
+        .reparent_subwindow(old_parent, new_parent, window);
+    log::debug!(
+        "reparent reconcile: window=0x{:x} old_parent=0x{:x} new_parent=0x{:x} \
+         mode {before:?} -> {:?}",
+        window.0,
+        old_parent.0,
+        new_parent.0,
+        state.composite_redirects.window_mode(window),
+    );
     if backend.supports_redirect_activation() {
-        let old_parent_redirects_subwindows =
-            state.composite_redirects.contains_key(&(old_parent, true));
-        let new_parent_redirects_subwindows =
-            state.composite_redirects.contains_key(&(new_parent, true));
-        let directly_redirected = state.composite_redirects.contains_key(&(window, false));
-        let had_backing = state
-            .resources
-            .window(window)
-            .is_some_and(|w| w.redirected_backing.is_some());
-
-        log::debug!(
-            "reparent reconcile: window=0x{:x} old_parent=0x{:x} new_parent=0x{:x} \
-             old_redirects_sub={old_parent_redirects_subwindows} \
-             new_redirects_sub={new_parent_redirects_subwindows} \
-             directly_redirected={directly_redirected} had_backing={had_backing}",
-            window.0,
-            old_parent.0,
-            new_parent.0,
-        );
-        if !directly_redirected {
-            if old_parent_redirects_subwindows && !new_parent_redirects_subwindows && had_backing {
-                log::debug!(
-                    "reparent reconcile: REVOKE window=0x{:x} (left redirected subtree)",
-                    window.0,
-                );
-                crate::core_loop::process_disconnect::teardown_redirect_for_window(
-                    state, backend, origin, window,
-                );
-            } else if !old_parent_redirects_subwindows
-                && new_parent_redirects_subwindows
-                && !had_backing
-            {
-                let new_mode = state
-                    .composite_redirects
-                    .get(&(new_parent, true))
-                    .expect("just checked contains_key")
-                    .mode;
-                log::debug!(
-                    "reparent reconcile: GRANT window=0x{:x} new_mode={new_mode:?} \
-                     (entered redirected subtree)",
-                    window.0,
-                );
-                activate_redirect_backing_for(state, backend, origin, window, new_mode);
-            } else if old_parent_redirects_subwindows && new_parent_redirects_subwindows {
-                let old_mode = state
-                    .composite_redirects
-                    .get(&(old_parent, true))
-                    .map(|r| r.mode);
-                let new_mode = state
-                    .composite_redirects
-                    .get(&(new_parent, true))
-                    .map(|r| r.mode);
-                if old_mode != new_mode
-                    && let Some(new_mode) = new_mode
-                {
-                    log::debug!(
-                        "reparent reconcile: FLIP window=0x{:x} old_mode={old_mode:?} \
-                         new_mode={new_mode:?}",
-                        window.0,
-                    );
-                    flip_redirect_target_mode(state, backend, origin, window, new_mode);
-                } else {
-                    log::debug!(
-                        "reparent reconcile: no-op (both redirected, mode unchanged) \
-                         window=0x{:x} mode={old_mode:?}",
-                        window.0,
-                    );
-                }
-            } else {
-                log::debug!(
-                    "reparent reconcile: no-op (state already consistent) window=0x{:x}",
-                    window.0,
-                );
-            }
-        } else {
-            log::debug!(
-                "reparent reconcile: skipped window=0x{:x} has direct RedirectWindow",
-                window.0,
-            );
-        }
+        sync_redirect_backing(state, backend, origin, window, before);
     }
+    // After the reconcile, so a revoke still sees the backing it tears down.
+    apply_viewability_delta_to_redirects(state, backend, origin, &result.delta);
+    release_storage_for_delta(state, backend, origin, &result.delta);
     let _dropped = fanout_event_to_clients(state, &on_window, |buf, seq, order| {
         x11::encode_reparent_notify_event(
             buf,
@@ -21145,6 +23687,25 @@ fn handle_reparent_window(
             override_redirect,
         );
     });
+    if let Some((_, _, override_redirect)) = unmapped {
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_map_notify_event(buf, seq, order, window, window, override_redirect);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, new_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_map_notify_event(
+                    buf,
+                    seq,
+                    order,
+                    new_parent,
+                    window,
+                    override_redirect,
+                );
+            });
+    }
+    // The window moved in the tree; Xorg's ReparentWindow re-evaluates the
+    // pointer through its MapWindow (`dix/window.c:2695`).
+    backend.windows_restructured(state);
     Ok(RequestOutcome::Handled)
 }
 
@@ -21463,14 +24024,14 @@ fn handle_create_window(
                 // window lands where core put it (e.g. below the COW).
                 backend.sync_top_level_order(state);
             }
-            // L2 plan B.6b future-child hook: under spec, a freshly
-            // created child of a REDIRECT_SUBWINDOWS parent inherits
-            // the redirect. NameWindowPixmap's check at the top of
-            // NAME_WINDOW_PIXMAP already consults `composite_redirects`
-            // for the parent, so no per-child bookkeeping is needed
-            // until the backing-pixmap path lands.
         }
     }
+    // Xorg compCreateWindow (composite/compwindow.c:579-589): a child of a
+    // RedirectSubwindows parent gets that client's record. It is unmapped,
+    // so the backing waits for realize.
+    state
+        .composite_redirects
+        .redirect_new_subwindow(parent, window_id);
     // CreateNotify on parent (SubstructureNotify subscribers).
     let create_notify_targets = subscribers_by_id(state, parent, 0x0008_0000);
     if !create_notify_targets.is_empty() {
@@ -21688,6 +24249,7 @@ fn handle_change_window_attributes(
     for old_host_xid in released_hosts {
         if !state.resources.host_xid_still_referenced(old_host_xid) {
             let _ = backend.free_pixmap(origin, old_host_xid.as_raw());
+            state.resources.host_pixmap_freed(old_host_xid.as_raw());
         }
     }
 
@@ -22053,6 +24615,10 @@ fn handle_configure_window(
         .and_then(|sibling| state.resources.window(sibling))
         .and_then(|w| w.host_xid)
         .map(|h| h.as_raw());
+    // What covered the window before the move, for the part of it the
+    // backend's in-backing copy cannot carry (see `expose_child_share`'s
+    // caller below).
+    let higher_before = higher_sibling_rects(state, request.window);
     let configure = state
         .resources
         .configure_window(request)
@@ -22277,6 +24843,34 @@ fn handle_configure_window(
                 request.value_mask,
             );
             let _dropped = accumulate_damage_full_to_state(state, window_id);
+        } else if viewable
+            && !resized
+            && let Some((old_x, old_y, _, _, _)) = before_geom
+            && (old_x, old_y) != (geometry.x, geometry.y)
+            && (has_redirected_ancestor(state, window_id)
+                || parent.is_some_and(|p| p != crate::resources::ROOT_WINDOW))
+        {
+            // A pure move of an UNREDIRECTED subwindow (inside a
+            // redirected ancestor, the backend also carries its pixels to the new
+            // position in the ancestor's backing, Xorg `fbCopyWindow`):
+            // Xorg reports that copy through `damageCopyWindow`
+            // (`miext/damage/damage.c`); a damage object on any ancestor
+            // sees it, since window damage includes inferiors. (The
+            // vacated area is reported by its exposure paint below.)
+            // Without this the compositor's damage region is just the
+            // parent's own ClipByChildren repaint, which excludes the
+            // moved window — MATE's notification area stayed blank after
+            // a panel drag until something else damaged that spot.
+            log::trace!(
+                target: "yserver_core::core_loop::damage_fanout",
+                "configure_damage_emit_inferior_move: window=0x{:x} ({},{}) -> ({},{})",
+                window_id.0,
+                old_x,
+                old_y,
+                geometry.x,
+                geometry.y,
+            );
+            let _dropped = accumulate_damage_full_to_state(state, window_id);
         } else {
             log::trace!(
                 target: "yserver_core::core_loop::damage_fanout",
@@ -22291,6 +24885,56 @@ fn handle_configure_window(
                 geometry_changed,
                 request.value_mask,
             );
+        }
+        // What the window left behind, exposed beneath it as Xorg's
+        // `miMoveWindow` does — inside a shared redirect backing, and for
+        // a subwindow anywhere (a top-level keeps its own storage and the
+        // scene recomposites what it uncovers).
+        let shared = has_redirected_ancestor(state, window_id);
+        if viewable
+            && let Some((old_x, old_y, old_w, old_h, old_bw)) = before_geom
+            && let Some(parent) = parent
+            && (shared || parent != crate::resources::ROOT_WINDOW)
+        {
+            // Both ends as far as the parent's clip reaches: the part of
+            // the window outside it was never drawn, nor carried.
+            let inside = content_within_ancestors(state, parent);
+            let old_outer = crate::nested::intersect_regions(
+                &bounding_in_parent(state, window_id, (old_x, old_y, old_w, old_h, old_bw)),
+                &[inside],
+            );
+            let new_outer = crate::nested::intersect_regions(
+                &current_bounding_in_parent(state, window_id),
+                &[inside],
+            );
+            let vacated = crate::nested::subtract_regions(&old_outer, &new_outer);
+            if !vacated.is_empty() {
+                expose_vacated_area(state, backend, origin, parent, window_id, vacated);
+            }
+            // The moved window's own holes. The backend copies only the
+            // part that was the window's to begin with (not under a
+            // higher sibling) to the part that is still the window's
+            // (not under one now); Xorg exposes the rest of the new
+            // position — `miMoveWindow` → `ValidateTree` →
+            // `miHandleValidateExposures`, where `CopyWindow` filled only
+            // the translated old `borderClip`. MATE: dragging the
+            // workspace switcher under the (higher) notification area
+            // left a tray-sized hole in the switcher.
+            // A resize already exposes the whole window (below).
+            if !resized {
+                let (dx, dy) = (
+                    geometry.x.saturating_sub(old_x),
+                    geometry.y.saturating_sub(old_y),
+                );
+                let mut carried = crate::nested::subtract_regions(&old_outer, &higher_before);
+                crate::nested::translate_region(&mut carried, dx, dy);
+                let higher_now = higher_sibling_rects(state, window_id);
+                let visible_now = crate::nested::subtract_regions(&new_outer, &higher_now);
+                let holes = crate::nested::subtract_regions(&visible_now, &carried);
+                if !holes.is_empty() {
+                    let _rest = expose_child_share(state, backend, origin, window_id, holes, true);
+                }
+            }
         }
         // A resize exposes the window in EITHER direction. Xorg draws no
         // grow/shrink distinction: `miResizeWindow` copies the whole NEW
@@ -22359,6 +25003,9 @@ fn handle_configure_window(
             }
         }
     }
+    // Xorg miMoveWindow / miResizeWindow / ReflectStackChange end in
+    // WindowsRestructured (`mi/miwindow.c:302,620`, `dix/window.c:2179`).
+    backend.windows_restructured(state);
     // A confined pointer follows its confine window — re-clamp after
     // any geometry change (Xorg ConfineCursorToWindow on configure;
     // XGrabButton-25 moves confine_to and expects the pointer pulled
@@ -22896,7 +25543,7 @@ fn emit_property_change(
         .filter_map(|(id, client)| {
             let selected = client.xi2_masks.iter().any(|(&(_, dev), &mask)| {
                 let device_matches = dev == deviceid || dev == XI_ALL_DEVICES;
-                device_matches && (mask & XI2_PROPERTY_EVENT_MASK) != 0
+                device_matches && (mask & u64::from(XI2_PROPERTY_EVENT_MASK)) != 0
             });
             selected.then_some(ClientId(*id))
         })
@@ -22967,7 +25614,7 @@ fn emit_property_change(
     dropped
 }
 
-fn emit_x11_error_with_minor(
+pub(crate) fn emit_x11_error_with_minor(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
@@ -24037,17 +26684,20 @@ fn handle_change_keyboard_control(
                     (0, None) => ctrl.global_auto_repeat = false,
                     (1, None) => ctrl.global_auto_repeat = true,
                     (2, None) => ctrl.global_auto_repeat = true, // DEFAULT_AUTOREPEAT
-                    (0, Some(k)) => {
-                        ctrl.auto_repeats[usize::from(k >> 3)] &= !(1 << (k & 7));
-                    }
-                    (1, Some(k)) => {
-                        ctrl.auto_repeats[usize::from(k >> 3)] |= 1 << (k & 7);
-                    }
-                    (2, Some(k)) => {
+                    (0..=2, Some(k)) => {
                         let i = usize::from(k >> 3);
                         let m = 1 << (k & 7);
-                        ctrl.auto_repeats[i] = (ctrl.auto_repeats[i] & !m)
-                            | (crate::server::DEFAULT_AUTO_REPEATS[i] & m);
+                        match t {
+                            0 => ctrl.auto_repeats[i] &= !m,
+                            1 => ctrl.auto_repeats[i] |= m,
+                            _ => {
+                                ctrl.auto_repeats[i] = (ctrl.auto_repeats[i] & !m)
+                                    | (crate::server::DEFAULT_AUTO_REPEATS[i] & m);
+                            }
+                        }
+                        // Xorg XkbDisableComputedAutoRepeats: a mapping
+                        // change no longer re-derives this key's repeat.
+                        ctrl.auto_repeats_explicit[i] |= m;
                     }
                     _ => return bad_value(state, u32::from(t)),
                 }
@@ -24409,6 +27059,8 @@ fn handle_set_pointer_mapping(
 /// SetModifierMapping (118): MappingNotify fanout, then reply.
 fn handle_set_modifier_mapping(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -24420,30 +27072,151 @@ fn handle_set_modifier_mapping(
     let Some(keycodes) = body.get(..need) else {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 118);
     };
-    // Xorg ProcSetModifierMapping: keycodes must be 0 or within the
-    // advertised [min_keycode, max_keycode] range (8..=255 here).
-    for &kc in keycodes {
-        if kc != 0 && kc < 8 {
+    // Xorg ProcSetModifierMapping: BadValue for a refused map, else the
+    // change_modmap status in the reply.
+    let status = match change_modifier_mapping(state, backend, origin, kpm, keycodes, None, |_| {})
+    {
+        ModmapChangeOutcome::Success => 0,
+        ModmapChangeOutcome::Busy => 1,
+        ModmapChangeOutcome::BadValue(value) => {
             return emit_x11_error(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
-                u32::from(kc),
+                value,
                 118,
             );
         }
-    }
-    state.modifier_mapping_override = Some((kpm, keycodes.to_vec()));
-    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
-    });
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
-    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    let buf = stub_reply_32(client.byte_order, sequence, status);
     Ok(write_to_client(client, client_id, &buf))
+}
+
+/// Result of [`change_modifier_mapping`] (Xorg `change_modmap`'s return).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModmapChangeOutcome {
+    /// Applied (`MappingSuccess`).
+    Success,
+    /// A key that is or would be a modifier is down: nothing applied
+    /// (`MappingBusy`).
+    Busy,
+    /// Refused; the error value (Xorg `client->errorValue`).
+    BadValue(u32),
+}
+
+/// Xorg's `change_modmap` (dix/inpututils.c) for SetModifierMapping and XI
+/// SetDeviceModifierMapping (`xi_device`: the XI device; `None` = core).
+///
+/// - `build_modmap_from_modkeymap`: row `i / kpm` of the request is modifier
+///   `i / kpm`; a keycode listed twice is BadValue with value 0.
+/// - `check_modmap_change`: a keycode outside the keycode range is BadValue
+///   (value: the lowest such keycode); MappingBusy if a new modifier key is
+///   down, or an old one is, where Xorg's loop over the old ones stops short
+///   of the last keycode (255).
+///
+/// Then the backend edits its XKB keymap's modmap and the events go out in
+/// Xorg's order (`XkbApplyMappingChange` → `XkbSendNotification`):
+/// XkbMapNotify, core MappingNotify(Modifier), XkbControlsNotify for per-key
+/// repeat changes, XkbIndicatorMapNotify. A backend without an XKB keymap
+/// gets the map stored for readback instead. An identical map still applies
+/// and notifies, as on Xorg. Keyboard devices share the one keymap, so the XI
+/// request changes it for every device (Xorg: the device, its master or
+/// slaves).
+///
+/// `on_applied` runs once the change took effect and before any notification
+/// goes out: the XI request sends its DeviceMappingNotify there, so its
+/// clients see it ahead of the XKB and core notifications, as on Xorg.
+fn change_modifier_mapping(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    kpm: u8,
+    keycodes: &[u8],
+    xi_device: Option<u16>,
+    on_applied: impl FnOnce(&mut ServerState),
+) -> ModmapChangeOutcome {
+    const MIN_KEYCODE: usize = 8;
+    const MAX_KEYCODE: usize = 255;
+    let mut modmap = [0u8; 256];
+    for (i, &kc) in keycodes.iter().enumerate() {
+        if kc == 0 {
+            continue;
+        }
+        if modmap[usize::from(kc)] != 0 {
+            return ModmapChangeOutcome::BadValue(0);
+        }
+        modmap[usize::from(kc)] = 1 << (i / usize::from(kpm.max(1)));
+    }
+    let down = |kc: usize| state.keys_down[kc >> 3] & (1 << (kc & 7)) != 0;
+    for (kc, _) in modmap.iter().enumerate().filter(|(_, m)| **m != 0) {
+        if !(MIN_KEYCODE..=MAX_KEYCODE).contains(&kc) {
+            return ModmapChangeOutcome::BadValue(u32::try_from(kc).unwrap_or(0));
+        }
+        if down(kc) {
+            return ModmapChangeOutcome::Busy;
+        }
+    }
+    let current = xi_device
+        .and_then(|dev| state.xi1_modifier_map.get(&dev).cloned())
+        .or_else(|| state.modifier_mapping_override.clone())
+        .or_else(|| backend.get_modifier_mapping(origin).ok());
+    if let Some((cur_kpm, cur_keys)) = current
+        && cur_keys.iter().take(8 * usize::from(cur_kpm)).any(|&kc| {
+            (MIN_KEYCODE..MAX_KEYCODE).contains(&usize::from(kc)) && down(usize::from(kc))
+        })
+    {
+        return ModmapChangeOutcome::Busy;
+    }
+
+    // Xorg XkbSendLegacyMapNotify → XIShouldNotify: the core MappingNotify
+    // is for clients whose master keyboard changed. An XI request on a slave
+    // reaches the master only as its lastSlave, which the device an XI client
+    // remaps isn't on Xorg (XTEST drives a slave of its own there).
+    let core_notify = xi_device.is_none_or(|dev| dev == crate::xinput::DEVICEID_MASTER_KEYBOARD);
+    let Some(change) = backend.set_modifier_mapping(&modmap) else {
+        match xi_device {
+            Some(dev) => {
+                state.xi1_modifier_map.insert(dev, (kpm, keycodes.to_vec()));
+            }
+            None => state.modifier_mapping_override = Some((kpm, keycodes.to_vec())),
+        }
+        on_applied(state);
+        if core_notify {
+            let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+            let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+                let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
+            });
+        }
+        return ModmapChangeOutcome::Success;
+    };
+    // The keymap is the one modifier map now: drop any stored readback.
+    state.modifier_mapping_override = None;
+    state.xi1_modifier_map.clear();
+    on_applied(state);
+    let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
+    if core_notify {
+        // Xorg XkbSendLegacyMapNotify: MapNotify's changes decide who gets
+        // the core MappingNotify(Modifier).
+        crate::core_loop::xkb_select::send_legacy_core_map_notify(
+            state,
+            crate::core_loop::xkb_select::LegacyCause::MapNotify,
+            change.map_notify.changed,
+            change.map_notify.first_key_sym,
+            change.map_notify.n_key_syms,
+        );
+    }
+    crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+        state,
+        xkb_event_base,
+        &change,
+        (crate::core_loop::xkb_layout::X_SET_MODIFIER_MAPPING, 0),
+    );
+    ModmapChangeOutcome::Success
 }
 
 fn handle_get_geometry(
@@ -24530,7 +27303,13 @@ fn handle_query_tree(
     } else {
         window_state.parent
     };
-    let children = window_state.children.clone();
+    // Xorg's QueryTree stops at RealChildHead (dix/dispatch.c:1078), which
+    // Composite points at the overlay window while it tops the root
+    // (composite/compwindow.c:762): the COW is a root child nobody lists.
+    let mut children = window_state.children.clone();
+    if window == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
     debug!(
         "client {} #{} QueryTree reply 0x{:x}: parent=0x{:x} children={}",
         client_id.0,
@@ -25126,10 +27905,9 @@ fn handle_map_window(
         return Ok(RequestOutcome::Handled);
     }
 
-    let (was_unmapped, promoted_descendants) =
-        state.resources.map_window_with_promoted_descendants(window);
+    let transition = state.resources.map_window(window);
     debug_assert!(
-        was_unmapped,
+        transition.mapping_changed,
         "current_map_state == Unmapped guard above was checked; \
          map_window should now transition",
     );
@@ -25140,17 +27918,16 @@ fn handle_map_window(
         .map(|w| (w.parent, w.override_redirect));
     if let Some(xid) = host_xid {
         let _ = backend.map_subwindow(origin, xid.as_raw());
-        // Stage 4b.7: if the window's parent has a
-        // `RedirectSubwindows(mode)` record, the newly-mapped child
-        // needs its own backing (per Composite spec: "redirected
-        // hierarchy pixels are available whenever it is viewable",
-        // and Xorg activates on realize at `compwindow.c:267`).
-        // AFTER `map_subwindow` per the plan's codex-round-6
-        // ordering fix — `map_subwindow` blindly flips
-        // `scene_participating = true`, so the Manual
-        // participation flip inside `activate_redirect_backing_for`
-        // (sets it back to false) must land last.
-        maybe_activate_child_under_redirected_parent(state, backend, origin, window);
+    }
+    realize_storage_for_delta(state, backend, origin, &transition.delta);
+    // Every window that became viewable under a redirect (its own, or its
+    // parent's RedirectSubwindows) gets a backing, as Xorg allocates on
+    // realize (`compwindow.c:274`). AFTER `map_subwindow` per the plan's
+    // codex-round-6 ordering fix — `map_subwindow` blindly flips
+    // `scene_participating = true`, so the Manual participation flip
+    // inside `activate_redirect_backing_for` must land last.
+    apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+    if host_xid.is_some() {
         reapply_redirect_mode_after_map(state, backend, origin, window);
     }
 
@@ -25222,14 +27999,26 @@ fn handle_map_window(
     // mate-xorg.xtrace lines 5164→5173.
     if host_xid.is_some() {
         let _dropped = accumulate_damage_full_to_state(state, window);
-        for promoted in &promoted_descendants {
+        // The mapped window itself keeps its just-fired notify cycle.
+        for promoted in transition
+            .delta
+            .became_viewable
+            .iter()
+            .filter(|w| **w != window)
+        {
             reset_damage_notify_cycle_for_drawable(state, *promoted);
         }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
+    // Xorg MapWindow ends in WindowsRestructured (`dix/window.c:2695`): the
+    // pointer's crossings follow MapNotify and Expose within the request.
+    backend.windows_restructured(state);
     debug!(
-        "client {} #{} MapWindow 0x{:x}",
-        client_id.0, sequence.0, window.0
+        "client {} #{} MapWindow 0x{:x} viewable+{}",
+        client_id.0,
+        sequence.0,
+        window.0,
+        transition.delta.became_viewable.len()
     );
     Ok(RequestOutcome::Handled)
 }
@@ -25255,8 +28044,22 @@ fn handle_map_subwindows(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    map_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
+        .map(|(outcome, _delta)| outcome)
+}
+
+/// MapSubwindows; also returns the union of the children's viewability deltas.
+fn map_subwindows_with_delta(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
+    let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
-        return Ok(RequestOutcome::Handled);
+        return Ok((RequestOutcome::Handled, delta));
     };
     if state.resources.window(parent).is_none() {
         // Xorg `dix/dispatch.c::ProcMapSubwindows` returns BadWindow
@@ -25269,11 +28072,13 @@ fn handle_map_subwindows(
             x11::error::BAD_WINDOW,
             parent.0,
             9,
-        );
+        )
+        .map(|outcome| (outcome, delta));
     }
     let children: Vec<ResourceId> = state.resources.children(parent).to_vec();
     for child in children {
-        let was_unmapped = state.resources.map_window(child);
+        let transition = state.resources.map_window(child);
+        let was_unmapped = transition.mapping_changed;
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
         let extents = state.resources.window(child).map(|w| (w.width, w.height));
         let override_redirect = state
@@ -25282,10 +28087,12 @@ fn handle_map_subwindows(
             .is_some_and(|w| w.override_redirect);
         if let Some(xid) = host_xid {
             let _ = backend.map_subwindow(origin, xid.as_raw());
-            // Stage 4b.7: same post-hook as `handle_map_window`.
-            // Activation MUST run AFTER `map_subwindow` per the
-            // plan's round-6 ordering fix.
-            maybe_activate_child_under_redirected_parent(state, backend, origin, child);
+        }
+        realize_storage_for_delta(state, backend, origin, &transition.delta);
+        // Same post-hook as `handle_map_window`: AFTER `map_subwindow`.
+        apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+        delta.extend(transition.delta);
+        if host_xid.is_some() {
             reapply_redirect_mode_after_map(state, backend, origin, child);
             // Audit #11: see `handle_map_window` for the rationale.
             // Mirror the damage bump so MapSubwindows-driven mass
@@ -25329,8 +28136,16 @@ fn handle_map_subwindows(
             let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
-    debug!("client {} #{} MapSubwindows", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+    // Xorg MapSubwindows: one WindowsRestructured after the batch
+    // (`dix/window.c:2775`).
+    backend.windows_restructured(state);
+    debug!(
+        "client {} #{} MapSubwindows viewable+{}",
+        client_id.0,
+        sequence.0,
+        delta.became_viewable.len()
+    );
+    Ok((RequestOutcome::Handled, delta))
 }
 
 fn handle_unmap_window(
@@ -25356,7 +28171,8 @@ fn handle_unmap_window(
             );
         }
         let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
-        let was_mapped = state.resources.unmap_window(window);
+        let transition = state.resources.unmap_window(window);
+        let was_mapped = transition.mapping_changed;
         let parent = if was_mapped {
             state
                 .resources
@@ -25368,6 +28184,9 @@ fn handle_unmap_window(
         if let Some(xid) = host_xid {
             let _ = backend.unmap_subwindow(origin, xid.as_raw());
         }
+        // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
+        apply_viewability_delta_to_redirects(state, backend, origin, &transition.delta);
+        release_storage_for_delta(state, backend, origin, &transition.delta);
         // XI1: an active device grab is released automatically when its
         // grab window becomes not viewable (XTS XGrabDeviceKey-9; Xorg
         // DeactivateGrabsOnWindowUnmap shape).
@@ -25411,6 +28230,8 @@ fn handle_unmap_window(
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
             release_core_grabs_for_unviewable(state, backend);
+            // Then WindowsRestructured (`dix/window.c:2871`).
+            backend.windows_restructured(state);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -25425,14 +28246,28 @@ fn handle_unmap_subwindows(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)
+        .map(|(outcome, _delta)| outcome)
+}
+
+/// UnmapSubwindows; also returns the union of the children's viewability deltas.
+fn unmap_subwindows_with_delta(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<(RequestOutcome, ViewabilityDelta)> {
+    let mut delta = ViewabilityDelta::default();
     let Some(parent) = x11::map_window_id(body) else {
-        return Ok(RequestOutcome::Handled);
+        return Ok((RequestOutcome::Handled, delta));
     };
     struct PendingUnmap {
         child: ResourceId,
         host_xid: Option<crate::backend::WindowHandle>,
     }
-    let Some(children) = state.resources.mapped_children_bottom_to_top(parent) else {
+    let Some(mut children) = state.resources.mapped_children_bottom_to_top(parent) else {
         return emit_x11_error(
             state,
             client_id,
@@ -25440,14 +28275,22 @@ fn handle_unmap_subwindows(
             x11::error::BAD_WINDOW,
             parent.0,
             11,
-        );
+        )
+        .map(|outcome| (outcome, delta));
     };
+    // UnmapSubwindows stops at RealChildHead too (dix/window.c:2897): the
+    // overlay window stays mapped.
+    if parent == ROOT_WINDOW {
+        children.retain(|child| *child != COMPOSITE_OVERLAY_WINDOW);
+    }
     // Snapshot mapping order + collect host xids; unmap each in the
     // resource table.
     let mut pending: Vec<PendingUnmap> = Vec::new();
     for child in children {
         let host_xid = state.resources.window(child).and_then(|w| w.host_xid);
-        if state.resources.unmap_window(child) {
+        let transition = state.resources.unmap_window(child);
+        delta.extend(transition.delta);
+        if transition.mapping_changed {
             pending.push(PendingUnmap { child, host_xid });
         }
     }
@@ -25463,11 +28306,21 @@ fn handle_unmap_subwindows(
             x11::encode_unmap_notify_event(buf, seq, order, parent, child, false);
         });
     }
+    // Xorg frees each redirect pixmap at unrealize (`compwindow.c:291`).
+    apply_viewability_delta_to_redirects(state, backend, origin, &delta);
+    release_storage_for_delta(state, backend, origin, &delta);
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
-    debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
-    Ok(RequestOutcome::Handled)
+    // Xorg UnmapSubwindows: one WindowsRestructured (`dix/window.c:2939`).
+    backend.windows_restructured(state);
+    debug!(
+        "client {} #{} UnmapSubwindows viewable-{}",
+        client_id.0,
+        sequence.0,
+        delta.became_unviewable.len()
+    );
+    Ok((RequestOutcome::Handled, delta))
 }
 
 fn handle_ge_request(
@@ -25530,7 +28383,12 @@ fn handle_big_requests_request(
     let byte_order = client.byte_order;
     client.big_requests_enabled = true;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_big_requests_enable_reply(&mut buf, byte_order, sequence, 256 * 1024)?;
+    x11::write_big_requests_enable_reply(
+        &mut buf,
+        byte_order,
+        sequence,
+        x11::MAX_BIG_REQUEST_UNITS,
+    )?;
     let outcome = write_to_client(client, client_id, &buf);
     // Unblock the reader so subsequent requests use big-framing.
     if let Some(tx) = client.reader_control.as_ref() {
@@ -25619,6 +28477,7 @@ fn window_attributes(
 
 fn handle_circulate_window(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -25646,41 +28505,51 @@ fn handle_circulate_window(
             13,
         );
     }
-    let chosen_child = {
-        let kids = state.resources.children(container);
-        match (direction, kids.first(), kids.last()) {
-            (0, _, Some(&back)) => Some(back),
-            (1, Some(&front), _) => Some(front),
-            _ => None,
-        }
-    };
-    let Some(child) = chosen_child else {
+    let Some(child) = state.circulate_candidate(container, direction) else {
         return Ok(RequestOutcome::Handled);
     };
-    // SubstructureRedirect on container takes priority — redirect the
-    // request to the first subscriber instead of performing the
-    // circulate.
+    // SubstructureRedirect on the container by another client turns it into
+    // a CirculateRequest (Xorg MaybeDeliverEventsToClient skips the
+    // requester).
     let redirect_target = subscribers_by_id(state, container, 0x0010_0000)
         .into_iter()
-        .next();
+        .find(|c| *c != client_id);
     if let Some(target) = redirect_target {
         let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
             let _ =
                 x11::write_circulate_request_event(buf, order, seq, container, child, direction);
         });
     } else {
-        let _ = state.resources.circulate_window(container, direction);
-        let on_child = subscribers_by_id(state, child, 0x0002_0000);
-        let on_container = subscribers_by_id(state, container, 0x0008_0000);
-        let mut targets = on_child;
-        for cid in on_container {
-            if !targets.contains(&cid) {
-                targets.push(cid);
-            }
+        state.resources.circulate_child(child, direction == 0);
+        if let Some(xid) = state.resources.window(child).and_then(|w| w.host_xid) {
+            let _ = backend.configure_subwindow(
+                None,
+                xid.as_raw(),
+                crate::host_x11::HostSubwindowConfig {
+                    x: None,
+                    y: None,
+                    width: None,
+                    height: None,
+                    border_width: None,
+                    sibling: None,
+                    stack_mode: Some(if direction == 0 { 0 } else { 1 }),
+                },
+            );
         }
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        backend.sync_top_level_order(state);
+        // CirculateNotify to the window's StructureNotify and the parent's
+        // SubstructureNotify selectors, each with its own event window; the
+        // place (OnTop 0 / OnBottom 1) equals the direction.
+        let _dropped = emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
             let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
         });
+        let _dropped =
+            emit_window_event_to_state(state, container, 0x0008_0000, |buf, seq, order| {
+                let _ =
+                    x11::write_circulate_notify_event(buf, order, seq, container, child, direction);
+            });
+        // Xorg ReflectStackChange (`dix/window.c:2179`).
+        backend.windows_restructured(state);
     }
     debug!("client {} #{} CirculateWindow", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -26230,6 +29099,27 @@ fn apply_allow_events(
     Ok(RequestOutcome::Handled)
 }
 
+/// Record a client's XI version the way Xorg `ProcXIQueryVersion` stores
+/// it in `XIClientRec`: the first query sets it; a later query raises it
+/// only when both the stored and the new version are 2.2 or newer
+/// ("Peter promises to never again break backward compatibility").
+/// Otherwise the stored version stays — Xorg then answers a lower request
+/// with BadValue and a higher one with the stored version; yserver keeps
+/// answering with the negotiated version, so only the stored value (what
+/// `FilterRawEvents` reads) follows Xorg here.
+fn record_xi2_client_version(state: &mut ServerState, client_id: ClientId, version: (u16, u16)) {
+    match state.xi2_client_versions.get(&client_id) {
+        None => {
+            state.xi2_client_versions.insert(client_id, version);
+        }
+        Some(&stored) => {
+            if version >= (2, 2) && stored >= (2, 2) && version > stored {
+                state.xi2_client_versions.insert(client_id, version);
+            }
+        }
+    }
+}
+
 fn handle_set_input_focus(
     state: &mut ServerState,
     client_id: ClientId,
@@ -26253,72 +29143,80 @@ fn handle_set_input_focus(
                 42,
             );
         }
-        if window.0 > 1 {
-            let Some(w) = state.resources.window(window) else {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_WINDOW,
-                    window.0,
-                    42,
-                );
-            };
-            if w.map_state != crate::resources::MapState::Viewable {
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    window.0,
-                    42,
-                );
-            }
+        if let Some((code, value)) = core_focus_window_error(state, window) {
+            return emit_x11_error(state, client_id, sequence, code, value, 42);
         }
-        // Xorg SetInputFocus: requests with a time LATER than the
-        // current time or EARLIER than the last focus time are
-        // silently ignored.
         let time = body
             .get(4..8)
             .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        let now = state
-            .timestamp_now()
-            .max(state.xi1_last_input_time)
-            .max(state.core_focus.time);
-        if time != 0
-            && (crate::core_loop::xi1_focus::time_after(time, now)
-                || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
-        {
-            debug!(
-                "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
-                client_id.0, sequence.0, state.core_focus.time
-            );
-            return Ok(RequestOutcome::Handled);
-        }
-        debug!(
-            "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
-            client_id.0, window.0
-        );
-        log::trace!(
-            target: "yserver::input::focus",
-            "SetInputFocus client={} window={} revert_to={revert_to}",
-            state.debug_client_label(client_id),
-            state.debug_window_label(window),
-        );
-        apply_core_focus(
-            state,
-            window.0,
-            revert_to,
-            if time == 0 { now } else { time },
-        );
+        apply_core_input_focus(state, client_id, sequence, window, revert_to, time);
     }
     debug!("client {} #{} SetInputFocus", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
 
+/// The window check of Xorg `SetInputFocus`: a focus other than
+/// None(0)/PointerRoot(1) must be an existing window (BadWindow) that is
+/// viewable (BadMatch). Returns `(error code, errorValue)`.
+fn core_focus_window_error(state: &ServerState, window: ResourceId) -> Option<(u8, u32)> {
+    if window.0 <= 1 {
+        return None;
+    }
+    match state.resources.window(window) {
+        None => Some((x11::error::BAD_WINDOW, window.0)),
+        Some(w) if w.map_state != crate::resources::MapState::Viewable => {
+            Some((x11::error::BAD_MATCH, window.0))
+        }
+        Some(_) => None,
+    }
+}
+
+/// The rest of Xorg `SetInputFocus` for the master keyboard, whose focus
+/// is the core focus (core SetInputFocus and XISetFocus on device 3 both
+/// land here): the timestamp gate, the FocusOut/FocusIn chain, and the
+/// new focus/revert_to/time. `window` has passed
+/// [`core_focus_window_error`].
+fn apply_core_input_focus(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    window: ResourceId,
+    revert_to: u8,
+    time: u32,
+) {
+    // Xorg SetInputFocus: requests with a time LATER than the
+    // current time or EARLIER than the last focus time are
+    // silently ignored.
+    let now = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.core_focus.time);
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
+    {
+        debug!(
+            "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
+            client_id.0, sequence.0, state.core_focus.time
+        );
+        return;
+    }
+    debug!(
+        "focus decision: client {} SetInputFocus 0x{:x} revert_to={revert_to}",
+        client_id.0, window.0
+    );
+    log::trace!(
+        target: "yserver::input::focus",
+        "SetInputFocus client={} window={} revert_to={revert_to}",
+        state.debug_client_label(client_id),
+        state.debug_window_label(window),
+    );
+    apply_core_focus(state, window.0, revert_to, if time == 0 { now } else { time });
+}
+
 /// Move the core keyboard focus to `to_raw` (0 None, 1 PointerRoot, else a
 /// window), with the FocusOut/FocusIn chain when it changes: what a
-/// validated SetInputFocus does.
+/// SetInputFocus that passed its checks and its timestamp gate does.
 fn apply_core_focus(state: &mut ServerState, to_raw: u32, revert_to: u8, time: u32) {
     let from_raw = state.core_focus.raw;
     if from_raw != to_raw {
@@ -26515,8 +29413,11 @@ pub(crate) fn emit_core_focus_transition(
                     buf, seq, order, e.focus_in, e.window, mode, e.detail,
                 );
             });
-        // XI2 mirrors only the real FocusIn/FocusOut pairs (evtype
-        // 9/10) on the windows the core chain touches.
+    }
+    // Xorg DoFocusEvents: the whole core sequence, then the XI2 one
+    // (DeviceFocusEvents), which has its own windows.
+    for e in crate::crossings::device_focus_transition_events(state, from_raw, to_raw, pointer_win)
+    {
         let evtype = if e.focus_in { 9 } else { 10 };
         let _dropped = emit_xi2_focus_event_to_state(
             state,
@@ -27269,6 +30170,33 @@ fn drawable_size(state: &ServerState, id: ResourceId) -> Option<(u16, u16)> {
     state.resources.pixmap(id).map(|p| (p.width, p.height))
 }
 
+/// Xorg VERIFY_PICTURE (`render/picturestr.h:363`, error value set at
+/// `render/render.c:252`): the first of `ids` that names no Picture.
+fn first_missing_picture(state: &ServerState, ids: &[ResourceId]) -> Option<ResourceId> {
+    ids.iter()
+        .copied()
+        .find(|id| state.resources.picture(*id).is_none())
+}
+
+/// A RENDER destination Picture on an unviewable window: Xorg's composite clip is the
+/// window's clipList/borderClip (`render/mipict.c:114-118`), emptied when it stops being
+/// viewable (`mi/mivaltree.c:690-695`, `mi/miwindow.c:738-745`), so nothing is drawn.
+fn dst_picture_window_unviewable(state: &ServerState, pic: ResourceId) -> bool {
+    state
+        .resources
+        .picture(pic)
+        .and_then(|p| p.window)
+        .is_some_and(|w| window_unviewable(state, w))
+}
+
+/// True for a window that is not viewable (Xorg: not realized); false for pixmaps.
+fn window_unviewable(state: &ServerState, id: ResourceId) -> bool {
+    state
+        .resources
+        .window(id)
+        .is_some_and(|w| w.map_state != crate::resources::MapState::Viewable)
+}
+
 /// Source-availability split for CopyArea/CopyPlane (X11 §CopyArea;
 /// Xorg miHandleExposures): the part of the requested source rect
 /// outside the source drawable's bounds is not copied. Returns the
@@ -27289,6 +30217,10 @@ fn copy_area_source_split(
     Option<(i16, i16, i16, i16, u16, u16)>,
     Vec<(i16, i16, u16, u16)>,
 ) {
+    if window_unviewable(state, src) {
+        // Xorg: an unrealized window's clipList is empty, so nothing copies (micopy.c:282).
+        return (None, vec![(dst_x, dst_y, width, height)]);
+    }
     let Some((sw, sh)) = drawable_size(state, src) else {
         // Unknown source geometry: keep the old conservative
         // behavior (copy as requested, no missing region).
@@ -27466,16 +30398,21 @@ fn handle_copy_area(
         // Clamp the copy to the AVAILABLE part of the source drawable
         // (X11 §CopyArea): out-of-bounds source regions are never
         // copied; they become the GraphicsExpose region below.
-        let (avail, missing) = copy_area_source_split(
-            state,
-            request.src,
-            request.src_x,
-            request.src_y,
-            request.dst_x,
-            request.dst_y,
-            request.width,
-            request.height,
-        );
+        let (avail, missing) = if window_unviewable(state, request.dst) {
+            // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
+            (None, Vec::new())
+        } else {
+            copy_area_source_split(
+                state,
+                request.src,
+                request.src_x,
+                request.src_y,
+                request.dst_x,
+                request.dst_y,
+                request.width,
+                request.height,
+            )
+        };
         let request = match avail {
             Some((sx, sy, dx, dy, w, h)) => x11::CopyAreaRequest {
                 src_x: sx,
@@ -27687,12 +30624,29 @@ fn copy_area_effective_dst_rects(
                 && c.width > 0
                 && c.height > 0
                 && !is_manual)
-                .then_some(CopyAreaSubRect {
-                    x: c.x,
-                    y: c.y,
-                    width: c.width,
-                    height: c.height,
+                .then(|| {
+                    let rect = x11::xfixes::RegionRect {
+                        x: c.x,
+                        y: c.y,
+                        width: c.width,
+                        height: c.height,
+                    };
+                    // A shaped child takes only its bounding shape out
+                    // (Xorg subtracts its `borderSize`): GDK clips a
+                    // native window inside a client-side one with it, and
+                    // the parent's button bar outside it stays drawable.
+                    crate::nested::intersect_regions(
+                        &[rect],
+                        &current_bounding_in_parent(state, *cid),
+                    )
                 })
+        })
+        .flatten()
+        .map(|r| CopyAreaSubRect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
         })
         .collect();
     if child_rects.is_empty() {
@@ -27843,7 +30797,12 @@ fn handle_copy_plane(
         backend.apply_draw_state(origin, &st)?;
         // Clamp to the available source region (same contract as
         // CopyArea — out-of-bounds source becomes GraphicsExpose).
-        let (avail, missing) = copy_area_source_split(state, src, sx, sy, dx, dy, w, h);
+        let (avail, missing) = if window_unviewable(state, dst) {
+            // Xorg miDoCopy returns before copying or exposing: NoExpose (micopy.c:157).
+            (None, Vec::new())
+        } else {
+            copy_area_source_split(state, src, sx, sy, dx, dy, w, h)
+        };
         if let Some((asx, asy, adx, ady, aw, ah)) = avail {
             backend.copy_plane(
                 origin,
@@ -28219,6 +31178,28 @@ fn handle_free_pixmap(
             FREE_PIXMAP_OPCODE,
         );
     };
+    if removed.composite_name {
+        // A name owns its own alias ref: a sibling name sharing the backing must not hide it.
+        let names: Vec<_> = removed.host_xid.into_iter().collect();
+        let last = crate::core_loop::process_disconnect::release_removed_names(
+            state, backend, origin, &names,
+        );
+        crate::core_loop::process_disconnect::free_orphaned_host_pixmaps(
+            state,
+            backend,
+            last.clone(),
+            &last,
+            None,
+        );
+        debug!(
+            "client {} #{} FreePixmap pixmap=0x{:x} (window name) host_xid={:?}",
+            client_id.0,
+            sequence.0,
+            pixmap.0,
+            removed.host_xid.map(crate::backend::PixmapHandle::as_raw),
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     let still_referenced = removed
         .host_xid
         // The BORDER reference is as load-bearing as the background one:
@@ -28338,15 +31319,16 @@ fn handle_list_fonts_with_info(
 
 fn handle_change_keyboard_mapping(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let first_keycode = body.first().copied().unwrap_or(8);
+    let kpk = body.get(1).copied().unwrap_or(0);
     let count = header.data;
-    // Xorg ProcChangeKeyboardMapping: first_keycode < min_keycode →
-    // BadValue; first + count - 1 > max_keycode → BadValue.
+    // Xorg ProcChangeKeyboardMapping (dix/devices.c); BadLength is checked at dispatch.
     if first_keycode < 8 {
         return emit_x11_error(
             state,
@@ -28357,32 +31339,101 @@ fn handle_change_keyboard_mapping(
             100,
         );
     }
-    if u32::from(first_keycode) + u32::from(count) > 256 {
+    // Xorg reports keySymsPerKeyCode as the error value for both conditions.
+    if u32::from(first_keycode) + u32::from(count) > 256 || kpk == 0 {
         return emit_x11_error(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
-            u32::from(first_keycode) + u32::from(count) - 1,
+            u32::from(kpk),
             100,
         );
     }
-    // Store the keysym rows: body = first_keycode(1)
-    // keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
-    let kpk = body.get(1).copied().unwrap_or(0);
-    store_keymap_overrides(state, first_keycode, kpk, count, &body[4.min(body.len())..]);
-    // Server-wide MappingNotify fanout: every connected client sees the
-    // same keymap change. We collect ids first to avoid an &/&mut overlap
-    // through `state.clients`.
-    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
-    });
+    // XkbApplyMappingChange changes nothing (and notifies nothing) for zero keys.
+    if count == 0 {
+        return Ok(RequestOutcome::Handled);
+    }
+    // Body: first_keycode(1) keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
+    let xkb_change = apply_keymap_change(
+        state,
+        backend,
+        first_keycode,
+        kpk,
+        count,
+        &body[4.min(body.len())..],
+    );
+    // Xorg's order (XkbSendNotification): XkbMapNotify, then the core
+    // MappingNotify (XkbSendLegacyMapNotify), then the ControlsNotify of a
+    // per-key repeat change and an IndicatorMapNotify.
+    let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    if let Some(change) = &xkb_change {
+        crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
+    }
+    // The core MappingNotify (Xorg XkbSendLegacyMapNotify): every client
+    // but an XKB client that didn't select the change as a MapNotify detail.
+    legacy_keyboard_mapping_notify(state, xkb_change.as_ref(), first_keycode, count);
+    if let Some(change) = &xkb_change {
+        crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+            state,
+            xkb_event_base,
+            change,
+            (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
+        );
+    }
     debug!(
         "client {} #{} ChangeKeyboardMapping",
         client_id.0, sequence.0
     );
     Ok(RequestOutcome::Handled)
+}
+
+/// Hand the rows to the backend's XKB keymap (Xorg `XkbApplyMappingChange`),
+/// else to `state.keymap_overrides`. Returns what the XKB keymap change did,
+/// for the XKB notifications; `None` for the core-only store.
+fn apply_keymap_change(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    first_keycode: u8,
+    kpk: u8,
+    count: u8,
+    syms: &[u8],
+) -> Option<crate::backend::KeyboardMappingChange> {
+    let n = usize::from(count) * usize::from(kpk);
+    let keysyms: Vec<u32> = syms
+        .chunks_exact(4)
+        .take(n)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let change = backend.change_keyboard_mapping(first_keycode, kpk, &keysyms);
+    if change.is_none() {
+        store_keymap_overrides(state, first_keycode, kpk, count, syms);
+    }
+    change
+}
+
+/// The core MappingNotify(Keyboard) of a keyboard mapping change, as Xorg's
+/// `XkbSendLegacyMapNotify` sends it from the change's MapNotify: to every
+/// client but an XKB-initialised one whose map details miss the change.
+/// Without an XKB keymap (`None`) the change counts as KeySyms over the
+/// request's keys.
+fn legacy_keyboard_mapping_notify(
+    state: &mut ServerState,
+    change: Option<&crate::backend::KeyboardMappingChange>,
+    first_keycode: u8,
+    count: u8,
+) {
+    let (changed, first, num) = change.map_or((0x0002, first_keycode, count), |c| {
+        let m = c.map_notify;
+        (m.changed, m.first_key_sym, m.n_key_syms)
+    });
+    crate::core_loop::xkb_select::send_legacy_core_map_notify(
+        state,
+        crate::core_loop::xkb_select::LegacyCause::MapNotify,
+        changed,
+        first,
+        num,
+    );
 }
 
 /// Install `count` keysym rows starting at `first_keycode` into
@@ -29404,7 +32455,7 @@ fn handle_send_event(
     // guard targets the wnck/mate-panel case, which delivers by mask.
     let core_type = req.event[0] & 0x7f;
     if req.event_mask != 0 && matches!(core_type, 4..=8) {
-        let xi2_bit = 1u32 << core_type;
+        let xi2_bit = 1u64 << core_type;
         let before = targets.len();
         targets.retain(|target| {
             let Some(target_client) = state.clients.get(&target.0) else {
@@ -29608,98 +32659,179 @@ fn handle_warp_pointer(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
-        let src_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
-        let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
-        let dst_x = i16::from_le_bytes([body[16], body[17]]);
-        let dst_y = i16::from_le_bytes([body[18], body[19]]);
-        // Xorg ProcWarpPointer: BadWindow for a nonexistent src or
-        // dst window.
-        if src_window.0 != 0 && state.resources.window(src_window).is_none() {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_WINDOW,
-                src_window.0,
-                41,
+        let rd16 = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]);
+        let rdu16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+        let req = WarpRequest {
+            src: ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]])),
+            dst: ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]])),
+            src_x: i32::from(rd16(8)),
+            src_y: i32::from(rd16(10)),
+            src_w: rdu16(12),
+            src_h: rdu16(14),
+            dst_x: i32::from(rd16(16)),
+            dst_y: i32::from(rd16(18)),
+        };
+        if let Some(bad) = warp_pointer_bad_window(state, &req) {
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_WINDOW, bad, 41);
+        }
+        if !warp_pointer_src_allows(state, &req, WarpSrcRule::Core) {
+            debug!(
+                "client {} #{} WarpPointer no-op (pointer outside src rect)",
+                client_id.0, sequence.0
             );
+            return Ok(RequestOutcome::Handled);
         }
-        if dst_window.0 != 0 && state.resources.window(dst_window).is_none() {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_WINDOW,
-                dst_window.0,
-                41,
-            );
-        }
-        // src_window != None: the warp only happens when the pointer
-        // is currently inside the source rectangle of src_window
-        // (width/height 0 extend to the window edge).
-        if src_window.0 != 0 {
-            let src_x = i16::from_le_bytes([body[8], body[9]]);
-            let src_y = i16::from_le_bytes([body[10], body[11]]);
-            let src_w = u16::from_le_bytes([body[12], body[13]]);
-            let src_h = u16::from_le_bytes([body[14], body[15]]);
-            let (px, py) = state.pointer_root;
-            let (ox, oy) = state.resources.window_absolute_position(src_window);
-            let rel_x = i32::from(px) - ox;
-            let rel_y = i32::from(py) - oy;
-            let (win_w, win_h) = state
-                .resources
-                .window(src_window)
-                .map_or((0, 0), |w| (i32::from(w.width), i32::from(w.height)));
-            let x0 = i32::from(src_x);
-            let y0 = i32::from(src_y);
-            let x1 = if src_w == 0 {
-                win_w
-            } else {
-                x0 + i32::from(src_w)
-            };
-            let y1 = if src_h == 0 {
-                win_h
-            } else {
-                y0 + i32::from(src_h)
-            };
-            if rel_x < x0 || rel_x >= x1 || rel_y < y0 || rel_y >= y1 {
-                debug!(
-                    "client {} #{} WarpPointer no-op (pointer outside src rect)",
-                    client_id.0, sequence.0
-                );
-                return Ok(RequestOutcome::Handled);
-            }
-        }
-        if dst_window.0 == 0 {
-            // dst=None: move relative to the current pointer position.
-            if let Ok(p) = backend.query_pointer(origin) {
-                let abs_x = i32::from(p.win_x) + i32::from(dst_x);
-                let abs_y = i32::from(p.win_y) + i32::from(dst_y);
-                let prev = state.barrier_bypass;
-                state.barrier_bypass = true;
-                backend.warp_pointer_root(state, abs_x, abs_y);
-                state.barrier_bypass = prev;
-            }
-        } else {
-            let host_target = state
-                .resources
-                .host_drawable_target(dst_window)
-                .map(|t| (t.host_xid(), dst_x, dst_y));
-            if let Some((host_xid, x, y)) = host_target {
-                let _ = backend.warp_pointer(origin, host_xid, x, y);
-            }
-            // Resolve the destination to root-absolute coordinates for
-            // self-contained backends (KMS) — see
-            // `Backend::warp_pointer_root`. No-op for proxy backends.
-            let (wx, wy) = state.resources.window_absolute_position(dst_window);
-            let prev = state.barrier_bypass;
-            state.barrier_bypass = true;
-            backend.warp_pointer_root(state, wx + i32::from(dst_x), wy + i32::from(dst_y));
-            state.barrier_bypass = prev;
-        }
+        apply_pointer_warp(state, backend, origin, &req);
     }
     debug!("client {} #{} WarpPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+/// Which of Xorg's two source-rectangle tests a warp uses. Xorg keeps
+/// two copies that differ in one term (see [`warp_pointer_src_allows`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarpSrcRule {
+    /// `ProcWarpPointer` (dix/events.c).
+    Core,
+    /// `ProcXIWarpPointer` (Xi/xiwarppointer.c).
+    XInput2,
+}
+
+/// A decoded core `WarpPointer` or `XIWarpPointer`. The XI FP16.16
+/// coordinates are already converted to whole pixels the way Xorg does
+/// it (`int src_x = stuff->src_x / (double)(1 << 16)`, which truncates
+/// toward zero).
+struct WarpRequest {
+    src: ResourceId,
+    dst: ResourceId,
+    src_x: i32,
+    src_y: i32,
+    src_w: u16,
+    src_h: u16,
+    dst_x: i32,
+    dst_y: i32,
+}
+
+/// The first nonexistent window of a warp, in Xorg's lookup order: the
+/// destination is looked up before the source in both ProcWarpPointer
+/// and ProcXIWarpPointer.
+fn warp_pointer_bad_window(state: &ServerState, req: &WarpRequest) -> Option<u32> {
+    [req.dst, req.src]
+        .into_iter()
+        .find(|w| w.0 != 0 && state.resources.window(*w).is_none())
+        .map(|w| w.0)
+}
+
+/// Whether the pointer is inside the warp's source rectangle, so the
+/// warp goes ahead (always true without a source window).
+///
+/// Ported term for term, including the XI copy's slip: its right-edge
+/// test compares against 0 instead of the pointer x
+/// (`winX + src_x + src_width < 0`, Xi/xiwarppointer.c), so an XI warp
+/// ignores the right edge of the rectangle — only the window's own
+/// extent (via the visibility test) bounds it. Both copies treat the
+/// right/bottom edges as inclusive, and a zero width/height as "to the
+/// window's edge". The core copy skips the visibility test for the root
+/// window (`source->parent &&`); the XI copy always runs it.
+fn warp_pointer_src_allows(state: &ServerState, req: &WarpRequest, rule: WarpSrcRule) -> bool {
+    if req.src.0 == 0 {
+        return true;
+    }
+    let (x, y) = (
+        i32::from(state.pointer_root.0),
+        i32::from(state.pointer_root.1),
+    );
+    let (win_x, win_y) = state.resources.window_absolute_position(req.src);
+    let left = win_x + req.src_x;
+    let top = win_y + req.src_y;
+    let right_limit = match rule {
+        WarpSrcRule::Core => x,
+        WarpSrcRule::XInput2 => 0,
+    };
+    let outside = x < left
+        || y < top
+        || (req.src_w != 0 && left + i32::from(req.src_w) < right_limit)
+        || (req.src_h != 0 && top + i32::from(req.src_h) < y);
+    if outside {
+        return false;
+    }
+    let check_visibility = rule == WarpSrcRule::XInput2 || req.src != ROOT_WINDOW;
+    !check_visibility || point_in_window_is_visible(state, req.src, x, y)
+}
+
+/// Xorg `PointInWindowIsVisible` (dix/window.c): the window is viewable
+/// and the root point lies in its visible border-inclusive region and
+/// input shape. The pointer hit test resolves exactly that — the point is
+/// in `window`'s region iff the deepest window under it is `window` or
+/// one of its inferiors.
+fn point_in_window_is_visible(state: &ServerState, window: ResourceId, x: i32, y: i32) -> bool {
+    if window == ROOT_WINDOW {
+        return true;
+    }
+    let viewable = state
+        .resources
+        .window(window)
+        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+    if !viewable {
+        return false;
+    }
+    let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) else {
+        return false;
+    };
+    state
+        .root_pointer_target_at(x, y)
+        .is_some_and(|(hit, _, _)| {
+            hit == window || crate::core_loop::xi1_focus::is_ancestor(state, window, hit)
+        })
+}
+
+/// Move the sprite for a validated warp: relative to the destination
+/// window's origin, or to the current position when there is none,
+/// clamped to the screen like ProcWarpPointer/ProcXIWarpPointer, then
+/// through the backend's absolute-motion path (which generates the
+/// crossing and motion events a warp is specified to produce). Warps
+/// bypass pointer barriers.
+fn apply_pointer_warp(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    req: &WarpRequest,
+) {
+    let (base_x, base_y) = if req.dst.0 == 0 {
+        (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        )
+    } else {
+        state.resources.window_absolute_position(req.dst)
+    };
+    let (root_w, root_h) = state
+        .resources
+        .window(ROOT_WINDOW)
+        .map_or((1, 1), |r| (i32::from(r.width), i32::from(r.height)));
+    let x = base_x
+        .saturating_add(req.dst_x)
+        .clamp(0, (root_w - 1).max(0));
+    let y = base_y
+        .saturating_add(req.dst_y)
+        .clamp(0, (root_h - 1).max(0));
+    if req.dst.0 != 0 {
+        // Proxy backends warp the host pointer relative to the host
+        // window (a no-op on KMS, which only uses `warp_pointer_root`).
+        let to_i16 = |v: i32| i16::try_from(v).unwrap_or(if v < 0 { i16::MIN } else { i16::MAX });
+        if let Some(target) = state.resources.host_drawable_target(req.dst) {
+            let _ = backend.warp_pointer(
+                origin,
+                target.host_xid(),
+                to_i16(req.dst_x),
+                to_i16(req.dst_y),
+            );
+        }
+    }
+    let prev = state.barrier_bypass;
+    state.barrier_bypass = true;
+    backend.warp_pointer_root(state, x, y);
+    state.barrier_bypass = prev;
 }
 
 fn handle_get_modifier_mapping(
@@ -30527,7 +33659,8 @@ pub(crate) fn confine_pointer_now(state: &mut ServerState, backend: &mut dyn Bac
 /// Xorg `ActivatePointerGrab`/`DeactivatePointerGrab` →
 /// `DoEnterLeaveEvents(sprite.win ↔ grab window, NotifyGrab/Ungrab)`.
 /// Events flow through the normal per-window mask filter (EnterWindow
-/// 0x10 / LeaveWindow 0x20) to every selecting client.
+/// 0x10 / LeaveWindow 0x20) to every selecting client, then the same chain
+/// in XI2 form (`DeviceEnterLeaveEvents`), from the master pointer.
 pub(crate) fn emit_core_pointer_grab_chain(
     state: &mut ServerState,
     from_win: ResourceId,
@@ -30540,7 +33673,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
     let chain = crate::crossings::normal_mode_crossings(state, from_win, to_win);
     let (root_x, root_y) = state.pointer_root;
     let server_time = state.timestamp_now();
-    for e in chain {
+    for e in &chain {
         let (mask, enter) = match e.kind {
             crate::crossings::CrossingKind::Enter => (0x10u32, true),
             crate::crossings::CrossingKind::Leave => (0x20u32, false),
@@ -30548,6 +33681,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let (ox, oy) = state.resources.window_absolute_position(e.window);
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
         let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
             let crossing = yserver_protocol::x11::CrossingEvent {
                 sequence: seq,
@@ -30562,12 +33696,52 @@ pub(crate) fn emit_core_pointer_grab_chain(
                 state: 0,
                 detail: e.detail,
                 mode,
+                focus,
             };
             if enter {
                 x11::encode_enter_notify_event(buf, order, crossing);
             } else {
                 x11::encode_leave_notify_event(buf, order, crossing);
             }
+        });
+    }
+    for e in chain {
+        let evtype: u16 = match e.kind {
+            crate::crossings::CrossingKind::Enter => 7,
+            crate::crossings::CrossingKind::Leave => 8,
+        };
+        // Xorg sends these before the grab is installed and after it is
+        // gone, so the window's selections get them, whatever the grab.
+        let targets =
+            crate::core_loop::pointer_fanout::xi2_master_selectors(state, e.window, evtype);
+        if targets.is_empty() {
+            continue;
+        }
+        let (ox, oy) = state.resources.window_absolute_position(e.window);
+        let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
+        let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
+        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            x11::encode_xi2_crossing_event(
+                buf,
+                order,
+                seq,
+                XI2_MAJOR_OPCODE,
+                evtype,
+                2,
+                server_time,
+                ROOT_WINDOW,
+                e.window,
+                root_x,
+                root_y,
+                event_x,
+                event_y,
+                0,
+                mode,
+                e.detail,
+                2,
+                focus,
+            );
         });
     }
 }
@@ -30914,6 +34088,7 @@ fn handle_grab_keyboard(
                 source: crate::server::ActiveKeyboardGrabSource::Explicit,
                 owner_events: header.data != 0,
                 via_xi2: false,
+                xi2_mask: 0,
             });
             state.last_keyboard_grab_time = if time == 0 { now } else { time };
             // Core↔XI bridge — see handle_grab_pointer. GrabKeyboard wire:
@@ -31137,6 +34312,7 @@ fn handle_grab_key(
             pointer_mode: req.pointer_mode,
             keyboard_mode: req.keyboard_mode,
             via_xi2: false,
+            xi2_mask: 0,
         });
         debug!(
             "client {} GrabKey window=0x{:x} keycode={} modifiers=0x{:x}",
@@ -31274,6 +34450,113 @@ fn glx_pbuffer_geometry(state: &ServerState, drawable: ResourceId) -> Option<x11
     })
 }
 
+/// Record a GLXPixmap over the (already validated) X pixmap `x_pixmap` and
+/// take its export-lifetime ref — the one resource model behind GLX 1.0
+/// `CreateGLXPixmap`, GLX 1.3 `CreatePixmap` and
+/// `CreateGLXPixmapWithConfigSGIX`, as Xorg funnels all three through
+/// `DoCreateGLXPixmap` (glxcmds.c:1198-1220).
+///
+/// The host xid is resolved NOW and stored on the record so release is
+/// robust to the X pixmap being freed (X11 `FreePixmap`) before the GLX
+/// destroy / disconnect — re-resolving `x_drawable → host_xid` at release
+/// time would fail once the resource is gone, leaking the ref forever. The
+/// ref keeps the `ExportedBacking` entry (and its dmabuf fd) alive past an
+/// early `FreePixmap`, the counterpart of Xorg's `pixmap->refcnt++`.
+fn insert_glx_pixmap_record(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    owner: ClientId,
+    glx_pixmap: u32,
+    x_pixmap: u32,
+    fbconfig: u32,
+    texture_target: u32,
+) {
+    let acquire_host_xid = state
+        .resources
+        .pixmap(ResourceId(x_pixmap))
+        .and_then(|p| p.host_xid.map(|h| h.as_raw()));
+    state.glx_drawables.insert(
+        glx_pixmap,
+        crate::server::GlxDrawable {
+            owner,
+            kind: crate::server::GlxDrawableKind::Pixmap,
+            x_drawable: x_pixmap,
+            fbconfig,
+            width: 0,
+            height: 0,
+            event_mask: 0,
+            glx_export_host_xid: acquire_host_xid,
+            texture_target,
+        },
+    );
+    if let Some(host_xid) = acquire_host_xid {
+        backend.acquire_glx_pixmap_export(host_xid);
+    }
+}
+
+/// The context XID of a `QueryContext` / `IsDirect` request, or the error
+/// Xorg sends: `BadLength` for a body that is not exactly one XID
+/// (`REQUEST_SIZE_MATCH`), `GLXBadContext` with the XID as bad value when
+/// it names no live context (glx/vnd_dispatch_stubs.c:492-525).
+fn glx_request_context(state: &ServerState, body: &[u8]) -> Result<u32, (u8, u32)> {
+    use yserver_protocol::x11::glx as g;
+    let Some(xid) = g::parse_single_xid(body) else {
+        return Err((x11::error::BAD_LENGTH, 0));
+    };
+    if state.glx_contexts.contains_key(&xid) {
+        Ok(xid)
+    } else {
+        Err((
+            crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_CONTEXT,
+            xid,
+        ))
+    }
+}
+
+/// The FBConfig behind a GLX *visual*, or `None` when `visual` is not one
+/// of the GLX visuals `GetVisualConfigs` advertises. Mirrors Xorg's
+/// `validGlxVisual`, which searches `pGlxScreen->visuals` only — an
+/// FBConfig ID, or an X visual without a GLX config, is not a GLX visual
+/// (glxcmds.c:90-107). `synthesise_glx_fb_configs` stays the single source
+/// of the visual → FBConfig pairing.
+fn glx_visual_fbconfig(visual: u32) -> Option<u32> {
+    use yserver_protocol::x11::glx as g;
+    if !synthesise_glx_visual_configs()
+        .iter()
+        .any(|v| v.visual_id == visual)
+    {
+        return None;
+    }
+    synthesise_glx_fb_configs(false).iter().find_map(|cfg| {
+        cfg.iter()
+            .any(|(a, v)| *a == g::GLX_VISUAL_ID && *v == visual)
+            .then(|| {
+                cfg.iter()
+                    .find(|(a, _)| *a == g::GLX_FBCONFIG_ID)
+                    .map(|(_, v)| *v)
+            })
+            .flatten()
+    })
+}
+
+/// The X visual of a synthesised FBConfig (`GLX_VISUAL_ID`), 0 for a
+/// visual-less or unknown FBConfig — Xorg's `ctx->config->visualID`.
+fn glx_fbconfig_visual(fbconfig: u32) -> u32 {
+    use yserver_protocol::x11::glx as g;
+    synthesise_glx_fb_configs(false)
+        .iter()
+        .find(|cfg| {
+            cfg.iter()
+                .any(|(a, v)| *a == g::GLX_FBCONFIG_ID && *v == fbconfig)
+        })
+        .and_then(|cfg| {
+            cfg.iter()
+                .find(|(a, _)| *a == g::GLX_VISUAL_ID)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(0)
+}
+
 /// Depth (24 or 32) of a synthesised GLX FBConfig, derived from the X visual
 /// it maps to (`ROOT_VISUAL` depth-24 / `ARGB_VISUAL` depth-32) — the single
 /// source of truth is `synthesise_glx_fb_configs`, so this stays correct if
@@ -31357,7 +34640,7 @@ fn handle_translate_coordinates(
     Ok(write_to_client(client, client_id, &buf))
 }
 
-fn write_to_client(
+pub(crate) fn write_to_client(
     client: &mut crate::server::ClientState,
     client_id: ClientId,
     bytes: &[u8],
@@ -31787,6 +35070,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![crtc_id.wrapping_add(0x1000)],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }
     }
 
@@ -31966,6 +35252,23 @@ mod tests {
         assert_eq!(glx_fbconfig_depth(0x103), 32);
         // Unknown fbconfig falls back to the depth-24 default.
         assert_eq!(glx_fbconfig_depth(0xDEAD), 24);
+    }
+
+    /// Every GLX visual `GetVisualConfigs` advertises has an FBConfig carrying
+    /// that visual (Xorg's `pGlxScreen->visuals[i]` *is* a config), and the
+    /// pairing round-trips. FBConfig IDs and the visual-less FBConfig are
+    /// not GLX visuals.
+    #[test]
+    fn glx_visual_fbconfig_pairs_every_advertised_visual() {
+        for visual in synthesise_glx_visual_configs() {
+            let fbconfig = glx_visual_fbconfig(visual.visual_id)
+                .unwrap_or_else(|| panic!("visual 0x{:x} has no FBConfig", visual.visual_id));
+            assert_eq!(glx_fbconfig_visual(fbconfig), visual.visual_id);
+        }
+        assert_eq!(glx_visual_fbconfig(0x101), None);
+        assert_eq!(glx_visual_fbconfig(0x104), None);
+        assert_eq!(glx_fbconfig_visual(0x104), 0);
+        assert_eq!(glx_fbconfig_visual(0xDEAD), 0);
     }
 
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
@@ -32205,7 +35508,7 @@ mod tests {
             via_xi2,
             implicit: false,
             passive,
-            xi2_mask: if via_xi2 { u32::MAX } else { 0 },
+            xi2_mask: if via_xi2 { u64::MAX } else { 0 },
         });
     }
 
@@ -32639,8 +35942,10 @@ mod tests {
     }
 
     /// ProcTranslateCoords applies child input shapes. The Composite Overlay
-    /// Window is the top root child but has an empty input shape by default,
-    /// so a mapped popup below it must be returned as `child`, as on Xorg.
+    /// Window is the top root child and, like Xorg's, starts unshaped, so it
+    /// is the `child` over a popup until the compositor empties its input
+    /// region; then the popup below it is (measured on Xvfb 21.1,
+    /// tools/vng-scenarios/cow-input-shape).
     #[test]
     fn translate_coordinates_skips_empty_input_shaped_cow() {
         use crate::{backend::WindowHandle, resources::COMPOSITE_OVERLAY_WINDOW};
@@ -32665,27 +35970,38 @@ mod tests {
         state
             .resources
             .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
-        state.materialize_cow_input_shape();
         let _ = read_all_available(&mut peer);
 
-        let mut body = Vec::with_capacity(12);
-        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-        body.extend_from_slice(&715i16.to_le_bytes());
-        body.extend_from_slice(&327i16.to_le_bytes());
-        handle_translate_coordinates(&mut state, ClientId(1), SequenceNumber(1), &body)
-            .expect("handle_translate_coordinates");
-
-        let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes.len(), 32);
-        assert_eq!(bytes[0], 1, "reply");
+        let mut translate = |state: &mut ServerState| {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&715i16.to_le_bytes());
+            body.extend_from_slice(&327i16.to_le_bytes());
+            handle_translate_coordinates(state, ClientId(1), SequenceNumber(1), &body)
+                .expect("handle_translate_coordinates");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(bytes[0], 1, "reply");
+            assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
+            assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+        };
         assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            translate(&mut state),
+            COMPOSITE_OVERLAY_WINDOW.0,
+            "an unshaped COW is the child over the popup",
+        );
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::new());
+        assert_eq!(
+            translate(&mut state),
             popup.0,
             "empty-input COW must not hide the popup child",
         );
-        assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
-        assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
     }
 
     #[test]
@@ -32790,6 +36106,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             crate::randr::RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -32807,10 +36126,13 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
 
-        let monitors = active_monitors(&state);
+        let monitors = active_monitors(&state, true);
         assert_eq!(monitors.len(), state.randr.outputs.len());
         assert_eq!(monitors.len(), 2);
         assert!(monitors[0].primary);
@@ -32821,6 +36143,712 @@ mod tests {
             (677, 381),
             "automatic monitor geometry still derives physical size from its retained CRTC",
         );
+    }
+
+    /// The two-output guest of `tools/vng-scenarios/xrandr-monitors.sh
+    /// --outputs 2` after `--right-of`: Virtual-1 1920x1440+0+0 (primary),
+    /// Virtual-2 1360x768+1920+0, both 325x203 mm.
+    fn monitor_fixture(byte_order: ClientByteOrder) -> (ServerState, UnixStream) {
+        let output =
+            |name: &str, id: u32, x: i16, width: u16, height: u16| crate::randr::RandrOutput {
+                name: name.into(),
+                output_id: id,
+                crtc_id: id + 2,
+                mode_id: id + 4,
+                connected: true,
+                x,
+                y: 0,
+                width,
+                height,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 325,
+                mm_height: 203,
+                mode_ids: vec![id + 4],
+                num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
+            };
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            7,
+            vec![
+                output("Virtual-1", 1, 0, 1920, 1440),
+                output("Virtual-2", 2, 1920, 1360, 768),
+            ],
+        );
+        let peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().byte_order = byte_order;
+        (state, peer)
+    }
+
+    /// A request body in the client's byte order.
+    struct WireBody(ClientByteOrder, Vec<u8>);
+
+    impl WireBody {
+        fn u32(mut self, v: u32) -> Self {
+            match self.0 {
+                ClientByteOrder::LittleEndian => self.1.extend_from_slice(&v.to_le_bytes()),
+                ClientByteOrder::BigEndian => self.1.extend_from_slice(&v.to_be_bytes()),
+            }
+            self
+        }
+        fn u16(mut self, v: u16) -> Self {
+            match self.0 {
+                ClientByteOrder::LittleEndian => self.1.extend_from_slice(&v.to_le_bytes()),
+                ClientByteOrder::BigEndian => self.1.extend_from_slice(&v.to_be_bytes()),
+            }
+            self
+        }
+        fn bytes(mut self, v: &[u8]) -> Self {
+            self.1.extend_from_slice(v);
+            self
+        }
+    }
+
+    fn wire_u32(bo: ClientByteOrder, b: &[u8]) -> u32 {
+        let b: [u8; 4] = b[..4].try_into().unwrap();
+        match bo {
+            ClientByteOrder::LittleEndian => u32::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u32::from_be_bytes(b),
+        }
+    }
+
+    fn wire_u16(bo: ClientByteOrder, b: &[u8]) -> u16 {
+        let b: [u8; 2] = b[..2].try_into().unwrap();
+        match bo {
+            ClientByteOrder::LittleEndian => u16::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u16::from_be_bytes(b),
+        }
+    }
+
+    /// Swap `body` as the reader would, then dispatch it as RANDR `minor`.
+    fn randr_wire_request(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        minor: u8,
+        body: WireBody,
+    ) -> Vec<u8> {
+        let WireBody(byte_order, mut body) = body;
+        yserver_protocol::x11::request_swap::swap_request_body(128, minor, byte_order, &mut body);
+        handle_randr_request(
+            state,
+            &mut RecordingBackend::new(),
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+        )
+        .expect("RANDR request");
+        read_all_available(peer)
+    }
+
+    /// `SetMonitor` body: window, then name primary automatic noutput x y
+    /// width height mm-width mm-height outputs.
+    #[allow(clippy::too_many_arguments)]
+    fn set_monitor_body(
+        bo: ClientByteOrder,
+        window: u32,
+        name: u32,
+        primary: bool,
+        noutput: u16,
+        geometry: (i16, i16, u16, u16),
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> WireBody {
+        #[allow(clippy::cast_sign_loss)]
+        let mut body = WireBody(bo, Vec::new())
+            .u32(window)
+            .u32(name)
+            .bytes(&[u8::from(primary), 0])
+            .u16(noutput)
+            .u16(geometry.0 as u16)
+            .u16(geometry.1 as u16)
+            .u16(geometry.2)
+            .u16(geometry.3)
+            .u32(mm.0)
+            .u32(mm.1);
+        for &output in outputs {
+            body = body.u32(output);
+        }
+        body
+    }
+
+    fn set_monitor(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        name: &str,
+        primary: bool,
+        geometry: (i16, i16, u16, u16),
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> Vec<u8> {
+        let bo = state.clients[&1].byte_order;
+        let atom = state.atoms.intern(name, false).0;
+        #[allow(clippy::cast_possible_truncation)]
+        let body = set_monitor_body(
+            bo,
+            ROOT_WINDOW.0,
+            atom,
+            primary,
+            outputs.len() as u16,
+            geometry,
+            mm,
+            outputs,
+        );
+        randr_wire_request(state, peer, x11randr_minor::SET_MONITOR, body)
+    }
+
+    fn delete_monitor(state: &mut ServerState, peer: &mut UnixStream, name: u32) -> Vec<u8> {
+        let bo = state.clients[&1].byte_order;
+        let body = WireBody(bo, Vec::new()).u32(ROOT_WINDOW.0).u32(name);
+        randr_wire_request(state, peer, x11randr_minor::DELETE_MONITOR, body)
+    }
+
+    mod x11randr_minor {
+        pub const SET_MONITOR: u8 = yserver_protocol::x11::randr::RR_SET_MONITOR;
+        pub const DELETE_MONITOR: u8 = yserver_protocol::x11::randr::RR_DELETE_MONITOR;
+    }
+
+    /// One decoded `GetMonitors` entry: name, primary, automatic,
+    /// "WxH+X+Y", "mmWxmmH", outputs.
+    type WireMonitor = (String, bool, bool, String, (u32, u32), Vec<u32>);
+
+    fn get_monitors(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        get_active: bool,
+    ) -> Vec<WireMonitor> {
+        let bo = state.clients[&1].byte_order;
+        let body =
+            WireBody(bo, Vec::new())
+                .u32(ROOT_WINDOW.0)
+                .bytes(&[u8::from(get_active), 0, 0, 0]);
+        let r = randr_wire_request(
+            state,
+            peer,
+            yserver_protocol::x11::randr::RR_GET_MONITORS,
+            body,
+        );
+        assert_eq!(r[0], 1, "GetMonitors reply: {r:02x?}");
+        assert_eq!(
+            wire_u32(bo, &r[4..]) as usize * 4 + 32,
+            r.len(),
+            "reply length"
+        );
+        let count = wire_u32(bo, &r[12..]);
+        let mut total_outputs = 0;
+        let mut offset = 32;
+        let mut monitors = Vec::new();
+        for _ in 0..count {
+            let m = &r[offset..];
+            let n_out = usize::from(wire_u16(bo, &m[6..]));
+            #[allow(clippy::cast_possible_wrap)]
+            let geometry = format!(
+                "{}x{}+{}+{}",
+                wire_u16(bo, &m[12..]),
+                wire_u16(bo, &m[14..]),
+                wire_u16(bo, &m[8..]) as i16,
+                wire_u16(bo, &m[10..]) as i16,
+            );
+            let name = state
+                .atoms
+                .name(AtomId(wire_u32(bo, m)))
+                .unwrap_or("?")
+                .to_string();
+            let outputs = (0..n_out).map(|i| wire_u32(bo, &m[24 + i * 4..])).collect();
+            monitors.push((
+                name,
+                m[4] != 0,
+                m[5] != 0,
+                geometry,
+                (wire_u32(bo, &m[16..]), wire_u32(bo, &m[20..])),
+                outputs,
+            ));
+            total_outputs += n_out;
+            offset += 24 + n_out * 4;
+        }
+        assert_eq!(offset, r.len());
+        assert_eq!(wire_u32(bo, &r[16..]) as usize, total_outputs, "noutputs");
+        monitors
+    }
+
+    fn wm(
+        name: &str,
+        primary: bool,
+        automatic: bool,
+        geometry: &str,
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> WireMonitor {
+        (
+            name.into(),
+            primary,
+            automatic,
+            geometry.into(),
+            mm,
+            outputs.to_vec(),
+        )
+    }
+
+    /// XINERAMA `(GetScreenCount, QueryScreens)` in the client's order.
+    fn xinerama_heads(state: &mut ServerState, peer: &mut UnixStream) -> (u8, Vec<String>) {
+        use yserver_protocol::x11::xinerama as xin;
+        let bo = state.clients[&1].byte_order;
+        let mut send = |state: &mut ServerState, minor: u8, body: &[u8]| {
+            handle_xinerama_request(
+                state,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 151,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("XINERAMA request");
+            read_all_available(peer)
+        };
+        let window = WireBody(bo, Vec::new()).u32(ROOT_WINDOW.0).1;
+        let count = send(state, xin::GET_SCREEN_COUNT, &window);
+        let screens = send(state, xin::QUERY_SCREENS, &[]);
+        let n = wire_u32(bo, &screens[8..]) as usize;
+        #[allow(clippy::cast_possible_wrap)]
+        let heads = (0..n)
+            .map(|i| {
+                let s = &screens[32 + i * 8..];
+                format!(
+                    "{}x{}+{}+{}",
+                    wire_u16(bo, &s[4..]),
+                    wire_u16(bo, &s[6..]),
+                    wire_u16(bo, s) as i16,
+                    wire_u16(bo, &s[2..]) as i16,
+                )
+            })
+            .collect();
+        (count[1], heads)
+    }
+
+    const BOTH_ORDERS: [ClientByteOrder; 2] =
+        [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian];
+
+    /// Measured split: `--setmonitor left 960/170x1440/211+0+0 Virtual-1`
+    /// and `right ...+960+0 none` hide Virtual-1's automatic monitor, keep
+    /// Virtual-2's, and nobody is primary (the primary output is covered).
+    #[test]
+    fn set_monitor_split_replaces_the_covered_automatic_monitor() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            let r = set_monitor(
+                &mut state,
+                &mut peer,
+                "left",
+                false,
+                (0, 0, 960, 1440),
+                (170, 211),
+                &[1],
+            );
+            assert!(r.is_empty(), "{r:02x?}");
+            let r = set_monitor(
+                &mut state,
+                &mut peer,
+                "right",
+                false,
+                (960, 0, 960, 1440),
+                (170, 211),
+                &[],
+            );
+            assert!(r.is_empty(), "{r:02x?}");
+            let want = vec![
+                wm("left", false, false, "960x1440+0+0", (170, 211), &[1]),
+                wm("right", false, false, "960x1440+960+0", (170, 211), &[]),
+                wm(
+                    "Virtual-2",
+                    false,
+                    true,
+                    "1360x768+1920+0",
+                    (325, 203),
+                    &[2],
+                ),
+            ];
+            assert_eq!(get_monitors(&mut state, &mut peer, false), want, "{bo:?}");
+            assert_eq!(get_monitors(&mut state, &mut peer, true), want, "{bo:?}");
+            assert_eq!(
+                xinerama_heads(&mut state, &mut peer),
+                (
+                    3,
+                    vec![
+                        "960x1440+0+0".into(),
+                        "960x1440+960+0".into(),
+                        "1360x768+1920+0".into()
+                    ]
+                ),
+            );
+        }
+    }
+
+    /// Measured: a 0x0+0+0 monitor over both outputs is their union, and
+    /// its physical size is Xorg 21.1's integer `last_w / first_w *
+    /// first_mm` — 1360/1920 = 0 — so 0x0 mm. With Virtual-2 off it is
+    /// Virtual-1's geometry alone.
+    #[test]
+    fn automatic_geometry_client_monitor_follows_the_crtc_layout() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "both",
+                false,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1, 2],
+            );
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, false),
+                vec![wm("both", false, false, "3280x1440+0+0", (0, 0), &[1, 2])],
+            );
+            state.randr.outputs[1].mode_id = 0;
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, false),
+                vec![wm(
+                    "both",
+                    false,
+                    false,
+                    "1920x1440+0+0",
+                    (325, 203),
+                    &[1, 2]
+                )],
+            );
+        }
+    }
+
+    /// Measured `cprim`: a primary client monitor leads the list, and the
+    /// uncovered CRTC of the primary output is ALSO reported primary —
+    /// Xorg's leading entry does not count towards `has_primary`.
+    #[test]
+    fn client_primary_and_uncovered_primary_output_are_both_primary() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            state.randr.primary_output = 2;
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "autogeo",
+                false,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "cprim",
+                true,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1],
+            );
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, true),
+                vec![
+                    wm("cprim", true, false, "1920x1440+0+0", (325, 203), &[1]),
+                    wm("autogeo", false, false, "1920x1440+0+0", (325, 203), &[1]),
+                    wm("Virtual-2", true, true, "1360x768+1920+0", (325, 203), &[2]),
+                ],
+            );
+        }
+    }
+
+    /// Measured `extra-primary`: a new primary monitor clears the old one's
+    /// flag; deleting it leaves no primary client monitor behind.
+    #[test]
+    fn a_new_primary_client_monitor_clears_the_previous_one() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "left",
+                false,
+                (0, 0, 960, 1440),
+                (170, 211),
+                &[1],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "right",
+                true,
+                (960, 0, 960, 1440),
+                (100, 50),
+                &[],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "extra",
+                true,
+                (0, 0, 10, 10),
+                (100, 50),
+                &[],
+            );
+            let names = |m: Vec<WireMonitor>| m.into_iter().map(|m| (m.0, m.1)).collect::<Vec<_>>();
+            assert_eq!(
+                names(get_monitors(&mut state, &mut peer, false)),
+                vec![
+                    ("extra".into(), true),
+                    ("left".into(), false),
+                    ("right".into(), false),
+                    ("Virtual-2".into(), false),
+                ],
+            );
+            let extra = state.atoms.intern("extra", true).0;
+            assert!(delete_monitor(&mut state, &mut peer, extra).is_empty());
+            assert_eq!(
+                names(get_monitors(&mut state, &mut peer, false)),
+                vec![
+                    ("left".into(), false),
+                    ("right".into(), false),
+                    ("Virtual-2".into(), false),
+                ],
+            );
+        }
+    }
+
+    /// Measured `empty`: a 0x0 monitor with no outputs is listed by
+    /// `GetMonitors(get_active=0)` and counted by XINERAMA GetScreenCount,
+    /// but neither `get_active=1` nor QueryScreens reports it.
+    #[test]
+    fn an_empty_monitor_is_counted_but_not_active() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "empty",
+                false,
+                (0, 0, 0, 0),
+                (100, 50),
+                &[],
+            );
+            let all = get_monitors(&mut state, &mut peer, false);
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[1], wm("empty", false, false, "0x0+0+0", (100, 50), &[]));
+            assert_eq!(get_monitors(&mut state, &mut peer, true).len(), 2);
+            let (count, heads) = xinerama_heads(&mut state, &mut peer);
+            assert_eq!((count, heads.len()), (3, 2));
+        }
+    }
+
+    /// The error table measured on Xorg 21.1 (`mon.py errors`): codes and
+    /// wire values, no state change on failure, and no validation of the
+    /// output ids.
+    #[test]
+    fn set_and_delete_monitor_errors_match_xorg() {
+        use yserver_protocol::x11::error;
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            let err = |r: &[u8]| {
+                assert_eq!(r.len(), 32, "one error: {r:02x?}");
+                assert_eq!(r[0], 0);
+                (r[1], wire_u32(bo, &r[4..]), wire_u16(bo, &r[8..]), r[10])
+            };
+            let output_atom = state.atoms.intern("Virtual-1", false).0;
+            let name = state.atoms.intern("errmon", false).0;
+            let root = ROOT_WINDOW.0;
+            let set = |state: &mut ServerState,
+                       peer: &mut UnixStream,
+                       window,
+                       name,
+                       noutput,
+                       outputs: &[u32]| {
+                let body = set_monitor_body(
+                    bo,
+                    window,
+                    name,
+                    false,
+                    noutput,
+                    (0, 0, 10, 10),
+                    (100, 50),
+                    outputs,
+                );
+                randr_wire_request(state, peer, x11randr_minor::SET_MONITOR, body)
+            };
+            let cases: Vec<(&str, Vec<u8>, (u8, u32))> = vec![
+                (
+                    "name=output",
+                    set(&mut state, &mut peer, root, output_atom, 0, &[]),
+                    (error::BAD_VALUE, output_atom),
+                ),
+                (
+                    "name=None",
+                    set(&mut state, &mut peer, root, 0, 0, &[]),
+                    (error::BAD_ATOM, root),
+                ),
+                (
+                    "name=0x7fffff",
+                    set(&mut state, &mut peer, root, 0x7f_ffff, 0, &[]),
+                    (error::BAD_ATOM, root),
+                ),
+                (
+                    "bad window",
+                    set(&mut state, &mut peer, 0x7ff_fffe, name, 0, &[]),
+                    (error::BAD_WINDOW, 0x7ff_fffe),
+                ),
+                (
+                    "noutput=1, none sent",
+                    set(&mut state, &mut peer, root, name, 1, &[]),
+                    (error::BAD_LENGTH, 0),
+                ),
+                (
+                    "noutput=0, one sent",
+                    set(&mut state, &mut peer, root, name, 0, &[1]),
+                    (error::BAD_LENGTH, 0),
+                ),
+            ];
+            for (label, r, (code, value)) in cases {
+                assert_eq!(err(&r), (code, value, 43, 128), "SetMonitor {label} {bo:?}");
+            }
+            let short = randr_wire_request(
+                &mut state,
+                &mut peer,
+                x11randr_minor::SET_MONITOR,
+                WireBody(bo, Vec::new()).u32(root).u32(name),
+            );
+            assert_eq!(err(&short).0, error::BAD_LENGTH);
+            assert!(state.randr_client_monitors.is_empty());
+
+            // Output ids are not validated (measured: `bogusout` succeeded).
+            let bogus = state.atoms.intern("bogusout", false).0;
+            assert!(set(&mut state, &mut peer, root, bogus, 1, &[0x7777]).is_empty());
+            assert_eq!(
+                err(&set(&mut state, &mut peer, root, bogus, 0, &[])),
+                (error::BAD_VALUE, bogus, 43, 128),
+                "21.1 refuses a name already in use",
+            );
+
+            let never = state.atoms.intern("nosuchmon", false).0;
+            let del = |state: &mut ServerState, peer: &mut UnixStream, window: u32, name: u32| {
+                let body = WireBody(bo, Vec::new()).u32(window).u32(name);
+                randr_wire_request(state, peer, x11randr_minor::DELETE_MONITOR, body)
+            };
+            let cases: Vec<(&str, Vec<u8>, (u8, u32))> = vec![
+                (
+                    "never set",
+                    del(&mut state, &mut peer, root, never),
+                    (error::BAD_VALUE, never),
+                ),
+                (
+                    "None",
+                    del(&mut state, &mut peer, root, 0),
+                    (error::BAD_ATOM, 0),
+                ),
+                (
+                    "0x7fffff",
+                    del(&mut state, &mut peer, root, 0x7f_ffff),
+                    (error::BAD_ATOM, 0x7f_ffff),
+                ),
+                (
+                    "bad window",
+                    del(&mut state, &mut peer, 0x7ff_fffe, bogus),
+                    (error::BAD_WINDOW, 0x7ff_fffe),
+                ),
+                (
+                    "output name",
+                    del(&mut state, &mut peer, root, output_atom),
+                    (error::BAD_VALUE, output_atom),
+                ),
+            ];
+            for (label, r, (code, value)) in cases {
+                assert_eq!(
+                    err(&r),
+                    (code, value, 44, 128),
+                    "DeleteMonitor {label} {bo:?}"
+                );
+            }
+            let long = randr_wire_request(
+                &mut state,
+                &mut peer,
+                x11randr_minor::DELETE_MONITOR,
+                WireBody(bo, Vec::new()).u32(root).u32(bogus).u32(0),
+            );
+            assert_eq!(err(&long).0, error::BAD_LENGTH);
+            assert_eq!(
+                state.randr_client_monitors.len(),
+                1,
+                "bogusout survived every failure"
+            );
+            assert!(del(&mut state, &mut peer, root, bogus).is_empty());
+            assert!(state.randr_client_monitors.is_empty());
+        }
+    }
+
+    /// Measured `mon.py events`: each successful Set/DeleteMonitor sends one
+    /// core ConfigureNotify on the root (`RRSendConfigNotify`) and no RANDR
+    /// event; a failed one sends nothing.
+    #[test]
+    fn set_and_delete_monitor_notify_with_a_root_configure_notify() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            state
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .event_masks
+                .insert(ROOT_WINDOW, 0x0002_0000);
+            state.randr_select_masks.insert((1, ROOT_WINDOW), 0x1f);
+            let root = state
+                .resources
+                .window(ROOT_WINDOW)
+                .map(|w| (w.width, w.height))
+                .unwrap();
+            let configure_notify = |r: &[u8]| {
+                assert_eq!(r.len(), 32, "exactly one event: {r:02x?}");
+                assert_eq!(r[0], 22, "ConfigureNotify");
+                assert_eq!(wire_u32(bo, &r[4..]), ROOT_WINDOW.0, "event window");
+                assert_eq!(wire_u32(bo, &r[8..]), ROOT_WINDOW.0, "window");
+                assert_eq!(wire_u32(bo, &r[12..]), 0, "above-sibling None");
+                assert_eq!((wire_u16(bo, &r[20..]), wire_u16(bo, &r[22..])), root);
+            };
+            configure_notify(&set_monitor(
+                &mut state,
+                &mut peer,
+                "evmon",
+                false,
+                (0, 0, 100, 100),
+                (100, 50),
+                &[],
+            ));
+            let again = set_monitor(
+                &mut state,
+                &mut peer,
+                "evmon",
+                false,
+                (0, 0, 200, 100),
+                (100, 50),
+                &[],
+            );
+            assert_eq!(
+                (again.len(), again[0]),
+                (32, 0),
+                "reused name: an error, no event"
+            );
+            let evmon = state.atoms.intern("evmon", true).0;
+            configure_notify(&delete_monitor(&mut state, &mut peer, evmon));
+            let again = delete_monitor(&mut state, &mut peer, evmon);
+            assert_eq!(
+                (again.len(), again[0]),
+                (32, 0),
+                "unknown name: an error, no event"
+            );
+        }
     }
 
     #[test]
@@ -33232,16 +37260,15 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // Master keyboard (device 3) focused on a real window.
+        // Master keyboard (device 3) focused on a real window. The master
+        // keyboard's focus IS the core focus (Xorg: `inputInfo.keyboard->
+        // focus`, which ProcSetInputFocus and ProcXIGetFocus share).
         let win = 0x4000_0005u32;
-        state.xi1_device_focus.insert(
-            3,
-            crate::server::Xi1DeviceFocus {
-                focus: win,
-                revert_to: 0,
-                time: 0,
-            },
-        );
+        state.core_focus = crate::server::CoreFocus {
+            raw: win,
+            revert_to: 0,
+            time: 0,
+        };
         // XIGetFocus { deviceid:CARD16=3 } + pad.
         let header = RequestHeader {
             opcode: 137,
@@ -33294,6 +37321,849 @@ mod tests {
         assert_eq!(bytes[0], 0, "error packet");
         assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "BadDevice");
         assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor echoed");
+    }
+
+    // ── XIWarpPointer / XISetFocus / XIChangeHierarchy / XISelectEvents ──
+    //
+    // Expected values below are Xvfb 21.1.24 captures (raw-socket probe,
+    // little-endian client unless noted), cross-checked against
+    // Xi/xiwarppointer.c, Xi/xisetdevfocus.c, Xi/xichangehierarchy.c and
+    // Xi/xiselectev.c.
+
+    /// Send one XInput request (major 137) from client 1 and return what
+    /// the client received.
+    fn send_xi_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let header = RequestHeader {
+            opcode: 137,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        };
+        handle_xi2_request(
+            state,
+            backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            body,
+        )
+        .expect("xi request");
+        read_all_available(peer)
+    }
+
+    fn assert_xi_error(bytes: &[u8], code: u8, value: u32, minor: u16) {
+        assert_eq!(bytes.len(), 32, "one error packet: {bytes:02x?}");
+        assert_eq!(bytes[0], 0, "error packet: {bytes:02x?}");
+        assert_eq!(bytes[1], code, "error code: {bytes:02x?}");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            value,
+            "errorValue: {bytes:02x?}"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            minor,
+            "minor opcode: {bytes:02x?}"
+        );
+        assert_eq!(bytes[10], XI2_MAJOR_OPCODE, "major opcode");
+    }
+
+    /// A mapped 100×100 child of the root at (100, 100), owned by client 1.
+    fn seed_mapped_window_at_100(state: &mut ServerState, xid: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(xid));
+    }
+
+    fn fp1616(v: f64) -> i32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = (v * 65536.0).round() as i32;
+        raw
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn xi_warp_body(
+        src: u32,
+        dst: u32,
+        src_x: f64,
+        src_y: f64,
+        src_w: u16,
+        src_h: u16,
+        dst_x: f64,
+        dst_y: f64,
+        deviceid: u16,
+    ) -> Vec<u8> {
+        let mut b = Vec::with_capacity(32);
+        b.extend_from_slice(&src.to_le_bytes());
+        b.extend_from_slice(&dst.to_le_bytes());
+        b.extend_from_slice(&fp1616(src_x).to_le_bytes());
+        b.extend_from_slice(&fp1616(src_y).to_le_bytes());
+        b.extend_from_slice(&src_w.to_le_bytes());
+        b.extend_from_slice(&src_h.to_le_bytes());
+        b.extend_from_slice(&fp1616(dst_x).to_le_bytes());
+        b.extend_from_slice(&fp1616(dst_y).to_le_bytes());
+        b.extend_from_slice(&deviceid.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_core_warp(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        src: u32,
+        dst: u32,
+        src_x: i16,
+        src_y: i16,
+        src_w: u16,
+        src_h: u16,
+        dst_x: i16,
+        dst_y: i16,
+    ) {
+        let mut b = Vec::with_capacity(20);
+        b.extend_from_slice(&src.to_le_bytes());
+        b.extend_from_slice(&dst.to_le_bytes());
+        b.extend_from_slice(&src_x.to_le_bytes());
+        b.extend_from_slice(&src_y.to_le_bytes());
+        b.extend_from_slice(&src_w.to_le_bytes());
+        b.extend_from_slice(&src_h.to_le_bytes());
+        b.extend_from_slice(&dst_x.to_le_bytes());
+        b.extend_from_slice(&dst_y.to_le_bytes());
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 41,
+                data: 0,
+                length_units: 6,
+            },
+            &b,
+            None,
+        )
+        .expect("WarpPointer");
+    }
+
+    #[test]
+    fn xi_warp_pointer_moves_to_truncated_fp1616_destination() {
+        // Xvfb: XIWarpPointer(dst=root, 10.75, 20.25) → pointer (10, 20);
+        // then relative (-0.5, -1.5) → (10, 19); relative (+0.99, +2.5)
+        // → (10, 21). ProcXIWarpPointer stores the FP16.16 values in
+        // ints, so the fraction truncates toward zero.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 10.75, 20.25, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert!(bytes.is_empty(), "XIWarpPointer has no reply: {bytes:02x?}");
+        assert_eq!(backend.warped_to, Some((10, 20)));
+
+        state.pointer_root = (10, 20);
+        let body = xi_warp_body(0, 0, 0.0, 0.0, 0, 0, -0.5, -1.5, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((10, 19)));
+
+        state.pointer_root = (10, 19);
+        let body = xi_warp_body(0, 0, 0.0, 0.0, 0, 0, 0.99, 2.5, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((10, 21)));
+    }
+
+    #[test]
+    fn xi_warp_pointer_to_window_and_clamped_to_the_screen() {
+        // Xvfb (1024×768): dst=W(100,100) (5, 6) → (105, 106);
+        // (-5.5, -6.5) → (95, 94); dst=root (5000, 5000) → (w-1, h-1);
+        // (-3, -3) → (0, 0). The test root is 800×600.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const W: u32 = 0x0040_0001;
+        seed_mapped_window_at_100(&mut state, W);
+        for (dx, dy, want) in [(5.0, 6.0, (105, 106)), (-5.5, -6.5, (95, 94))] {
+            let body = xi_warp_body(0, W, 0.0, 0.0, 0, 0, dx, dy, 2);
+            let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_eq!(backend.warped_to, Some(want), "dst=W ({dx}, {dy})");
+        }
+        for (dx, dy, want) in [
+            (5000.0, 5000.0, (799, 599)),
+            (800.0, 600.0, (799, 599)),
+            (-3.0, -3.0, (0, 0)),
+        ] {
+            let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, dx, dy, 2);
+            let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_eq!(backend.warped_to, Some(want), "dst=root ({dx}, {dy})");
+        }
+    }
+
+    #[test]
+    fn xi_warp_pointer_rejects_everything_but_the_master_pointer() {
+        // ProcXIWarpPointer: BadDevice unless the device is a master
+        // pointer or a floating slave (yserver has no floating slaves).
+        // errorValue = deviceid. Xvfb: devices 0,1,3,4,5,99 → BadDevice.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for dev in [0u16, 1, 3, 4, 5, 99] {
+            let body = xi_warp_body(0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 5.0, 5.0, dev);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, u32::from(dev), 41);
+        }
+        // The device is checked before the windows.
+        let body = xi_warp_body(0, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 3);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 3, 41);
+        assert_eq!(backend.warped_to, None, "no rejected request may warp");
+    }
+
+    #[test]
+    fn xi_warp_pointer_bad_windows_report_dst_before_src() {
+        // Xvfb: dst bad → BadWindow(dst); src bad → BadWindow(src); both
+        // bad → BadWindow(dst).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = xi_warp_body(0, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 41);
+        let body = xi_warp_body(0x00be_ef00, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00be_ef00, 41);
+        let body = xi_warp_body(0x00be_ef00, 0x00de_ad00, 0.0, 0.0, 0, 0, 5.0, 5.0, 2);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 41);
+        assert_eq!(backend.warped_to, None);
+    }
+
+    #[test]
+    fn xi_warp_pointer_source_rectangle_follows_xorgs_xi_arithmetic() {
+        // Xorg keeps two copies of the source-rectangle test. The XI one
+        // compares the right edge against 0 instead of the pointer x
+        // (`winX + src_x + src_width < 0`), so with W at (100,100) 100×100
+        // and src rect (0,0,10,10):
+        //   pointer (160,105): XIWarpPointer WARPS, core WarpPointer doesn't;
+        //   pointer (105,160): neither warps (the bottom edge is checked);
+        //   pointer (105,110): XI warps (bottom edge inclusive).
+        // Both also require the pointer to be visible in the source window:
+        //   pointer (50,50), src rect (-100,-100,0,0): no warp.
+        // The src coordinates truncate: pointer (104,104) with src_x 4.9
+        // warps, with 5.0 doesn't; pointer (99,99) with -0.9 doesn't.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_mapped_window_at_100(&mut state, W);
+        let cases = [
+            ((160_i16, 105_i16), (0.0, 0.0, 10_u16, 10_u16), true),
+            ((105, 160), (0.0, 0.0, 10, 10), false),
+            ((105, 110), (0.0, 0.0, 10, 10), true),
+            ((50, 50), (-100.0, -100.0, 0, 0), false),
+            ((104, 104), (4.9, 4.9, 0, 0), true),
+            ((104, 104), (5.0, 5.0, 0, 0), false),
+            ((99, 99), (-0.9, -0.9, 0, 0), false),
+        ];
+        for (pointer, (sx, sy, sw, sh), warps) in cases {
+            let mut backend = RecordingBackend::new();
+            state.pointer_root = pointer;
+            let body = xi_warp_body(W, ROOT_WINDOW.0, sx, sy, sw, sh, 300.0, 300.0, 2);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+            assert!(bytes.is_empty(), "no error: {bytes:02x?}");
+            assert_eq!(
+                backend.warped_to,
+                warps.then_some((300, 300)),
+                "pointer {pointer:?} src ({sx},{sy},{sw},{sh})"
+            );
+        }
+        // src = root: always inside.
+        let mut backend = RecordingBackend::new();
+        state.pointer_root = (50, 50);
+        let body = xi_warp_body(ROOT_WINDOW.0, ROOT_WINDOW.0, 0.0, 0.0, 0, 0, 70.0, 70.0, 2);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 41, &body);
+        assert_eq!(backend.warped_to, Some((70, 70)));
+    }
+
+    #[test]
+    fn core_warp_pointer_source_rectangle_matches_xorg() {
+        // ProcWarpPointer (Xvfb): W at (100,100) 100×100, src rect
+        // (0,0,10,10): pointer (160,105) → no warp; (110,105) → warp (the
+        // right edge is inclusive: `winX + srcX + srcWidth < x`);
+        // (50,50) with src rect (-100,-100,0,0) → no warp (the pointer is
+        // not visible in W). Bad windows report dst before src.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        seed_mapped_window_at_100(&mut state, W);
+        for (pointer, (sx, sy, sw, sh), warps) in [
+            ((160, 105), (0, 0, 10, 10), false),
+            ((110, 105), (0, 0, 10, 10), true),
+            ((105, 110), (0, 0, 10, 10), true),
+            ((50, 50), (-100, -100, 0, 0), false),
+        ] {
+            let mut backend = RecordingBackend::new();
+            state.pointer_root = pointer;
+            send_core_warp(
+                &mut state,
+                &mut backend,
+                W,
+                ROOT_WINDOW.0,
+                sx,
+                sy,
+                sw,
+                sh,
+                300,
+                300,
+            );
+            assert_eq!(
+                backend.warped_to,
+                warps.then_some((300, 300)),
+                "pointer {pointer:?} src ({sx},{sy},{sw},{sh})"
+            );
+        }
+        let mut backend = RecordingBackend::new();
+        send_core_warp(
+            &mut state,
+            &mut backend,
+            0x00be_ef00,
+            0x00de_ad00,
+            0,
+            0,
+            0,
+            0,
+            5,
+            5,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_WINDOW);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0x00de_ad00,
+            "dst is looked up first"
+        );
+    }
+
+    fn xi_set_focus_body(focus: u32, time: u32, deviceid: u16) -> Vec<u8> {
+        let mut b = Vec::with_capacity(12);
+        b.extend_from_slice(&focus.to_le_bytes());
+        b.extend_from_slice(&time.to_le_bytes());
+        b.extend_from_slice(&deviceid.to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b
+    }
+
+    /// Split a byte stream into X packets (GenericEvents carry a tail).
+    fn split_packets(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 32 <= bytes.len() {
+            let mut len = 32;
+            if bytes[pos] & 0x7f == 35 || bytes[pos] == 1 {
+                len += 4 * u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            }
+            out.push(&bytes[pos..pos + len]);
+            pos += len;
+        }
+        out
+    }
+
+    #[test]
+    fn xi_set_focus_on_the_master_keyboard_is_core_set_input_focus() {
+        // Xvfb: XISetFocus(dev 3, W) → GetInputFocus = W with revert_to
+        // RevertToParent (ProcXISetFocus passes RevertToParent), XIGetFocus
+        // (3) = W, and the core + XI2 FocusIn/FocusOut chain is delivered.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        {
+            let client = state.clients.get_mut(&1).unwrap();
+            client.event_masks.insert(ResourceId(W), FOCUS_CHANGE_MASK);
+            client
+                .xi2_masks
+                .insert((ResourceId(W), 0), (1 << 9) | (1 << 10));
+        }
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0, 3),
+        );
+        assert_eq!(state.core_focus.raw, W);
+        assert_eq!(state.core_focus.revert_to, 2, "RevertToParent");
+        let packets = split_packets(&bytes);
+        assert!(
+            packets
+                .iter()
+                .any(|p| p[0] == 9 && u32::from_le_bytes(p[4..8].try_into().unwrap()) == W),
+            "core FocusIn on W: {packets:02x?}"
+        );
+        assert!(
+            packets.iter().any(|p| p[0] == 35
+                && u16::from_le_bytes(p[8..10].try_into().unwrap()) == 9
+                && u32::from_le_bytes(p[24..28].try_into().unwrap()) == W),
+            "XI2 FocusIn on W: {packets:02x?}"
+        );
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[3, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &W.to_le_bytes(), "XIGetFocus(3) = W");
+
+        // Xvfb: None and PointerRoot are accepted and reported back.
+        for focus in [0u32, 1] {
+            let _ = send_xi_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                49,
+                &xi_set_focus_body(focus, 0, 3),
+            );
+            assert_eq!(state.core_focus.raw, focus);
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[3, 0, 0, 0]);
+            let bytes = split_packets(&bytes).last().unwrap().to_vec();
+            assert_eq!(&bytes[8..12], &focus.to_le_bytes());
+        }
+
+        // A time later than the server's clock is silently ignored.
+        let _ = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0x7fff_ffff, 3),
+        );
+        assert_eq!(state.core_focus.raw, 1, "future-timestamp request ignored");
+    }
+
+    #[test]
+    fn xi_set_focus_errors_match_xorg() {
+        // Xvfb: devices without a focus class (the pointers) and unknown
+        // ids → BadDevice, errorValue 0 (ProcXISetFocus sets none); a
+        // missing window → BadWindow; an unviewable one → BadMatch with
+        // the window as errorValue.
+        const UNMAPPED: u32 = 0x0040_0002;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(UNMAPPED),
+                parent: ROOT_WINDOW,
+                width: 10,
+                height: 10,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        for dev in [0u16, 1, 2, 4, 99] {
+            let bytes = send_xi_request(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                49,
+                &xi_set_focus_body(ROOT_WINDOW.0, 0, dev),
+            );
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 0, 49);
+        }
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(0x00de_ad00, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_WINDOW, 0x00de_ad00, 49);
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(UNMAPPED, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_MATCH, UNMAPPED, 49);
+        // FollowKeyboard on the master keyboard itself would make it
+        // follow itself (Xvfb segfaults on it); yserver rejects it.
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(3, 0, 3),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 3, 49);
+        assert_eq!(state.core_focus.raw, 1, "focus untouched by errors");
+    }
+
+    #[test]
+    fn xi_set_focus_on_the_slave_keyboard_sets_its_own_focus() {
+        // Xvfb: XISetFocus(dev 5, W) leaves the core focus alone and
+        // XIGetFocus(5) = W; FollowKeyboard (3) is accepted on a slave
+        // and reported back as 3.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(W, 0, 5),
+        );
+        assert!(bytes.is_empty(), "{bytes:02x?}");
+        assert_eq!(state.core_focus.raw, 1, "core focus unchanged");
+        let f = crate::core_loop::xi1_focus::device_focus(&state, 5);
+        assert_eq!((f.focus, f.revert_to), (W, 2));
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[5, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &W.to_le_bytes());
+        let _ = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            49,
+            &xi_set_focus_body(3, 0, 5),
+        );
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[5, 0, 0, 0]);
+        assert_eq!(&bytes[8..12], &3u32.to_le_bytes(), "FollowKeyboard");
+    }
+
+    #[test]
+    fn xi_get_focus_rejects_pointer_devices() {
+        // Xvfb: XIGetFocus on devices without a focus class (2, 4) →
+        // BadDevice, errorValue 0.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for dev in [2u8, 4] {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 50, &[dev, 0, 0, 0]);
+            assert_xi_error(&bytes, XI1_ERROR_BAD_DEVICE, 0, 50);
+        }
+    }
+
+    fn xi_hierarchy_body(num_changes: u8, changes: &[&[u8]]) -> Vec<u8> {
+        let mut b = vec![num_changes, 0, 0, 0];
+        for c in changes {
+            b.extend_from_slice(c);
+        }
+        b
+    }
+
+    fn le_u16s(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn remove_master_change(dev: u16, mode: u8) -> Vec<u8> {
+        let mut c = le_u16s(&[2, 3, dev]);
+        c.extend_from_slice(&[mode, 0]);
+        c.extend_from_slice(&le_u16s(&[2, 3]));
+        c
+    }
+
+    #[test]
+    fn xi_change_hierarchy_answers_like_xorg_for_the_fixed_devices() {
+        // Every row is an Xvfb 21.1.24 capture. Xvfb's devices 4/5 are the
+        // XTest slaves, which Xorg refuses to attach/detach ("these are
+        // fixed"); yserver's 4/5 are fixed too, so the answers match
+        // device-for-device. `None` = Success (no reply, no event).
+        const BAD_DEVICE: u8 = XI1_ERROR_BAD_DEVICE;
+        let attach = |dev: u16, master: u16| le_u16s(&[3, 2, dev, master]);
+        let detach = |dev: u16| le_u16s(&[4, 2, dev, 0]);
+        // (label, request body, expected error (code, errorValue)).
+        type Case = (&'static str, Vec<u8>, Option<(u8, u32)>);
+        let cases: Vec<Case> = vec![
+            ("empty", xi_hierarchy_body(0, &[]), None),
+            (
+                "remove 2 float",
+                xi_hierarchy_body(1, &[&remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 3 attach",
+                xi_hierarchy_body(1, &[&remove_master_change(3, 1)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 2 mode 5",
+                xi_hierarchy_body(1, &[&remove_master_change(2, 5)]),
+                Some((x11::error::BAD_VALUE, 0)),
+            ),
+            (
+                "remove 4",
+                xi_hierarchy_body(1, &[&remove_master_change(4, 2)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "remove 99",
+                xi_hierarchy_body(1, &[&remove_master_change(99, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove 0",
+                xi_hierarchy_body(1, &[&remove_master_change(0, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "attach 4->2",
+                xi_hierarchy_body(1, &[&attach(4, 2)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "attach 4->3",
+                xi_hierarchy_body(1, &[&attach(4, 3)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "attach 5->3",
+                xi_hierarchy_body(1, &[&attach(5, 3)]),
+                Some((BAD_DEVICE, 5)),
+            ),
+            (
+                "attach 2->3",
+                xi_hierarchy_body(1, &[&attach(2, 3)]),
+                Some((BAD_DEVICE, 2)),
+            ),
+            (
+                "attach 99->2",
+                xi_hierarchy_body(1, &[&attach(99, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "detach 4",
+                xi_hierarchy_body(1, &[&detach(4)]),
+                Some((BAD_DEVICE, 4)),
+            ),
+            (
+                "detach 5",
+                xi_hierarchy_body(1, &[&detach(5)]),
+                Some((BAD_DEVICE, 5)),
+            ),
+            (
+                "detach 2",
+                xi_hierarchy_body(1, &[&detach(2)]),
+                Some((BAD_DEVICE, 2)),
+            ),
+            (
+                "detach 99",
+                xi_hierarchy_body(1, &[&detach(99)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "unknown type skipped",
+                xi_hierarchy_body(1, &[&le_u16s(&[9, 1])]),
+                None,
+            ),
+            (
+                "unknown then remove 2",
+                xi_hierarchy_body(2, &[&le_u16s(&[9, 1]), &remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "remove with length 2",
+                xi_hierarchy_body(1, &[&le_u16s(&[2, 2, 2, 2, 0, 3])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "attach with length 3",
+                xi_hierarchy_body(1, &[&le_u16s(&[3, 3, 4, 2, 0, 0])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "num_changes 2, one change",
+                xi_hierarchy_body(2, &[&remove_master_change(2, 2)]),
+                Some((BAD_DEVICE, 0)),
+            ),
+            (
+                "change length past the request",
+                xi_hierarchy_body(1, &[&le_u16s(&[3, 9, 4, 2])]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+            (
+                "add master, name longer than the request",
+                xi_hierarchy_body(1, &[&[1, 0, 2, 0, 4, 0, 1, 1]]),
+                Some((x11::error::BAD_LENGTH, 0)),
+            ),
+        ];
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for (label, body, want) in cases {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 43, &body);
+            match want {
+                None => assert!(bytes.is_empty(), "{label}: {bytes:02x?}"),
+                Some((code, value)) => {
+                    assert!(!bytes.is_empty(), "{label}: expected an error");
+                    assert_eq!(bytes[1], code, "{label}: {bytes:02x?}");
+                    assert_xi_error(&bytes, code, value, 43);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xi_change_hierarchy_add_master_is_refused_with_bad_alloc() {
+        // Xorg creates the pair; yserver's device set is fixed, so it
+        // answers the way Xorg does when it cannot allocate a device
+        // (AllocDevicePair → BadAlloc) and sends no HierarchyChanged.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), 1 << 11);
+        let mut add = le_u16s(&[1, 3, 3]);
+        add.extend_from_slice(&[1, 1]);
+        add.extend_from_slice(b"foo\0");
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            43,
+            &xi_hierarchy_body(1, &[&add]),
+        );
+        assert_xi_error(&bytes, x11::error::BAD_ALLOC, 0, 43);
+    }
+
+    #[test]
+    fn xi_change_hierarchy_reads_changes_in_client_byte_order() {
+        // The change list is opaque to the request swapper; a big-endian
+        // client's AttachSlave(4 → 2) must still name device 4.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let change: Vec<u8> = [3u16, 2, 4, 2]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        let bytes = send_xi_request(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            43,
+            &xi_hierarchy_body(1, &[&change]),
+        );
+        assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "{bytes:02x?}");
+        assert_eq!(&bytes[4..8], &4u32.to_be_bytes(), "errorValue = device 4");
+    }
+
+    #[test]
+    fn xi_unknown_minor_is_bad_request() {
+        // Xvfb: XI minors 0, 62, 200, 255 → BadRequest (ProcIDispatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        for minor in [0u8, 62, 200, 255] {
+            let bytes = send_xi_request(&mut state, &mut backend, &mut peer, minor, &[0; 8]);
+            assert_xi_error(&bytes, x11::error::BAD_REQUEST, 0, u16::from(minor));
+        }
+    }
+
+    fn xi_select_body(window: u32, masks: &[(u16, &[u32])]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&window.to_le_bytes());
+        b.extend_from_slice(&u16::try_from(masks.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        for (dev, words) in masks {
+            b.extend_from_slice(&dev.to_le_bytes());
+            b.extend_from_slice(&u16::try_from(words.len()).unwrap().to_le_bytes());
+            for w in *words {
+                // Event masks are bit arrays: byte i holds bits 8i..8i+7.
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn xi_select_events_keeps_bit_32_and_rejects_bits_past_the_last_event() {
+        // Xvfb: select dev 2 = {2, 30, 31, 32} (mask_len 2) + dev 3 = {3};
+        // XIGetSelectedEvents returns exactly
+        //   02000200 040000c0 01000000 03000100 08000000
+        // (masks in device order, trailing zero words trimmed). Selecting
+        // bit 33 → BadValue(33), bit 69 → BadValue(69), and the rejected
+        // request changes nothing.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        let lo = (1u32 << 2) | (1 << 30) | (1 << 31);
+        let body = xi_select_body(W, &[(2, &[lo, 1]), (3, &[1 << 3])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert!(bytes.is_empty(), "{bytes:02x?}");
+        let expected_tail: [u8; 20] = [
+            0x02, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x01, 0x00, 0x08, 0x00, 0x00, 0x00,
+        ];
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(reply.len(), 52, "{reply:02x?}");
+        assert_eq!(&reply[4..8], &5u32.to_le_bytes(), "reply length");
+        assert_eq!(&reply[8..10], &2u16.to_le_bytes(), "num_masks");
+        assert_eq!(&reply[32..], &expected_tail);
+
+        let body = xi_select_body(W, &[(2, &[0, 1 << 1])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 33, 46);
+        let body = xi_select_body(W, &[(2, &[1 << 2, 0, 1 << 5])]);
+        let bytes = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        assert_xi_error(&bytes, x11::error::BAD_VALUE, 69, 46);
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(
+            &reply[32..],
+            &expected_tail,
+            "rejected selects applied nothing"
+        );
+    }
+
+    #[test]
+    fn xi_get_selected_events_header_fields_use_client_byte_order() {
+        // Xvfb, big-endian client, same selection as above:
+        //   00020002 040000c0 01000000 00030001 08000000
+        // deviceid/mask_len/num_masks swap; the mask bytes don't.
+        const W: u32 = 0x0040_0001;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        seed_mapped_window_at_100(&mut state, W);
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        let lo = (1u32 << 2) | (1 << 30) | (1 << 31);
+        // Request bodies reach the handler already swapped to LE.
+        let body = xi_select_body(W, &[(2, &[lo, 1]), (3, &[1 << 3])]);
+        let _ = send_xi_request(&mut state, &mut backend, &mut peer, 46, &body);
+        let reply = send_xi_request(&mut state, &mut backend, &mut peer, 60, &W.to_le_bytes());
+        assert_eq!(&reply[4..8], &5u32.to_be_bytes(), "reply length");
+        assert_eq!(&reply[8..10], &2u16.to_be_bytes(), "num_masks");
+        assert_eq!(
+            &reply[32..],
+            &[
+                0x00, 0x02, 0x00, 0x02, 0x04, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03,
+                0x00, 0x01, 0x08, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
@@ -33945,91 +38815,1020 @@ mod tests {
         assert!(mark_randr_unsupported_warned(&mut state, 19));
     }
 
-    #[test]
-    fn randr_set_crtc_transform_accepts_only_direct_identity_state() {
-        use yserver_protocol::x11::randr as x11randr;
+    const RR_IDENTITY: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
 
-        let mut state = ServerState::new();
-        let crtc = state.randr.outputs[0].crtc_id;
-        let mut peer = install_client(&mut state, 1);
+    fn rr_scale(word: i32) -> [i32; 9] {
+        [word, 0, 0, 0, word, 0, 0, 0, 0x0001_0000]
+    }
+
+    fn randr_transform_body_with_params(
+        crtc: u32,
+        matrix: [i32; 9],
+        filter_name: &[u8],
+        params: &[i32],
+    ) -> Vec<u8> {
+        let mut body = randr_transform_body(crtc, matrix, filter_name);
+        for param in params {
+            body.extend_from_slice(&param.to_le_bytes());
+        }
+        body
+    }
+
+    /// Send one SetCrtcTransform; the error code it produced, if any.
+    fn randr_set_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Option<u8> {
         let mut backend = RecordingBackend::new();
-        let identity = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
         let header = RequestHeader {
             opcode: 128,
-            data: x11randr::RR_SET_CRTC_TRANSFORM,
-            length_units: 12,
+            data: yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
         };
-
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(1),
             header,
-            &randr_transform_body(crtc, identity, &[]),
+            body,
         )
-        .expect("identity transform");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_eq!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
-        );
+        .expect("SetCrtcTransform");
+        let out = read_all_available(peer);
+        if out.is_empty() {
+            return None;
+        }
+        assert_eq!(out.len(), 32, "one error");
+        assert_eq!(out[0], 0, "error packet");
+        assert_eq!(out[10], 128, "major = RANDR");
+        Some(out[1])
+    }
 
-        // An identity filter is harmless and remains a wire-success no-op,
-        // but its parameters are not retained for GetCrtcTransform, so even
-        // an empty filter name with a parameter tail must warn.
-        let mut parameter_only = randr_transform_body(crtc, identity, &[]);
-        parameter_only.extend_from_slice(&0x0001_0000i32.to_le_bytes());
+    #[test]
+    fn randr_set_crtc_transform_validates_in_xorg_order() {
+        // rrcrtc.c:1755-1785 and RRCrtcTransformSet, then D2. Each case
+        // also carries the fault of every later step, so it shows the
+        // earlier check wins. BadAccess (leased CRTC) is not reachable:
+        // yserver has no RANDR leases.
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+        let bad_crtc = RANDR_BAD_CRTC;
+        let singular = [0i32; 9];
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let mut overrun = randr_transform_body(crtc, singular, b"");
+        overrun[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let mut overrun_bad_crtc = overrun.clone();
+        overrun_bad_crtc[0..4].copy_from_slice(&0xdeadu32.to_le_bytes());
+        let mut overrun_invertible = randr_transform_body(crtc, RR_IDENTITY, b"");
+        overrun_invertible[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let one = 0x0001_0000;
+        let cases: Vec<(&str, Vec<u8>, Option<u8>)> = vec![
+            ("BadCrtc", overrun_bad_crtc, Some(bad_crtc)),
+            ("non-invertible", overrun, Some(x11::error::BAD_MATCH)),
+            (
+                "negative nparams",
+                overrun_invertible,
+                Some(x11::error::BAD_LENGTH),
+            ),
+            (
+                "unknown filter",
+                randr_transform_body(crtc, rotate, b"box"),
+                Some(x11::error::BAD_NAME),
+            ),
+            (
+                "convolution parameter check",
+                randr_transform_body_with_params(crtc, RR_IDENTITY, b"convolution", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "params without a filter",
+                randr_transform_body_with_params(crtc, rotate, b"", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: valid convolution",
+                randr_transform_body_with_params(
+                    crtc,
+                    RR_IDENTITY,
+                    b"convolution",
+                    &[one, one, one],
+                ),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: rotation",
+                randr_transform_body(crtc, rotate, b"good"),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: translation",
+                randr_transform_body(crtc, [one, 0, 5 * one, 0, one, 0, 0, 0, one], b""),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "pure scale",
+                randr_transform_body(crtc, rr_scale(104_857), b"good"),
+                None,
+            ),
+            (
+                "bilinear keeps its parameters",
+                randr_transform_body_with_params(crtc, rr_scale(131_072), b"bilinear", &[one]),
+                None,
+            ),
+            (
+                "identity with a filter",
+                randr_transform_body(crtc, RR_IDENTITY, b"FAST"),
+                None,
+            ),
+        ];
+        for (name, body, expected) in cases {
+            assert_eq!(
+                randr_set_crtc_transform(&mut state, &mut peer, &body),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    fn randr_get_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        crtc: u32,
+    ) -> Vec<u8> {
+        randr_get_crtc_transform_body(state, peer, &crtc.to_le_bytes())
+    }
+
+    fn randr_get_crtc_transform_body(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(2),
             RequestHeader {
-                length_units: 13,
-                ..header
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
-            &parameter_only,
+            body,
         )
-        .expect("identity transform with filter parameter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_ne!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
+        .expect("GetCrtcTransform");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn get_crtc_transform_of_the_wrong_length_is_bad_length_before_bad_crtc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let crtc = state.randr.outputs[0].crtc_id;
+        // Short (header only) and oversized, for a real and a bogus CRTC.
+        for body in [
+            Vec::new(),
+            [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+            [0xdead_u32.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+        ] {
+            let reply = randr_get_crtc_transform_body(&mut state, &mut peer, &body);
+            assert_eq!(reply.len(), 32, "{body:?}");
+            assert_eq!(
+                (reply[0], reply[1]),
+                (0, x11::error::BAD_LENGTH),
+                "{body:?}"
+            );
+            assert_eq!(
+                (reply[8], reply[10]),
+                (yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM, 128)
+            );
+        }
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, 0xdead);
+        assert_eq!(
+            (reply[0], reply[1]),
+            (0, RANDR_BAD_CRTC),
+            "the right size looks up"
+        );
+    }
+
+    #[test]
+    fn randr_set_crtc_transform_stores_pending_for_get_crtc_transform() {
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 96, "default: no filter bytes");
+        assert_eq!(reply[44], 1, "hasTransforms");
+        assert_eq!(&reply[88..96], &[0u8; 8]);
+
+        // muffin's scale-down 125% CRTC 6 request (spec table): `good`.
+        let body = randr_transform_body_with_params(crtc, rr_scale(104_857), b"good", &[0x8000]);
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.pending_transform.matrix, rr_scale(104_857));
+        assert_eq!(
+            output.pending_transform.filter,
+            Some(crate::randr::Filter::Bilinear)
+        );
+        assert_eq!(
+            output.current_transform,
+            crate::randr::CrtcTransform::identity()
         );
 
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 108);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            104_857
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[48..52].try_into().unwrap()),
+            0x0001_0000
+        );
+        assert_eq!(&reply[88..96], &[8, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&reply[96..104], b"bilinear", "canonical name, not `good`");
+        assert_eq!(&reply[104..108], &0x8000i32.to_le_bytes());
+
+        // A rejected request leaves the pending transform alone.
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let body = randr_transform_body(crtc, rotate, b"");
+        assert_eq!(
+            randr_set_crtc_transform(&mut state, &mut peer, &body),
+            Some(x11::error::BAD_MATCH)
+        );
+        assert_eq!(
+            state.randr.outputs[0].pending_transform.matrix,
+            rr_scale(104_857)
+        );
+    }
+
+    fn randr_crtc_config_body(crtc: u32, x: i16, y: i16, mode: u32, outputs: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(24 + outputs.len() * 4);
+        body.extend_from_slice(&crtc.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        body.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&mode.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // RR_Rotate_0
+        body.extend_from_slice(&[0u8; 2]);
+        for output in outputs {
+            body.extend_from_slice(&output.to_le_bytes());
+        }
+        body
+    }
+
+    fn randr_set_crtc_config(
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        body: &[u8],
+    ) -> io::Result<RequestOutcome> {
         handle_randr_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+        )
+    }
+
+    /// `(width, height)` of every CrtcChangeNotify in `wire`, and whether a
+    /// SetCrtcConfig Success reply is present.
+    fn randr_crtc_notifies_and_success(wire: &[u8]) -> (Vec<(u16, u16)>, bool) {
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+        let notifies = wire
+            .chunks_exact(32)
+            .filter(|c| c[0] == 89 + 1 && c[1] == yserver_protocol::x11::randr::NOTIFY_CRTC_CHANGE)
+            .map(|c| (u16_at(c, 28), u16_at(c, 30)))
+            .collect();
+        let success = wire.chunks_exact(32).any(|c| c[0] == 1 && c[1] == 0);
+        (notifies, success)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_applies_a_pending_transform_as_a_change() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let same_config =
+            randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+
+        // Nothing pending: the backend's no-op stays a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert!(notifies.is_empty());
+
+        // xrandr --scale 2 (spec, "What Xorg does").
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "one CrtcChangeNotify carrying the mode size"
+        );
+        let applied = &state.randr.outputs[0];
+        assert_eq!(applied.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(applied.footprint(), (output.width * 2, output.height * 2));
+
+        // Applied: the same config is a no-op again.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A disable leaves the current transform in place.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(
+            state.randr.outputs[0].current_transform.matrix,
+            rr_scale(131_072)
+        );
+    }
+
+    fn randr_get_crtc_info(state: &mut ServerState, peer: &mut UnixStream, crtc: u32) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        let body = [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat();
+        handle_randr_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_INFO,
+                length_units: 3,
+            },
+            &body,
+        )
+        .expect("GetCrtcInfo");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_rotation_is_a_change_reported_as_xorg() {
+        use crate::randr::{RR_REFLECT_X, RR_ROTATE_0, RR_ROTATE_90};
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let rotated = |rotation: u16| {
+            let mut body =
+                randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+            body[20..22].copy_from_slice(&rotation.to_le_bytes());
+            body
+        };
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+
+        // `xrandr --rotate left`: same mode and origin, a new rotation.
+        randr_set_crtc_config(&mut state, &mut backend, &rotated(RR_ROTATE_90)).unwrap();
+        let wire = read_all_available(&mut peer);
+        let (notifies, success) = randr_crtc_notifies_and_success(&wire);
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "CrtcChangeNotify keeps the mode size (rrcrtc.c:249)"
+        );
+        let notify = wire.chunks_exact(32).find(|c| c[0] == 90).unwrap();
+        assert_eq!(u16_at(notify, 20), RR_ROTATE_90, "and carries the rotation");
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90);
+        assert!(state.randr.outputs[0].current_transform.is_identity());
+
+        // GetCrtcInfo: the rotated footprint, rotation and modesetting's
+        // rotations 0x3f (measured, tools/vng-scenarios/xrandr-rotate.sh).
+        let reply = randr_get_crtc_info(&mut state, &mut peer, crtc);
+        assert_eq!(reply[0], 1);
+        assert_eq!(
+            (u16_at(&reply, 16), u16_at(&reply, 18)),
+            (output.height, output.width)
+        );
+        assert_eq!(u16_at(&reply, 24), RR_ROTATE_90);
+        assert_eq!(u16_at(&reply, 26), 0x3f);
+
+        // The same rotation again is a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &rotated(RR_ROTATE_90)).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A reflection bit is a change too.
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &rotated(RR_ROTATE_90 | RR_REFLECT_X),
+        )
+        .unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert_eq!(notifies.len(), 1);
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90 | RR_REFLECT_X);
+
+        // A disable keeps the rotation, as xf86RandR12CrtcSet does.
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90 | RR_REFLECT_X);
+        assert_ne!(state.randr.outputs[0].rotation, RR_ROTATE_0);
+    }
+
+    /// A SetScreenConfig from client 1: `(status, new_timestamp,
+    /// new_config_timestamp, root)` of the reply, or `Err(error code)`.
+    fn randr_set_screen_config(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Result<(u8, u32, u32, u32), u8> {
+        handle_randr_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(5),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_SCREEN_CONFIG,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+        )
+        .expect("SetScreenConfig");
+        let wire = read_all_available(peer);
+        let reply = wire
+            .chunks_exact(32)
+            .find(|c| c[0] <= 1)
+            .expect("a reply or an error");
+        let u32_at = |o: usize| u32::from_le_bytes(reply[o..o + 4].try_into().unwrap());
+        if reply[0] == 0 {
+            return Err(reply[1]);
+        }
+        Ok((reply[1], u32_at(8), u32_at(12), u32_at(16)))
+    }
+
+    /// drawable, timestamp, configTimestamp, sizeID, rotation[, rate, pad].
+    fn screen_config_body(
+        config_timestamp: u32,
+        timestamp: u32,
+        size_id: u16,
+        rotation: u16,
+        rate: Option<u16>,
+    ) -> Vec<u8> {
+        let mut body = crate::resources::ROOT_WINDOW.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&timestamp.to_le_bytes());
+        body.extend_from_slice(&config_timestamp.to_le_bytes());
+        body.extend_from_slice(&size_id.to_le_bytes());
+        body.extend_from_slice(&rotation.to_le_bytes());
+        if let Some(rate) = rate {
+            body.extend_from_slice(&rate.to_le_bytes());
+            body.extend_from_slice(&[0; 2]);
+        }
+        body
+    }
+
+    #[test]
+    fn randr_set_screen_config_rotates_the_first_output_as_xorg() {
+        use crate::randr::{RR_ROTATE_90, RR_ROTATE_180};
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.randr_client_versions.insert(ClientId(1), (1, 5));
+        let cts = state.randr.config_timestamp;
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        let mm = (state.randr.width_mm, state.randr.height_mm);
+
+        // `xrandr -o left` (tools/vng-scenarios/xrandr-orientation.sh on
+        // Xorg): screen and CRTC 800×1280 from 1280×800, mm unchanged,
+        // CRTC at 0,0, rotation Rotate_90.
+        let reply = randr_set_screen_config(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            &screen_config_body(cts, 500, 0, RR_ROTATE_90, Some(0)),
+        )
+        .unwrap();
+        assert_eq!(reply, (0, 500, cts, crate::resources::ROOT_WINDOW.0));
+        assert_eq!(
+            (state.randr.screen_width, state.randr.screen_height),
+            (h, w)
+        );
+        assert_eq!((state.randr.width_mm, state.randr.height_mm), mm);
+        let applied = &state.randr.outputs[0];
+        assert_eq!(applied.rotation, RR_ROTATE_90);
+        assert_eq!(applied.footprint(), (output.height, output.width));
+        assert!(backend.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::ApplyCrtcConfig {
+                x: 0,
+                y: 0,
+                mode: Some(_),
+                ..
+            }
+        )));
+
+        // Xorg's statuses, in its order (same probe).
+        let body =
+            |cts, ts, size, rotation, rate| screen_config_body(cts, ts, size, rotation, Some(rate));
+        let mut call = |state: &mut ServerState, b: Vec<u8>| {
+            randr_set_screen_config(state, &mut backend, &mut peer, &b)
+        };
+        assert_eq!(
+            call(&mut state, body(cts + 1, 0, 0, 1, 0)).map(|r| r.0),
+            Ok(1)
+        );
+        assert_eq!(call(&mut state, body(cts, 1, 0, 1, 0)).map(|r| r.0), Ok(2));
+        assert_eq!(
+            call(&mut state, body(cts, 0, 1, 1, 0)),
+            Err(x11::error::BAD_VALUE),
+            "one mode size here"
+        );
+        assert_eq!(
+            call(&mut state, body(cts, 0, 0, 3, 0)),
+            Err(x11::error::BAD_VALUE)
+        );
+        assert_eq!(
+            call(&mut state, body(cts, 0, 0, 0x41, 0)),
+            Err(x11::error::BAD_MATCH)
+        );
+        assert_eq!(
+            call(&mut state, body(cts, 0, 0, 1, 1)),
+            Err(x11::error::BAD_VALUE)
+        );
+        let rate = state.randr.rr10_data().unwrap().rate;
+        assert_eq!(
+            call(&mut state, body(cts, 600, 0, RR_ROTATE_90, rate)).map(|r| (r.0, r.1)),
+            Ok((0, 600)),
+            "the current rate"
+        );
+        // A no-op success still moves lastSetTime (rrscreen.c:1100).
+        assert_eq!(
+            call(&mut state, body(cts, 700, 0, RR_ROTATE_90, 0)).map(|r| (r.0, r.1)),
+            Ok((0, 700))
+        );
+        assert_eq!(state.randr.timestamp, 700);
+        // `-o inverted`: back to the mode's own size.
+        assert_eq!(
+            call(&mut state, body(cts, 800, 0, RR_ROTATE_180, 0)).map(|r| r.0),
+            Ok(0)
+        );
+        assert_eq!(
+            (state.randr.screen_width, state.randr.screen_height),
+            (w, h)
+        );
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_180);
+    }
+
+    #[test]
+    fn randr_set_screen_config_size_follows_the_clients_randr_version() {
+        // REQUEST_SIZE_MATCH by RRClientKnowsRates (rrscreen.c:926-933).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let cts = state.randr.config_timestamp;
+        // Explicit times: CurrentTime is the test clock, behind lastSetTime.
+        let v10 = screen_config_body(cts, 1000, 0, 1, None);
+        let v11 = screen_config_body(cts, 1000, 0, 1, Some(0));
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v11),
+            Err(x11::error::BAD_LENGTH),
+            "no QueryVersion: the 1.0 size"
+        );
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v10).map(|r| r.0),
+            Ok(0)
+        );
+        state.randr_client_versions.insert(ClientId(1), (1, 1));
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v10),
+            Err(x11::error::BAD_LENGTH),
+            "measured: a 1.0-sized request from a 1.5 client"
+        );
+        assert_eq!(
+            randr_set_screen_config(&mut state, &mut backend, &mut peer, &v11).map(|r| r.0),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn randr_get_screen_info_lists_mode_sizes_and_rates_by_client_version() {
+        use crate::randr::RR_ROTATE_90;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let output = state.randr.outputs[0].clone();
+        state.randr.outputs[0].rotation = RR_ROTATE_90;
+        let get =
+            |state: &mut ServerState, backend: &mut RecordingBackend, peer: &mut UnixStream| {
+                handle_randr_request(
+                    state,
+                    backend,
+                    ClientId(1),
+                    SequenceNumber(6),
+                    RequestHeader {
+                        opcode: 128,
+                        data: yserver_protocol::x11::randr::RR_GET_SCREEN_INFO,
+                        length_units: 2,
+                    },
+                    &crate::resources::ROOT_WINDOW.0.to_le_bytes(),
+                )
+                .expect("GetScreenInfo");
+                read_all_available(peer)
+            };
+        let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let rate = state.randr.rr10_data().unwrap().rate;
+        let v10 = get(&mut state, &mut backend, &mut peer);
+        assert_eq!(v10[1], 0x3f, "setOfRotations");
+        assert_eq!(u16_at(&v10, 20), 1, "nSizes");
+        assert_eq!(u16_at(&v10, 24), RR_ROTATE_90);
+        assert_eq!(u16_at(&v10, 26), rate);
+        assert_eq!(u16_at(&v10, 28), 2, "nrateEnts = nsize + nrefresh");
+        assert_eq!(v10.len(), 32 + 8, "no rate lists for a 1.0 client");
+        // The mode size, unswapped while rotated (measured).
+        assert_eq!(
+            (u16_at(&v10, 32), u16_at(&v10, 34)),
+            (output.width, output.height)
+        );
+
+        state.randr_client_versions.insert(ClientId(1), (1, 5));
+        let v11 = get(&mut state, &mut backend, &mut peer);
+        assert_eq!(v11.len(), 32 + 12);
+        assert_eq!((u16_at(&v11, 40), u16_at(&v11, 42)), (1, rate));
+    }
+
+    #[test]
+    fn an_asynchronous_crtc_config_applies_the_transform_pending_at_request_time() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        backend.pending_crtc_config = Some(CrtcConfigToken(7));
+        let config = randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+        let RequestOutcome::PendingCrtcConfig(pending) =
+            randr_set_crtc_config(&mut state, &mut backend, &config).unwrap()
+        else {
+            panic!("the enable must park");
+        };
+        // A new SetCrtcTransform while the enable is in flight stays pending.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        complete_crtc_config(
             &mut state,
             &mut backend,
             ClientId(1),
             SequenceNumber(3),
-            RequestHeader {
-                length_units: 13,
-                ..header
-            },
-            &randr_transform_body(crtc, identity, b"box"),
+            pending.completion,
+            Ok(true),
         )
-        .expect("identity transform with named filter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        .unwrap();
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(output.pending_transform.matrix, rr_scale(32_768));
+    }
 
-        let mut projective = identity;
-        projective[6] = 1;
-        handle_randr_request(
-            &mut state,
-            &mut backend,
-            ClientId(1),
-            SequenceNumber(4),
-            header,
-            &randr_transform_body(crtc, projective, &[]),
-        )
-        .expect("reject non-identity transform");
-        let error = read_all_available(&mut peer);
-        assert_eq!(error.len(), 32);
-        assert_eq!(error[0], 0);
-        assert_eq!(error[1], x11::error::BAD_MATCH);
-        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), crtc);
-        assert_eq!(&error[8..10], &u16::from(header.data).to_le_bytes());
-        assert_eq!(error[10], 128);
+    #[test]
+    fn randr_set_crtc_config_does_not_bound_a_crtc_by_the_screen() {
+        // rrcrtc.c:1436 skips the bounds check for transform-capable CRTCs.
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let x = i16::try_from(state.randr.screen_width).unwrap();
+        let body =
+            randr_crtc_config_body(output.crtc_id, x, 0, output.mode_id, &[output.output_id]);
+        randr_set_crtc_config(&mut state, &mut backend, &body).unwrap();
+        let (_, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success, "past the screen edge is not BadValue");
+    }
+
+    /// The two 2560×1440 outputs of the muffin capture (spec, "What muffin
+    /// sends"): CRTC 4 at 0,0 and CRTC 6 at 2560,0, both mode 0x13.
+    const MUFFIN_MODE: u32 = 0x13;
+    const MUFFIN_MM: (u32, u32) = (597, 336);
+
+    fn muffin_output(output_id: u32, crtc_id: u32, x: i16) -> crate::randr::RandrOutput {
+        crate::randr::RandrOutput {
+            name: format!("DP-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: MUFFIN_MODE,
+            connected: true,
+            x,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: MUFFIN_MM.0,
+            mm_height: MUFFIN_MM.1,
+            mode_ids: vec![MUFFIN_MODE],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
+        }
+    }
+
+    struct MuffinReplay {
+        state: ServerState,
+        peer: UnixStream,
+        backend: RecordingBackend,
+    }
+
+    type Rect = (i16, i16, u16, u16);
+
+    impl MuffinReplay {
+        const OUTPUT_4: u32 = 3;
+        const OUTPUT_6: u32 = 5;
+
+        fn new() -> Self {
+            let mut state = ServerState::new();
+            state.randr = crate::randr::RandrState::from_outputs_with_modes(
+                1,
+                vec![
+                    muffin_output(Self::OUTPUT_4, 4, 0),
+                    muffin_output(Self::OUTPUT_6, 6, 2560),
+                ],
+                vec![crate::randr::RandrMode {
+                    mode_id: MUFFIN_MODE,
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 60,
+                    timing: None,
+                }],
+            );
+            let root = state.resources.window_mut(ROOT_WINDOW).unwrap();
+            (root.width, root.height) = (5120, 1440);
+            let peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            backend.apply_crtc_configs = true;
+            Self {
+                state,
+                peer,
+                backend,
+            }
+        }
+
+        fn send(&mut self, minor: u8, body: &[u8]) -> Vec<u8> {
+            handle_randr_request(
+                &mut self.state,
+                &mut self.backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("RANDR request");
+            read_all_available(&mut self.peer)
+        }
+
+        fn set_screen_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&w.to_le_bytes());
+            body.extend_from_slice(&h.to_le_bytes());
+            body.extend_from_slice(&mm_w.to_le_bytes());
+            body.extend_from_slice(&mm_h.to_le_bytes());
+            let out = self.send(yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE, &body);
+            assert!(
+                out.chunks_exact(32).all(|c| c[0] != 0),
+                "SetScreenSize {w}x{h} failed: {out:02x?}"
+            );
+        }
+
+        /// SetCrtcTransform then SetCrtcConfig, as muffin orders them.
+        fn configure(&mut self, crtc: u32, output: u32, x: i16, scale: i32, filter: &[u8]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+                &randr_transform_body(crtc, rr_scale(scale), filter),
+            );
+            assert!(out.is_empty(), "SetCrtcTransform crtc {crtc}: {out:02x?}");
+            self.set_crtc_config(crtc, x, MUFFIN_MODE, &[output]);
+        }
+
+        fn set_crtc_config(&mut self, crtc: u32, x: i16, mode: u32, outputs: &[u32]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                &randr_crtc_config_body(crtc, x, 0, mode, outputs),
+            );
+            let reply = out.chunks_exact(32).find(|c| c[0] != 0 && c[0] < 2);
+            assert_eq!(
+                reply.map(|c| (c[0], c[1])),
+                Some((1, 0)),
+                "SetCrtcConfig crtc {crtc} succeeds: {out:02x?}"
+            );
+        }
+
+        fn screen(&self) -> (u16, u16) {
+            let root = self.state.resources.window(ROOT_WINDOW).unwrap();
+            assert_eq!(
+                (root.width, root.height),
+                (
+                    self.state.randr.screen_width,
+                    self.state.randr.screen_height
+                ),
+                "root follows the RANDR screen"
+            );
+            (root.width, root.height)
+        }
+
+        /// GetCrtcInfo's `(x, y, width, height)`.
+        fn crtc_info(&mut self, crtc: u32) -> Rect {
+            let mut body = crtc.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_le_bytes());
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_CRTC_INFO, &body);
+            assert_eq!(r[0], 1, "GetCrtcInfo reply");
+            let i16_at = |o: usize| i16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            let u16_at = |o: usize| u16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            (i16_at(12), i16_at(14), u16_at(16), u16_at(18))
+        }
+
+        /// GetMonitors' `(x, y, width, height)` per monitor; asserts the
+        /// EDID mm are untouched by any transform.
+        fn monitors(&mut self) -> Vec<Rect> {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[1, 0, 0, 0]);
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_MONITORS, &body);
+            assert_eq!(r[0], 1, "GetMonitors reply");
+            let count = u32::from_le_bytes(r[12..16].try_into().unwrap());
+            let mut offset = 32;
+            let mut rects = Vec::new();
+            for _ in 0..count {
+                let m = &r[offset..];
+                let n_out = usize::from(u16::from_le_bytes(m[6..8].try_into().unwrap()));
+                let i16_at = |o: usize| i16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u16_at = |o: usize| u16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u32_at = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+                assert_eq!((u32_at(16), u32_at(20)), MUFFIN_MM);
+                rects.push((i16_at(8), i16_at(10), u16_at(12), u16_at(14)));
+                offset += 24 + n_out * 4;
+            }
+            rects
+        }
+
+        fn assert_layout(
+            &mut self,
+            screen: (u16, u16),
+            crtc4: Rect,
+            crtc6: Rect,
+            monitors: &[Rect],
+        ) {
+            assert_eq!(self.screen(), screen, "screen");
+            assert_eq!(self.crtc_info(4), crtc4, "GetCrtcInfo 4");
+            assert_eq!(self.crtc_info(6), crtc6, "GetCrtcInfo 6");
+            assert_eq!(self.monitors(), monitors, "GetMonitors");
+        }
+    }
+
+    const MUFFIN_IDENTITY: i32 = 0x0001_0000;
+    const MUFFIN_2_0: i32 = 131_072;
+    const MUFFIN_1_599991: i32 = 104_857;
+    const MUFFIN_1_337494: i32 = 87_654;
+    const MUFFIN_0_5: i32 = 32_768;
+    const MUFFIN_0_799988: i32 = 52_428;
+
+    #[test]
+    fn randr_replays_muffin_scale_down_100_125_150() {
+        let mut r = MuffinReplay::new();
+        let left = (0, 0, 2560, 1440);
+        r.assert_layout(
+            (5120, 1440),
+            left,
+            (2560, 0, 2560, 1440),
+            &[left, (2560, 0, 2560, 1440)],
+        );
+
+        // Each row of the spec table: SetScreenSize, then CRTC 4, then CRTC 6.
+        for (screen, mm, scale6, crtc6) in [
+            ((7680, 2880), (1355, 508), MUFFIN_2_0, (2560, 0, 5120, 2880)),
+            (
+                (6656, 2304),
+                (1084, 375),
+                MUFFIN_1_599991,
+                (2560, 0, 4096, 2304),
+            ),
+            (
+                (5984, 1926),
+                (906, 292),
+                MUFFIN_1_337494,
+                (2560, 0, 3424, 1926),
+            ),
+        ] {
+            let before6 = r.crtc_info(6);
+            r.set_screen_size(screen.0, screen.1, mm.0, mm.1);
+            // A screen may crop the previous scaled footprint for a moment.
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_IDENTITY, b"fast");
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(6, MuffinReplay::OUTPUT_6, 2560, scale6, b"good");
+            r.assert_layout(screen, left, crtc6, &[left, crtc6]);
+        }
+    }
+
+    #[test]
+    fn randr_replays_muffin_scale_up_125_through_both_crtcs_off() {
+        let mut r = MuffinReplay::new();
+        r.set_crtc_config(4, 0, 0, &[]);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 0, 0),
+            (2560, 0, 2560, 1440),
+            &[(2560, 0, 2560, 1440)],
+        );
+        r.set_crtc_config(6, 0, 0, &[]);
+        r.assert_layout((5120, 1440), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        r.set_screen_size(4608, 1152, 750, 188);
+        r.assert_layout((4608, 1152), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        // The mode is taller than the screen: this is what went dark.
+        r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_0_5, b"nearest");
+        let left = (0, 0, 1280, 720);
+        r.assert_layout((4608, 1152), left, (0, 0, 0, 0), &[left]);
+        // CRTC 6 stays at 2560 although CRTC 4 is only 1280 wide.
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_0_799988, b"good");
+        let right = (2560, 0, 2048, 1152);
+        r.assert_layout((4608, 1152), left, right, &[left, right]);
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((4608, 1152))
+        );
+    }
+
+    #[test]
+    fn randr_client_screen_size_survives_a_larger_transformed_bbox() {
+        let mut r = MuffinReplay::new();
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_2_0, b"good");
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((7680, 2880))
+        );
+        let right = (2560, 0, 5120, 2880);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 2560, 1440),
+            right,
+            &[(0, 0, 2560, 1440), right],
+        );
+    }
+
+    #[test]
+    fn present_default_crtc_uses_the_transformed_footprint() {
+        const WINDOW: u32 = 0x0001_1001;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 2560, 1440, true),
+                present_test_output(2, 22, 2560, 0, 2560, 1440, true),
+            ],
+        );
+        state.randr.primary_output = 1;
+        // Below CRTC 22's mode but inside its 2.0 footprint.
+        create_present_test_window(&mut state, WINDOW, 2600, 1500, 500, 500);
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            11
+        );
+        state.randr.outputs[1].current_transform =
+            crate::randr::CrtcTransform::new(rr_scale(MUFFIN_2_0), None, Vec::new()).unwrap();
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            22
+        );
     }
 
     #[test]
@@ -34823,7 +40622,8 @@ mod tests {
             },
         );
 
-        let mut body = vec![0; 20];
+        // A client that never sent QueryVersion: the 1.0 request size.
+        let mut body = vec![0; 16];
         body[0..4].copy_from_slice(&PIXMAP.to_le_bytes());
         handle_randr_request(
             &mut state,
@@ -34833,7 +40633,7 @@ mod tests {
             RequestHeader {
                 opcode: 128,
                 data: 2,
-                length_units: 6,
+                length_units: 5,
             },
             &body,
         )
@@ -34852,7 +40652,8 @@ mod tests {
             // BadValue is remapped to BadDrawable — verified on real Xorg with
             // `tools/randr-probe` (bogus xid -> code=9). Every other minor here
             // takes a window and reports BadWindow.
-            (2, 20usize, x11::error::BAD_DRAWABLE),
+            // 16: the 1.0 size, for a client without QueryVersion.
+            (2, 16usize, x11::error::BAD_DRAWABLE),
             (4, 8, x11::error::BAD_WINDOW),
             (5, 4usize, x11::error::BAD_WINDOW),
             (6, 4, x11::error::BAD_WINDOW),
@@ -35186,6 +40987,60 @@ mod tests {
             .expect("property stored");
         assert_eq!(stored.current.as_ref().unwrap().data, 42u32.to_le_bytes());
         assert_eq!(stored.current.as_ref().unwrap().r#type, prop_type);
+    }
+
+    /// #185: an output property write must not move lastSetTime/lastConfigTime
+    /// (Xorg `rrproperty.c`). muffin treats a lastSetTime that no longer
+    /// matches its own SetCrtcConfig reply as an external reconfiguration and
+    /// rebuilds its monitor config (Cinnamon then comes back at 200%).
+    #[test]
+    fn randr_change_output_property_leaves_randr_timestamps_alone() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.randr.timestamp = 29_342;
+        state.randr.config_timestamp = 29_133;
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        for (seq, mode) in [(1, 0u8), (2, 2u8)] {
+            let body = change_output_property_body(
+                output,
+                property.0,
+                prop_type.0,
+                32,
+                mode,
+                &42u32.to_le_bytes(),
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(seq),
+                change_output_property_header(body.len()),
+                &body,
+            )
+            .expect("ChangeOutputProperty");
+        }
+        let mut delete = output.to_le_bytes().to_vec();
+        delete.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_DELETE_OUTPUT_PROPERTY,
+                length_units: 3,
+            },
+            &delete,
+        )
+        .expect("DeleteOutputProperty");
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (29_342, 29_133)
+        );
     }
 
     #[test]
@@ -37696,6 +43551,169 @@ mod tests {
         assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 3);
     }
 
+    /// XI1 GetExtensionVersion answers the server's XI version, as Xorg's
+    /// `ProcXGetExtensionVersion` (Xi/getvers.c: `XIVersion` = 2.4; Xvfb's
+    /// `xinput --version` reports "XI version on server: 2.4"), with
+    /// RepType = X_GetExtensionVersion. libXi decides from this reply
+    /// whether XI 2.2 fields such as a raw event's `sourceid` are valid:
+    /// the old hard-coded 2.0 made `xinput test-xi2 --root` print every
+    /// raw key event as `device: 3 (0)` (#173; Xorg: `3 (5)`). A length
+    /// that doesn't match `nbytes` is BadLength.
+    #[test]
+    fn xi_get_extension_version_reports_the_server_version_like_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let name = b"XInputExtension";
+        let mut body = vec![name.len() as u8, 0, 0, 0];
+        body.extend_from_slice(name);
+        body.push(0);
+        let header = RequestHeader {
+            opcode: 131,
+            data: 1,
+            length_units: 6,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("GetExtensionVersion");
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "reply size");
+        assert_eq!((wire[0], wire[1]), (1, 1), "X_Reply, RepType");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2, "major");
+        assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 4, "minor");
+        assert_eq!(wire[12], 1, "present");
+
+        let short = RequestHeader {
+            length_units: 5,
+            ..header
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            short,
+            &body[..16],
+        )
+        .expect("GetExtensionVersion, wrong length");
+        let wire = read_all_available(&mut peer);
+        assert_eq!((wire[0], wire[1]), (0, x11::error::BAD_LENGTH), "BadLength");
+    }
+
+    /// The XI version a client announced is remembered the way Xorg's
+    /// `ProcXIQueryVersion` stores it, because `FilterRawEvents` reads it.
+    /// Xvfb capture (probe mon:…:0,2 / 2,0 / 3,2, then a keyboard grab):
+    /// 2.0 then 2.2 stays 2.0 (still filtered as XI 2.0); 2.2 then 2.0
+    /// keeps 2.2 (Xorg answers the 2.0 query with BadValue); 2.3 then 2.2
+    /// keeps 2.3; a client that never asks has no version (not filtered).
+    #[test]
+    fn xi_query_version_records_client_version_like_xorg() {
+        let header = RequestHeader {
+            opcode: 131,
+            data: 47,
+            length_units: 2,
+        };
+        let stored_after = |minors: &[u16]| {
+            let mut state = ServerState::new();
+            let _peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            for (i, minor) in minors.iter().enumerate() {
+                let m = minor.to_le_bytes();
+                handle_xi2_request(
+                    &mut state,
+                    &mut backend,
+                    None,
+                    ClientId(1),
+                    SequenceNumber(u16::try_from(i + 1).unwrap()),
+                    header,
+                    &[2, 0, m[0], m[1]],
+                )
+                .expect("XIQueryVersion");
+            }
+            state.xi2_client_versions.get(&ClientId(1)).copied()
+        };
+        assert_eq!(stored_after(&[]), None);
+        assert_eq!(stored_after(&[0]), Some((2, 0)));
+        assert_eq!(stored_after(&[0, 2]), Some((2, 0)));
+        assert_eq!(stored_after(&[2, 0]), Some((2, 2)));
+        assert_eq!(stored_after(&[3, 2]), Some((2, 3)));
+        assert_eq!(stored_after(&[2, 3]), Some((2, 3)));
+        // Capped at the server's version, as the reply is.
+        assert_eq!(stored_after(&[9]), Some((2, 4)));
+    }
+
+    /// XIGrabDevice(keyboard) and an XI2 passive key grab keep the grab's
+    /// event mask: Xorg delivers an XI2 raw key event to the grab owner
+    /// only when that mask selects it (DeliverOneGrabbedEvent reads
+    /// `grab->xi2mask`).
+    #[test]
+    fn xi2_keyboard_grabs_keep_their_event_mask() {
+        const MASK: u32 = (1 << 2) | (1 << 3) | (1 << 13) | (1 << 14);
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes()); // window
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&3u16.to_le_bytes()); // master keyboard
+        body.extend_from_slice(&[1, 1, 0, 0]); // async, async, owner_events=0, pad
+        body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&MASK.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 131,
+                data: 51,
+                length_units: 7,
+            },
+            &body,
+        )
+        .expect("XIGrabDevice keyboard");
+        assert_eq!(state.active_keyboard_grab.map(|g| g.xi2_mask), Some(MASK));
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes()); // grab_window
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&38u32.to_le_bytes()); // detail
+        body.extend_from_slice(&3u16.to_le_bytes()); // deviceid
+        body.extend_from_slice(&1u16.to_le_bytes()); // num_modifiers
+        body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[1, 1, 1, 0]); // Keycode, async, async, owner_events
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body.extend_from_slice(&MASK.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // modifier 0
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 131,
+                data: 54,
+                length_units: 9,
+            },
+            &body,
+        )
+        .expect("XIPassiveGrabDevice keycode");
+        assert_eq!(state.key_grabs.last().map(|g| g.xi2_mask), Some(MASK));
+    }
+
     #[test]
     fn xi_select_events_on_root_bootstraps_device_changed() {
         let mut state = ServerState::new();
@@ -38175,7 +44193,7 @@ mod tests {
         // at the root window — the way GDK/Chromium subscribe.
         state.clients.get_mut(&1).unwrap().xi2_masks.insert(
             (ROOT_WINDOW, DEVICEID_SLAVE_POINTER),
-            XI2_DEVICE_CHANGED_MASK,
+            u64::from(XI2_DEVICE_CHANGED_MASK),
         );
 
         // Touchpad add → DeviceChanged for device 4.
@@ -38254,12 +44272,10 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let non_root = ResourceId(0x4000_0001);
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((non_root, DEVICEID_SLAVE_POINTER), XI2_DEVICE_CHANGED_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (non_root, DEVICEID_SLAVE_POINTER),
+            u64::from(XI2_DEVICE_CHANGED_MASK),
+        );
         let dropped = emit_xi2_device_changed_slave_pointer(&mut state, 137);
         assert!(dropped.is_empty());
         assert!(
@@ -39692,7 +45708,7 @@ mod tests {
             .get_mut(&client_id)
             .expect("client installed")
             .xi2_masks
-            .insert((ROOT_WINDOW, deviceid), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, deviceid), u64::from(XI2_PROPERTY_EVENT_MASK));
     }
 
     #[test]
@@ -39955,12 +45971,10 @@ mod tests {
         // Selecting `XI_DeviceChanged` only — the
         // `XI2_PROPERTY_EVENT_MASK` bit is NOT set, so this client
         // must be skipped.
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ROOT_WINDOW, 4), crate::xinput::XI2_DEVICE_CHANGED_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ROOT_WINDOW, 4),
+            u64::from(crate::xinput::XI2_DEVICE_CHANGED_MASK),
+        );
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40008,7 +46022,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .xi2_masks
-            .insert((ROOT_WINDOW, 3), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, 3), u64::from(XI2_PROPERTY_EVENT_MASK));
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40058,7 +46072,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .xi2_masks
-            .insert((ROOT_WINDOW, 0), XI2_PROPERTY_EVENT_MASK);
+            .insert((ROOT_WINDOW, 0), u64::from(XI2_PROPERTY_EVENT_MASK));
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -40147,12 +46161,10 @@ mod tests {
         seed_touchpad_for_t3(&mut state);
         // Subscribe via a non-root window — anything keyed by the
         // device id wins.
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .xi2_masks
-            .insert((ResourceId(0xdead_beef), 4), XI2_PROPERTY_EVENT_MASK);
+        state.clients.get_mut(&1).unwrap().xi2_masks.insert(
+            (ResourceId(0xdead_beef), 4),
+            u64::from(XI2_PROPERTY_EVENT_MASK),
+        );
         let tap_atom = state
             .atoms
             .intern(crate::xinput::PROP_TAPPING_ENABLED, false)
@@ -41394,7 +47406,7 @@ mod tests {
                 },
             );
         }
-        assert!(state.resources.map_window(ResourceId(WIN)));
+        assert!(state.resources.map_window(ResourceId(WIN)).mapping_changed);
         state
             .clients
             .get_mut(&CLIENT)
@@ -41463,7 +47475,12 @@ mod tests {
             let mut peer = install_client(&mut state, CLIENT);
             make(&mut state, WIN_A);
             make(&mut state, WIN_B);
-            assert!(state.resources.map_window(ResourceId(WIN_B)));
+            assert!(
+                state
+                    .resources
+                    .map_window(ResourceId(WIN_B))
+                    .mapping_changed
+            );
             {
                 let c = state.clients.get_mut(&CLIENT).unwrap();
                 c.event_masks.insert(ResourceId(WIN_A), FOCUS_CHANGE_MASK);
@@ -41477,6 +47494,7 @@ mod tests {
                     owner_events: false,
                     source: ActiveKeyboardGrabSource::PassiveKey { keycode: 36 },
                     via_xi2: false,
+                    xi2_mask: 0,
                 });
             }
 
@@ -41579,40 +47597,23 @@ mod tests {
         let bytes = read_all_available(&mut peer);
 
         assert_eq!(bytes.len(), 216, "expected core + XI2 focus out/in");
+        // Xorg DoFocusEvents: the core sequence first, then the XI2 one.
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
         assert_eq!(bytes[0], 10, "first event should be core FocusOut");
         assert_eq!(bytes[1], 2, "parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            TOP
-        );
-        assert_eq!(bytes[32], 35, "second event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[40], bytes[41]]),
-            10,
-            "XI2 FocusOut evtype"
-        );
-        assert_eq!(bytes[51], 2, "XI2 parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]),
-            TOP
-        );
-        assert_eq!(bytes[108], 9, "third event should be core FocusIn");
-        assert_eq!(bytes[109], 0, "child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[112], bytes[113], bytes[114], bytes[115]]),
-            CHILD
-        );
+        assert_eq!(word(4), TOP);
+        assert_eq!(bytes[32], 9, "second event should be core FocusIn");
+        assert_eq!(bytes[33], 0, "child FocusIn should be NotifyAncestor");
+        assert_eq!(word(36), CHILD);
+        assert_eq!(bytes[64], 35, "third event should be XI2 GenericEvent");
+        assert_eq!(half(72), 10, "XI2 FocusOut evtype");
+        assert_eq!(bytes[83], 2, "XI2 parent FocusOut should be NotifyInferior");
+        assert_eq!(word(88), TOP);
         assert_eq!(bytes[140], 35, "fourth event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[148], bytes[149]]),
-            9,
-            "XI2 FocusIn evtype"
-        );
+        assert_eq!(half(148), 9, "XI2 FocusIn evtype");
         assert_eq!(bytes[159], 0, "XI2 child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[164], bytes[165], bytes[166], bytes[167]]),
-            CHILD
-        );
+        assert_eq!(word(164), CHILD);
         assert_eq!(
             state.core_focus.raw, CHILD,
             "keyboard focus should track child"
@@ -43342,6 +49343,7 @@ mod tests {
             (151, "XINERAMA"),
             (152, "XC-MISC"),
             (153, "XFree86-VidModeExtension"),
+            (154, "RECORD"),
         ];
 
         for (opcode, name) in extensions {
@@ -43416,6 +49418,9 @@ mod tests {
                 mm_height: 340,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             }],
         );
         let expected = current_vidmode_mode_line(&state).expect("active RandR mode");
@@ -44248,6 +50253,18 @@ mod tests {
         window: u32,
         mode: u8,
     ) -> RequestOutcome {
+        dispatch_composite_window_update(state, backend, client_id, 1, window, mode)
+    }
+
+    /// Any of Redirect/UnredirectWindow/Subwindows (minor 1-4).
+    fn dispatch_composite_window_update(
+        state: &mut ServerState,
+        backend: &mut dyn crate::backend::Backend,
+        client_id: ClientId,
+        minor: u8,
+        window: u32,
+        mode: u8,
+    ) -> RequestOutcome {
         let body = composite_redirect_request_body(window, mode);
         process_request(
             state,
@@ -44256,7 +50273,7 @@ mod tests {
             SequenceNumber(1),
             RequestHeader {
                 opcode: 144,
-                data: 1, // REDIRECT_WINDOW
+                data: minor,
                 length_units: 3,
             },
             &body,
@@ -44265,53 +50282,127 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn redirect_window_conflict_from_different_client_returns_bad_access() {
-        let mut state = ServerState::new();
-        let _peer_a = install_client(&mut state, 1);
-        let mut peer_b = install_client(&mut state, 2);
-        let mut backend = RecordingBackend::new();
-        // Client A redirects window 0xCAFE first (succeeds).
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xCAFE, 0);
-        // Client B tries the same redirect — must get BadAccess.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0xCAFE, 0);
-        peer_b.set_nonblocking(true).unwrap();
+    fn create_root_child(state: &mut ServerState, window: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(window),
+                parent: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The error code a client got, or `None` when nothing was written.
+    fn read_error_code(peer: &mut std::os::unix::net::UnixStream) -> Option<u8> {
+        peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
-        peer_b.read_exact(&mut buf).expect("error delivered to B");
-        assert_eq!(buf[0], 0, "expected X11 Error, got opcode {}", buf[0]);
-        // BAD_ACCESS = 10
-        assert_eq!(buf[1], 10, "expected BadAccess (10), got {}", buf[1]);
+        match peer.read(&mut buf) {
+            Ok(32) if buf[0] == 0 => Some(buf[1]),
+            Ok(0) | Err(_) => None,
+            Ok(n) => panic!("unexpected {n} bytes: {buf:02x?}"),
+        }
     }
 
     #[test]
-    fn redirect_window_same_client_idempotent() {
+    fn second_manual_redirect_from_another_client_is_bad_access() {
         let mut state = ServerState::new();
         let mut peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
         let mut backend = RecordingBackend::new();
-        // Two REDIRECT_WINDOW from the same client on the same window:
-        // both should succeed with no error event written.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xBEEF, 0);
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xBEEF, 0);
-        peer_a.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 32];
-        let n = peer_a.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
-        assert_eq!(state.composite_redirects.len(), 1);
+        create_root_child(&mut state, 0x0010_0001);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0x0010_0001, 1);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0x0010_0001, 1);
+        assert_eq!(read_error_code(&mut peer_a), None);
+        assert_eq!(read_error_code(&mut peer_b), Some(x11::error::BAD_ACCESS));
     }
 
     #[test]
-    fn redirect_manual_mode_is_accepted() {
+    fn automatic_redirects_from_several_clients_coexist() {
+        // Xorg compRedirectWindow refuses only a second Manual redirect.
+        let mut state = ServerState::new();
+        let mut peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        create_root_child(&mut state, 0x0010_0001);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0x0010_0001, 0);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0x0010_0001, 1);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(2), 0x0010_0001, 0);
+        assert_eq!(read_error_code(&mut peer_a), None);
+        assert_eq!(read_error_code(&mut peer_b), None);
+        assert_eq!(
+            state
+                .composite_redirects
+                .window_records(ResourceId(0x0010_0001))
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn redirect_of_an_unknown_window_is_bad_window() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // compositeproto: update=1 → Manual. xfwm4, picom, xcompmgr,
-        // and mate-panel's notification-area-applet all request Manual.
         dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 1);
-        peer.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 32];
-        let n = peer.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "no error bytes expected, got {n} bytes: {buf:02x?}");
-        assert_eq!(state.composite_redirects.len(), 1);
+        assert_eq!(read_error_code(&mut peer), Some(x11::error::BAD_WINDOW));
+        assert!(state.composite_redirects.is_empty());
+    }
+
+    #[test]
+    fn redirect_window_of_the_root_is_bad_match() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), ROOT_WINDOW.0, 1);
+        assert_eq!(read_error_code(&mut peer), Some(x11::error::BAD_MATCH));
+    }
+
+    #[test]
+    fn fullscreen_unredirect_and_re_redirect_under_root_subwindows_redirect() {
+        // Measured on Xvfb 21.1 (tools/vng-scenarios/composite-reredirect).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let w = 0x0010_0001;
+        dispatch_composite_window_update(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            ROOT_WINDOW.0,
+            1,
+        );
+        create_root_child(&mut state, w);
+        state
+            .composite_redirects
+            .redirect_new_subwindow(ROOT_WINDOW, ResourceId(w));
+        let codes = [
+            (3, None),                         // UnredirectWindow(W)
+            (3, Some(x11::error::BAD_VALUE)),  // again
+            (1, None),                         // RedirectWindow(W, Manual)
+            (1, Some(x11::error::BAD_ACCESS)), // again
+            (4, None),                         // UnredirectSubwindows(root)
+            (3, Some(x11::error::BAD_VALUE)),  // its free took W's record too
+        ];
+        for (minor, want) in codes {
+            let target = if minor == 4 { ROOT_WINDOW.0 } else { w };
+            dispatch_composite_window_update(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                minor,
+                target,
+                1,
+            );
+            assert_eq!(read_error_code(&mut peer), want, "minor {minor}");
+        }
+        assert!(state.composite_redirects.is_empty());
     }
 
     #[test]
@@ -44336,13 +50427,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         // Muffin issues this redundant request for a root child that
         // already inherited root RedirectSubwindows(Manual). Xorg's
@@ -44354,9 +50449,10 @@ mod tests {
         peer.read_exact(&mut buf).expect("BadAccess delivered");
         assert_eq!(buf[0], 0);
         assert_eq!(buf[1], x11::error::BAD_ACCESS);
-        assert!(
-            !state.composite_redirects.contains_key(&(window, false)),
-            "rejected probe must not install a persistent direct redirect",
+        assert_eq!(
+            state.composite_redirects.window_records(window).len(),
+            1,
+            "rejected probe must not install a second redirect",
         );
     }
 
@@ -44367,6 +50463,9 @@ mod tests {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
 
         dispatch_composite_redirect(
             &mut state,
@@ -44445,11 +50544,12 @@ mod tests {
             vec![present_test_output(5, CRTC, 0, 0, 1920, 1080, false)],
         );
         create_present_test_window(&mut state, WINDOW, 0, 0, 64, 64);
-        state
-            .resources
-            .window_mut(ResourceId(WINDOW))
-            .unwrap()
-            .host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+        {
+            let window = state.resources.window_mut(ResourceId(WINDOW)).unwrap();
+            window.host_xid = crate::backend::WindowHandle::from_raw(0x0040_1051);
+            // A Present to an unviewable window copies nothing (Xorg micopy.c:157).
+            window.map_state = crate::resources::MapState::Viewable;
+        }
         state.resources.create_pixmap(
             ClientId(1),
             CreatePixmapRequest {
@@ -48680,6 +54780,100 @@ mod tests {
         assert_eq!(gate.effective_target_msc, TARGET_MSC);
     }
 
+    /// Xorg: the flip check fails on the empty clipList (present_scmd.c:122),
+    /// the Copy to an unrealized window is a no-op (micopy.c:157), and idle
+    /// plus CompleteModeCopy are still sent (present_execute.c:137-156).
+    #[test]
+    fn present_to_unviewable_window_skips_copy_and_damage_but_completes() {
+        use crate::{backend::recording::RecordedCall, resources::MapState, server::DamageObject};
+
+        const PARENT: u32 = 0x0002_0021;
+        const WINDOW: u32 = 0x0002_0022;
+        const DAMAGE_XID: u32 = 0x0002_0023;
+        const PRESENT_ID: u64 = 0x45;
+        const TARGET_MSC: u64 = 600;
+
+        for (parent_state, window_state, hidden) in [
+            (MapState::Viewable, MapState::Unmapped, true),
+            (MapState::Unmapped, MapState::Unviewable, true),
+            (MapState::Viewable, MapState::Viewable, false),
+        ] {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            backend.present_direct_result = true;
+            for (xid, parent, map_state) in [
+                (PARENT, ROOT_WINDOW, parent_state),
+                (WINDOW, ResourceId(PARENT), window_state),
+            ] {
+                state.resources.create_window(
+                    ClientId(1),
+                    yserver_protocol::x11::CreateWindowRequest {
+                        depth: 24,
+                        window: ResourceId(xid),
+                        parent,
+                        width: 100,
+                        height: 100,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        ..Default::default()
+                    },
+                );
+                state
+                    .resources
+                    .window_mut(ResourceId(xid))
+                    .expect("window")
+                    .map_state = map_state;
+            }
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: ResourceId(WINDOW),
+                    level: 3,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+            let pending = SupersessionFixture::new(PRESENT_ID, WINDOW)
+                .eff(Some(TARGET_MSC))
+                .geometry(0, 0, 100, 100)
+                .pending();
+
+            execute_present_pixmap_copy(&mut state, &mut backend, pending).expect("present");
+
+            let copies = backend
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::CopyArea { .. }))
+                .count();
+            let damaged = !state.damage_objects[&DAMAGE_XID].rects.is_empty();
+            let gate = state.present_complete_gate.get(&PRESENT_ID).expect("gate");
+            assert_eq!(gate.effective_target_msc, TARGET_MSC);
+            if hidden {
+                assert!(
+                    backend.present_direct_candidates.is_empty(),
+                    "{window_state:?}: no direct attempt"
+                );
+                assert_eq!(copies, 0, "{window_state:?}: no copy");
+                assert!(!damaged, "{window_state:?}: no damage");
+                assert_eq!(backend.enqueued_present_completions.len(), 1);
+                let (event, _) = &backend.enqueued_present_completions[0];
+                assert_eq!(
+                    event.completion_mode,
+                    yserver_protocol::x11::present::COMPLETE_MODE_COPY
+                );
+                assert!(event.emit_idle, "{window_state:?}: idle still sent");
+                assert_eq!(event.present_id, PRESENT_ID);
+            } else {
+                // Viewable control: direct path taken as before.
+                assert_eq!(backend.present_direct_candidates.len(), 1);
+                assert!(damaged);
+                assert!(backend.enqueued_present_completions.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn damage_unresolvable_region_with_update_flag_accumulates_full_extent() {
         // Failing test first (plan Task 13 Step 3): an `update != 0` +
@@ -50280,7 +56474,8 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         // Anything outside {0, 1} is a spec violation → BadValue.
-        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0xDEAD, 2);
+        create_root_child(&mut state, 0x0010_0001);
+        dispatch_composite_redirect(&mut state, &mut backend, ClientId(1), 0x0010_0001, 2);
         peer.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 32];
         peer.read_exact(&mut buf).expect("error delivered");
@@ -50369,7 +56564,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(state.resources.map_window(WINDOW));
+        assert!(state.resources.map_window(WINDOW).mapping_changed);
         let window = state
             .resources
             .window_mut(WINDOW)
@@ -50381,13 +56576,16 @@ mod tests {
             height: 505,
             depth: 32,
         });
-        state.composite_redirects.insert(
-            (WINDOW, false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                WINDOW,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         let mut body = Vec::with_capacity(8);
         body.extend_from_slice(&WINDOW.0.to_le_bytes());
@@ -50531,6 +56729,170 @@ mod tests {
             vec![ClientId(1), ClientId(1)],
             "each GET records its own claim — what moved to the core claim \
              list is exactly what the backend refcount used to count",
+        );
+    }
+
+    /// Xorg `compCreateOverlayWindow` (`composite/compoverlay.c:149`) gives the
+    /// overlay no input shape, so it takes the pointer over the whole screen
+    /// until the compositor empties its input region, and again after a reset
+    /// to None (measured on Xvfb 21.1, tools/vng-scenarios/cow-input-shape).
+    #[test]
+    fn overlay_window_takes_the_pointer_until_its_input_region_is_emptied() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes as x11xfixes};
+
+        const APP: ResourceId = ResourceId(0x0020_0001);
+        const REGION: u32 = 0x0010_0042;
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: APP,
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(APP);
+        let hit = |state: &ServerState| state.root_pointer_target_at(150, 150).map(|h| h.0);
+        assert_eq!(hit(&state), Some(APP));
+
+        let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(hit(&state), Some(cow), "an unshaped COW takes the pointer");
+
+        let mut xfixes = |state: &mut ServerState, minor: u8, body: Vec<u8>| {
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            handle_xfixes_request(
+                state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(2),
+                header,
+                &body,
+            )
+            .expect("XFIXES request");
+        };
+        let input_region = |region: u32| {
+            let mut body = cow.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[x11shape::KIND_INPUT, 0, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(&region.to_le_bytes());
+            body
+        };
+        xfixes(
+            &mut state,
+            x11xfixes::CREATE_REGION,
+            REGION.to_le_bytes().to_vec(),
+        );
+        xfixes(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            input_region(REGION),
+        );
+        assert_eq!(
+            hit(&state),
+            Some(APP),
+            "an empty input region passes through"
+        );
+        xfixes(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            input_region(0),
+        );
+        assert_eq!(hit(&state), Some(cow), "None restores the default region");
+
+        body[0..4].copy_from_slice(&cow.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(hit(&state), Some(APP));
+    }
+
+    #[test]
+    fn overlay_window_create_and_release_notify_root_substructure_listeners() {
+        // Xorg compCreateOverlayWindow / DeleteWindow, measured on Xvfb 21.1
+        // (tools/vng-scenarios/composite-reredirect): CreateNotify, MapNotify;
+        // then UnmapNotify, DestroyNotify after the last release.
+        const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+        const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+        let mut state = ServerState::new();
+        let _compositor = install_client(&mut state, 1);
+        let mut listener = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        state
+            .clients
+            .get_mut(&2)
+            .expect("listener")
+            .event_masks
+            .insert(ROOT_WINDOW, SUBSTRUCTURE_NOTIFY);
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let events = |bytes: &[u8]| -> Vec<(u8, u32, u32)> {
+            let word =
+                |e: &[u8], at: usize| u32::from_le_bytes([e[at], e[at + 1], e[at + 2], e[at + 3]]);
+            bytes
+                .chunks_exact(32)
+                .map(|e| (e[0], word(e, 4), word(e, 8)))
+                .collect()
+        };
+        let root_body = ROOT_WINDOW.0.to_le_bytes();
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &root_body,
+        );
+        assert_eq!(
+            events(&read_all_available(&mut listener)),
+            vec![(16, ROOT_WINDOW.0, cow.0), (19, ROOT_WINDOW.0, cow.0)],
+            "CreateNotify(parent=root, window=COW), MapNotify(event=root)"
+        );
+        state
+            .clients
+            .get_mut(&2)
+            .expect("listener")
+            .event_masks
+            .insert(cow, STRUCTURE_NOTIFY);
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &root_body,
+        );
+        assert_eq!(
+            events(&read_all_available(&mut listener)),
+            vec![
+                (18, cow.0, cow.0),
+                (18, ROOT_WINDOW.0, cow.0),
+                (17, cow.0, cow.0),
+                (17, ROOT_WINDOW.0, cow.0),
+            ],
         );
     }
 
@@ -51468,6 +57830,195 @@ mod tests {
         assert_eq!(backing.depth, 32);
     }
 
+    /// How a GLX-TFP compositor lets go of a named, resized window.
+    #[derive(Clone, Copy, Debug)]
+    enum GlxTeardown {
+        DestroyGlxThenFree,
+        FreeThenDestroyGlx,
+        DestroyWindowFirst,
+        Disconnect,
+    }
+
+    fn drive(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// picom-glx under a WM: NameWindowPixmap + glXCreatePixmap, `resizes` resizes, then teardown.
+    fn glx_export_ref_after_resizes(resizes: u16, teardown: GlxTeardown) -> RecordingBackend {
+        use yserver_protocol::x11::glx as x11glx;
+        const WIN: u32 = 0x0077_0001;
+        const PIX: u32 = 0x0077_0002;
+        const GLXPIX: u32 = 0x0077_0003;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new()
+            .with_composite_support()
+            .with_redirect_activation();
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&WIN.to_le_bytes());
+        cw.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&100u16.to_le_bytes());
+        cw.extend_from_slice(&50u16.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        drive(&mut state, &mut backend, 1, 0, &cw);
+        let mut redirect = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        redirect.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        drive(
+            &mut state,
+            &mut backend,
+            144,
+            yserver_protocol::x11::composite::REDIRECT_SUBWINDOWS,
+            &redirect,
+        );
+        drive(&mut state, &mut backend, 8, 0, &WIN.to_le_bytes());
+        let mut name = WIN.to_le_bytes().to_vec();
+        name.extend_from_slice(&PIX.to_le_bytes());
+        drive(
+            &mut state,
+            &mut backend,
+            144,
+            yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP,
+            &name,
+        );
+        let mut glx = Vec::new();
+        glx.extend_from_slice(&0u32.to_le_bytes()); // screen
+        glx.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        glx.extend_from_slice(&PIX.to_le_bytes());
+        glx.extend_from_slice(&GLXPIX.to_le_bytes());
+        drive(&mut state, &mut backend, 148, x11glx::CREATE_PIXMAP, &glx);
+        let first = state
+            .resources
+            .pixmap(ResourceId(PIX))
+            .and_then(|p| p.host_xid)
+            .expect("named pixmap")
+            .as_raw();
+        assert_eq!(
+            backend.glx_pixmap_exports.get(&first),
+            Some(&1),
+            "glXCreatePixmap holds one export ref on the named backing",
+        );
+
+        for i in 1..=resizes {
+            let mut cfg = WIN.to_le_bytes().to_vec();
+            cfg.extend_from_slice(&0x0cu16.to_le_bytes());
+            cfg.extend_from_slice(&0u16.to_le_bytes());
+            cfg.extend_from_slice(&u32::from(100 + 10 * i).to_le_bytes());
+            cfg.extend_from_slice(&u32::from(50 + 10 * i).to_le_bytes());
+            drive(&mut state, &mut backend, 12, 0, &cfg);
+            let current = state
+                .resources
+                .window(ResourceId(WIN))
+                .and_then(|w| w.redirected_backing)
+                .expect("redirected backing")
+                .host_pixmap
+                .as_raw();
+            assert_ne!(current, first, "resize {i} rotated the backing");
+            assert_eq!(
+                state
+                    .glx_drawables
+                    .get(&GLXPIX)
+                    .and_then(|d| d.glx_export_host_xid),
+                Some(current),
+                "resize {i}: the GLX pixmap follows the retargeted alias",
+            );
+            assert_eq!(
+                backend
+                    .glx_pixmap_exports
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec![(current, 1)],
+                "resize {i}: the export ref lives on the backing the GLX pixmap names",
+            );
+        }
+
+        let destroy_glx = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(
+                state,
+                backend,
+                148,
+                x11glx::DESTROY_PIXMAP,
+                &GLXPIX.to_le_bytes(),
+            );
+        };
+        let free = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(state, backend, 54, 0, &PIX.to_le_bytes());
+        };
+        let destroy_win = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            drive(state, backend, 4, 0, &WIN.to_le_bytes());
+        };
+        match teardown {
+            GlxTeardown::DestroyGlxThenFree => {
+                destroy_glx(&mut state, &mut backend);
+                free(&mut state, &mut backend);
+                destroy_win(&mut state, &mut backend);
+            }
+            GlxTeardown::FreeThenDestroyGlx => {
+                free(&mut state, &mut backend);
+                destroy_glx(&mut state, &mut backend);
+                destroy_win(&mut state, &mut backend);
+            }
+            GlxTeardown::DestroyWindowFirst => {
+                destroy_win(&mut state, &mut backend);
+                destroy_glx(&mut state, &mut backend);
+                free(&mut state, &mut backend);
+            }
+            GlxTeardown::Disconnect => {
+                crate::core_loop::process_disconnect::process_disconnect(
+                    &mut state,
+                    &mut backend,
+                    ClientId(1),
+                );
+            }
+        }
+        backend
+    }
+
+    /// A resize retargets picom's GLX pixmap; the export ref must move with it, or OLD leaks.
+    #[test]
+    fn glx_pixmap_export_ref_follows_the_resize_retarget() {
+        for resizes in [0, 1, 2] {
+            for teardown in [
+                GlxTeardown::DestroyGlxThenFree,
+                GlxTeardown::FreeThenDestroyGlx,
+                GlxTeardown::DestroyWindowFirst,
+                GlxTeardown::Disconnect,
+            ] {
+                let backend = glx_export_ref_after_resizes(resizes, teardown);
+                assert!(
+                    backend.glx_pixmap_exports.is_empty(),
+                    "resizes={resizes} {teardown:?}: export refs left behind: {:?}",
+                    backend.glx_pixmap_exports,
+                );
+            }
+        }
+    }
+
     // compCopyWindow analog: when a redirected window resizes, the
     // pre-existing backing's contents must be carried over into the new
     // backing for the overlap region — otherwise any compositor that
@@ -52046,13 +58597,18 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(1),
-            },
-        );
+        // Viewable: Xorg allocates a redirect backing only for a realized window.
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(1),
+                },
+            )
+            .unwrap();
 
         activate_redirect_backing_for(
             &mut state,
@@ -52196,13 +58752,18 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(1),
-            },
-        );
+        // Viewable: Xorg allocates a redirect backing only for a realized window.
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(1),
+                },
+            )
+            .unwrap();
 
         activate_redirect_backing_for(
             &mut state,
@@ -52269,13 +58830,16 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
         state.damage_objects.insert(
             DAMAGE_XID,
             DamageObject {
@@ -52337,6 +58901,14 @@ mod tests {
         if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
+        // A backing is only allocated for a viewable window (Xorg
+        // compCheckRedirect); an unmapped one gets it as it maps.
+        assert!(
+            state
+                .resources
+                .map_window(ResourceId(WINDOW_XID))
+                .mapping_changed
+        );
 
         let root = crate::resources::ROOT_WINDOW;
         assert!(redirect_subwindows_for_server(
@@ -52345,15 +58917,15 @@ mod tests {
             root,
             CompositeRedirectMode::Manual
         ));
-        let record = state.composite_redirects.get(&(root, true)).copied();
-        assert!(record.is_some_and(|r| r.owner == crate::resources::SERVER_OWNER));
+        let records = state.composite_redirects.subwindows_records(root);
+        assert!(records.iter().any(|r| r.owner == crate::resources::SERVER_OWNER));
         let backing = state
             .resources
             .window(ResourceId(WINDOW_XID))
             .and_then(|w| w.redirected_backing.as_ref().map(|b| b.host_pixmap));
         assert!(
             backing.is_some(),
-            "an existing child gets its backing at once"
+            "an existing viewable child gets its backing at once"
         );
 
         // Again: nothing new is allocated.
@@ -52370,21 +58942,32 @@ mod tests {
         assert_eq!(backing, again);
 
         // A client's record is left alone.
-        state.composite_redirects.insert(
-            (root, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Automatic,
-                owner: ClientId(CLIENT_ID),
-            },
-        );
+        let children = state.resources.children(root).to_vec();
+        assert!(state.composite_redirects.unredirect_subwindows(
+            root,
+            &children,
+            crate::resources::SERVER_OWNER,
+            CompositeRedirectMode::Manual
+        ));
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root,
+                &children,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Automatic,
+                    owner: ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
         assert!(!redirect_subwindows_for_server(
             &mut state,
             &mut backend,
             root,
             CompositeRedirectMode::Manual
         ));
-        let kept = state.composite_redirects.get(&(root, true)).copied();
-        assert!(kept.is_some_and(|r| r.owner == ClientId(CLIENT_ID)));
+        let kept = state.composite_redirects.subwindows_records(root);
+        assert!(kept.len() == 1 && kept[0].owner == ClientId(CLIENT_ID));
     }
 
     #[test]
@@ -52873,13 +59456,16 @@ mod tests {
                 .expect("window installed");
             w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
 
         activate_redirect_backing_for(
             &mut state,
@@ -54418,6 +61004,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -54565,7 +61152,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
         // Sanity: sibling is NOT a descendant of grab window.
         assert!(
@@ -54596,6 +61183,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _ =
@@ -54733,6 +61321,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -54959,6 +61548,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -55240,6 +61830,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -55358,6 +61949,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -55479,6 +62071,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut state,
@@ -55621,6 +62214,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -55742,7 +62336,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
         // ReplayDevice only acts on a FROZEN device with a stored event to
         // replay (Xorg AllowSome) — engage the sync freeze + activating press.
@@ -55774,6 +62368,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -55853,13 +62448,13 @@ mod tests {
             .get_mut(&GRAB_CLIENT_ID)
             .expect("grab client")
             .xi2_masks
-            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+            .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
         state
             .clients
             .get_mut(&TARGET_CLIENT_ID)
             .expect("target client")
             .xi2_masks
-            .insert((ResourceId(TARGET_WIN), 1), XI2_BUTTON_PRESS_BIT);
+            .insert((ResourceId(TARGET_WIN), 1), u64::from(XI2_BUTTON_PRESS_BIT));
         state.button_grabs.push(PassiveButtonGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ResourceId(TARGET_WIN),
@@ -55889,6 +62484,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -56016,6 +62612,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -56192,6 +62789,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -56305,7 +62903,10 @@ mod tests {
             .get_mut(&OTHER_CLIENT_ID)
             .expect("other client")
             .xi2_masks
-            .insert((ResourceId(OTHER_WIN), 1), XI2_BUTTON_RELEASE_BIT);
+            .insert(
+                (ResourceId(OTHER_WIN), 1),
+                u64::from(XI2_BUTTON_RELEASE_BIT),
+            );
 
         // muffin holds an active master-pointer grab (XIGrabDevice).
         // owner_events=false → every event funnels to the grab owner.
@@ -56319,7 +62920,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         Backend::register_top_level(&mut backend, None, ResourceId(OTHER_WIN), OTHER_HOST_XID)
@@ -56341,6 +62942,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -56459,6 +63061,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -56737,6 +63340,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 0, // synchronous → freeze
             via_xi2: true,
+            xi2_mask: 0,
         });
 
         // 1. Alt+Tab press: passive grab activates + keyboard freezes.
@@ -56994,6 +63598,7 @@ mod tests {
             owner_events: false,
             source: ActiveKeyboardGrabSource::PassiveKey { keycode: 33 },
             via_xi2: true,
+            xi2_mask: 0,
         });
         {
             let f = state
@@ -57098,6 +63703,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 0, // synchronous → freeze
             via_xi2: false,
+            xi2_mask: 0,
         });
 
         let key = |pressed, keycode| HostKeyEvent {
@@ -57190,6 +63796,7 @@ mod tests {
             owner_events: false,
             source: ActiveKeyboardGrabSource::Explicit,
             via_xi2: false,
+            xi2_mask: 0,
         });
         {
             let f = state
@@ -57367,6 +63974,2081 @@ mod tests {
         let reply_nbytes = u16::from_le_bytes(wire2[12..14].try_into().unwrap()) as usize;
         assert_eq!(reply_atom, 0, "unnamed cursor reports atom=0 (None)");
         assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
+    }
+
+    /// One XFIXES request through the real dispatcher (version gate
+    /// included), little-endian body.
+    fn xfixes_req(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("xfixes request");
+    }
+
+    fn xfixes_u32s(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Split queued 32-byte packets (errors, events, fixed replies).
+    fn wire_packets(peer: &mut UnixStream) -> Vec<[u8; 32]> {
+        read_all_available(peer)
+            .chunks_exact(32)
+            .map(|c| <[u8; 32]>::try_from(c).unwrap())
+            .collect()
+    }
+
+    fn le_u32(p: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(p[at..at + 4].try_into().unwrap())
+    }
+
+    /// Error packet → (code, bad value, minor, major).
+    fn error_fields(p: &[u8; 32]) -> (u8, u32, u16, u8) {
+        assert_eq!(p[0], 0, "expected an error packet, got type {}", p[0]);
+        (p[1], le_u32(p, 4), u16::from_le_bytes([p[8], p[9]]), p[10])
+    }
+
+    /// QueryVersion follows Xorg's rule and gates requests on the
+    /// negotiated major. Ground truth: Xorg 21.1.24 Xvfb, raw xcb probe —
+    /// HideCursor before QueryVersion is BadRequest (major 138 there,
+    /// minor 29, value 0); 4.0 → 4.0; then 2.0 → 2.0 while HideCursor
+    /// still succeeds and DeletePointerBarrier (a 5.0 request) is
+    /// BadRequest; 7.0 is capped at the server version.
+    #[test]
+    fn xfixes_query_version_negotiates_and_gates_requests() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_REQUEST, 0, 29, XFIXES_MAJOR_OPCODE)
+        );
+        assert!(state.xfixes_cursor_hide_counts.is_empty());
+
+        let query = |state: &mut ServerState,
+                     backend: &mut RecordingBackend,
+                     peer: &mut UnixStream,
+                     major: u32,
+                     minor: u32| {
+            xfixes_req(
+                state,
+                backend,
+                1,
+                x11xfixes::QUERY_VERSION,
+                &xfixes_u32s(&[major, minor]),
+            );
+            let packets = wire_packets(peer);
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0][0], 1, "reply");
+            (le_u32(&packets[0], 8), le_u32(&packets[0], 12))
+        };
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 4, 0), (4, 0));
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 2, 0), (2, 0));
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert!(wire_packets(&mut peer).is_empty(), "4.0 request set kept");
+        assert_eq!(state.xfixes_cursor_hide_counts.get(&1), Some(&1));
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::DELETE_POINTER_BARRIER,
+            &xfixes_u32s(&[0x1234]),
+        );
+        let packets = wire_packets(&mut peer);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_REQUEST, 0, 32, XFIXES_MAJOR_OPCODE)
+        );
+
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 7, 0), (5, 0));
+        assert_eq!(query(&mut state, &mut backend, &mut peer, 3, 7), (3, 7));
+    }
+
+    /// Hide/Show counting, captured on Xvfb: bad window → BadWindow (value
+    /// = window) for both; ShowCursor without a hide → BadMatch (value =
+    /// window); two hides need two shows and a third show is BadMatch.
+    /// Across clients the sprite hides on the first hide anywhere and
+    /// comes back when the last hider shows or disconnects.
+    #[test]
+    fn xfixes_hide_show_cursor_counts_per_client() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        state.xfixes_client_major.insert(1, 5);
+        state.xfixes_client_major.insert(2, 5);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+        let hidden_calls = |backend: &RecordingBackend| -> Vec<bool> {
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|c| match c {
+                    RecordedCall::SetCursorHidden(h) => Some(*h),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        for minor in [x11xfixes::HIDE_CURSOR, x11xfixes::SHOW_CURSOR] {
+            xfixes_req(
+                &mut state,
+                &mut backend,
+                1,
+                minor,
+                &xfixes_u32s(&[0x0bad_bad0]),
+            );
+            let packets = wire_packets(&mut peer1);
+            assert_eq!(
+                error_fields(&packets[0]),
+                (
+                    x11::error::BAD_WINDOW,
+                    0x0bad_bad0,
+                    u16::from(minor),
+                    XFIXES_MAJOR_OPCODE
+                )
+            );
+        }
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_MATCH, root, 30, XFIXES_MAJOR_OPCODE)
+        );
+        assert!(hidden_calls(&backend).is_empty());
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            2,
+            x11xfixes::HIDE_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert_eq!(
+            hidden_calls(&backend),
+            vec![true],
+            "one edge for three hides"
+        );
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        assert!(wire_packets(&mut peer1).is_empty());
+        assert_eq!(hidden_calls(&backend), vec![true], "client 2 still hides");
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SHOW_CURSOR,
+            &xfixes_u32s(&[root]),
+        );
+        let packets = wire_packets(&mut peer1);
+        assert_eq!(
+            error_fields(&packets[0]),
+            (x11::error::BAD_MATCH, root, 30, XFIXES_MAJOR_OPCODE)
+        );
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+        );
+        assert_eq!(
+            hidden_calls(&backend),
+            vec![true, false],
+            "disconnect shows"
+        );
+        assert!(state.xfixes_cursor_hide_counts.is_empty());
+        assert!(!state.xfixes_client_major.contains_key(&2));
+    }
+
+    /// CursorNotify fan-out, per the Xvfb capture: one event per
+    /// (client, window) selection carrying that window, the cursor serial
+    /// and its name atom; a destroyed window's selection is gone; bad mask
+    /// → BadValue, bad window → BadWindow.
+    #[test]
+    fn xfixes_cursor_notify_goes_to_each_selection() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const CHILD: u32 = 0x0040_0001;
+        const CURSOR: u32 = 0x0040_0010;
+        const HOST: u32 = 0x0001_0077;
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
+        state.xfixes_client_major.insert(1, 5);
+        state.xfixes_client_major.insert(2, 5);
+        let mut backend = RecordingBackend::new();
+        let root = ROOT_WINDOW.0;
+        create_present_test_window(&mut state, CHILD, 0, 0, 10, 10);
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(CURSOR));
+        state.resources.set_cursor_host_xid(
+            ResourceId(CURSOR),
+            crate::backend::CursorHandle::from_raw(HOST).unwrap(),
+        );
+        let name = state.atoms.intern("bname", false);
+        state
+            .resources
+            .set_cursor_name_atom(ResourceId(CURSOR), name);
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[root, 2]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer1)[0]),
+            (x11::error::BAD_VALUE, 2, 3, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[0x0bad_bad0, 1]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer1)[0]),
+            (x11::error::BAD_WINDOW, 0x0bad_bad0, 3, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[root, 1]),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::SELECT_CURSOR_INPUT,
+            &xfixes_u32s(&[CHILD, 1]),
+        );
+        assert!(wire_packets(&mut peer1).is_empty());
+
+        backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
+            host_xid: HOST,
+            serial: 3,
+        });
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        let events = wire_packets(&mut peer1);
+        assert_eq!(events.len(), 2, "one per selection");
+        let mut windows = Vec::new();
+        for e in &events {
+            assert_eq!(e[0], crate::nested::XFIXES_FIRST_EVENT + 1);
+            assert_eq!(e[1], x11xfixes::DISPLAY_CURSOR_NOTIFY);
+            windows.push(le_u32(e, 4));
+            assert_eq!(le_u32(e, 8), 3, "serial");
+            assert_eq!(le_u32(e, 16), name.0, "name atom");
+        }
+        windows.sort_unstable();
+        assert_eq!(windows, vec![root, CHILD]);
+        assert!(
+            wire_packets(&mut peer2).is_empty(),
+            "client 2 never selected"
+        );
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        assert!(
+            wire_packets(&mut peer1).is_empty(),
+            "the report is consumed"
+        );
+
+        // Destroying the child drops its selection (Xorg CursorFreeWindow).
+        destroy_window_subtree(&mut state, &mut backend, None, ResourceId(CHILD));
+        backend.displayed_cursor_change = Some(crate::backend::DisplayedCursor {
+            host_xid: 0x0001_0099,
+            serial: 1,
+        });
+        emit_xfixes_cursor_notify(&mut state, &mut backend);
+        let events = wire_packets(&mut peer1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(le_u32(&events[0], 4), root);
+        assert_eq!(le_u32(&events[0], 16), 0, "unnamed cursor");
+    }
+
+    /// ChangeCursor: every XID of the destination cursor now names the
+    /// source cursor, and the backend replaces its displayed uses. Xvfb:
+    /// bad source / bad destination → BadCursor naming it.
+    #[test]
+    fn xfixes_change_cursor_retargets_cursor_and_backend() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const A: u32 = 0x0040_0020;
+        const D: u32 = 0x0040_0021;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        for (xid, host) in [(A, 0x0001_0010), (D, 0x0001_0020)] {
+            state.resources.create_cursor(ClientId(1), ResourceId(xid));
+            state.resources.set_cursor_host_xid(
+                ResourceId(xid),
+                crate::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[0x0bad_bad0, A]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer)[0]),
+            (x11::error::BAD_CURSOR, 0x0bad_bad0, 26, XFIXES_MAJOR_OPCODE)
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[D, 0x0bad_bad0]),
+        );
+        assert_eq!(
+            error_fields(&wire_packets(&mut peer)[0]),
+            (x11::error::BAD_CURSOR, 0x0bad_bad0, 26, XFIXES_MAJOR_OPCODE)
+        );
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR,
+            &xfixes_u32s(&[D, A]),
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+        assert_eq!(
+            state.resources.cursor_host_xid(ResourceId(A)),
+            Some(0x0001_0020)
+        );
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(calls.contains(&RecordedCall::ReplaceCursor {
+            old_host_xid: 0x0001_0010,
+            new_host_xid: 0x0001_0020,
+        }));
+        // A and D now share one host cursor: freeing one XID must not free it.
+        assert_eq!(state.resources.free_cursor(ResourceId(A)), None);
+        assert_eq!(
+            state.resources.free_cursor(ResourceId(D)),
+            Some(0x0001_0020)
+        );
+    }
+
+    /// ChangeCursorByName matches the cursor object's name even after the
+    /// client freed its XID (the window still shows it); a name nobody
+    /// interned matches nothing and is not an error (Xvfb: OK).
+    #[test]
+    fn xfixes_change_cursor_by_name_replaces_named_cursors() {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const A: u32 = 0x0040_0030;
+        const B: u32 = 0x0040_0031;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        for (xid, host) in [(A, 0x0001_0030), (B, 0x0001_0031)] {
+            state.resources.create_cursor(ClientId(1), ResourceId(xid));
+            state.resources.set_cursor_host_xid(
+                ResourceId(xid),
+                crate::backend::CursorHandle::from_raw(host).unwrap(),
+            );
+        }
+        let name = state.atoms.intern("bname", false);
+        state.resources.set_cursor_name_atom(ResourceId(B), name);
+        let _ = state.resources.free_cursor(ResourceId(B));
+
+        let by_name = |name: &[u8]| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&A.to_le_bytes());
+            body.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(name);
+            body.resize(body.len().div_ceil(4) * 4, 0);
+            body
+        };
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR_BY_NAME,
+            &by_name(b"zzznoname"),
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::CHANGE_CURSOR_BY_NAME,
+            &by_name(b"bname"),
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+        let replaces: Vec<RecordedCall> = backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::ReplaceCursor { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            replaces,
+            vec![RecordedCall::ReplaceCursor {
+                old_host_xid: 0x0001_0031,
+                new_host_xid: 0x0001_0030,
+            }]
+        );
+        assert_eq!(state.resources.cursor_name_for_host(0x0001_0031), None);
+    }
+
+    /// ExpandRegion against Xvfb: {(10,10 5x5),(30,30 5x5)} expanded by
+    /// l1 r2 t3 b4 → {(9,7 8x12),(29,27 8x12)}; by l20 r20 → the
+    /// overlapping boxes are unioned into {(-10,10 45x5),(10,30 45x5)}; an
+    /// empty source leaves the destination as it was; bad source or
+    /// destination → XFixes BadRegion (error base + 0) naming it.
+    #[test]
+    fn xfixes_expand_region_matches_xvfb() {
+        use yserver_protocol::x11::xfixes::{self as x11xfixes, RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        let rect = |x, y, width, height| RegionRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let region = |rects| crate::server::XFixesRegion {
+            owner: ClientId(1),
+            rects,
+        };
+        state
+            .xfixes_regions
+            .insert(0x10, region(vec![rect(10, 10, 5, 5), rect(30, 30, 5, 5)]));
+        state
+            .xfixes_regions
+            .insert(0x11, region(vec![rect(100, 100, 7, 7)]));
+        state.xfixes_regions.insert(0x12, region(Vec::new()));
+        let expand = |src: u32, dst: u32, l: u16, r: u16, t: u16, b: u16| {
+            let mut body = xfixes_u32s(&[src, dst]);
+            for v in [l, r, t, b] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body
+        };
+
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x10, 0x11, 1, 2, 3, 4),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(9, 7, 8, 12), rect(29, 27, 8, 12)]
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x10, 0x11, 20, 20, 0, 0),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
+        );
+        xfixes_req(
+            &mut state,
+            &mut backend,
+            1,
+            x11xfixes::EXPAND_REGION,
+            &expand(0x12, 0x11, 1, 1, 1, 1),
+        );
+        assert_eq!(
+            state.xfixes_regions[&0x11].rects,
+            vec![rect(-10, 10, 45, 5), rect(10, 30, 45, 5)]
+        );
+        assert!(wire_packets(&mut peer).is_empty());
+
+        for (src, dst) in [(0x0bad_bad0, 0x11), (0x10, 0x0bad_bad0)] {
+            xfixes_req(
+                &mut state,
+                &mut backend,
+                1,
+                x11xfixes::EXPAND_REGION,
+                &expand(src, dst, 1, 1, 1, 1),
+            );
+            assert_eq!(
+                error_fields(&wire_packets(&mut peer)[0]),
+                (
+                    crate::nested::XFIXES_FIRST_ERROR,
+                    0x0bad_bad0,
+                    28,
+                    XFIXES_MAJOR_OPCODE
+                )
+            );
+        }
+    }
+
+    // ── SYNC Await / AwaitFence ─────────────────────────────────────
+    // Ground truth for every expectation below: Xorg 21.1.24 Xvfb driven
+    // by a two-connection xcb probe (client A changes counters and fences,
+    // client B awaits and then sends GetInputFocus; "suspended" means B's
+    // reply had not arrived after A's round trip).
+
+    fn sync_req(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 142,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("sync request");
+    }
+
+    fn sync_i64(v: i64) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        #[allow(clippy::cast_possible_truncation)]
+        out[..4].copy_from_slice(&((v >> 32) as i32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        out[4..].copy_from_slice(&(v as u32).to_le_bytes());
+        out
+    }
+
+    fn sync_counter_body(counter: u32, value: i64) -> Vec<u8> {
+        let mut body = counter.to_le_bytes().to_vec();
+        body.extend_from_slice(&sync_i64(value));
+        body
+    }
+
+    /// One `WAITCONDITION`: counter, value type, wait value, test type,
+    /// event threshold.
+    fn sync_wait(
+        counter: u32,
+        value_type: u32,
+        wait: i64,
+        test_type: u32,
+        threshold: i64,
+    ) -> Vec<u8> {
+        let mut body = counter.to_le_bytes().to_vec();
+        body.extend_from_slice(&value_type.to_le_bytes());
+        body.extend_from_slice(&sync_i64(wait));
+        body.extend_from_slice(&test_type.to_le_bytes());
+        body.extend_from_slice(&sync_i64(threshold));
+        body
+    }
+
+    /// CounterNotify → (counter, wait value, counter value, count, destroyed).
+    fn counter_notify_fields(p: &[u8; 32]) -> (u32, i64, i64, u16, bool) {
+        assert_eq!(p[0], crate::nested::SYNC_FIRST_EVENT, "CounterNotify type");
+        assert_eq!(p[1], 0, "kind CounterNotify");
+        let i64_at = |at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(p, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(p, at + 4))
+        };
+        (
+            le_u32(p, 4),
+            i64_at(8),
+            i64_at(16),
+            u16::from_le_bytes([p[28], p[29]]),
+            p[30] != 0,
+        )
+    }
+
+    struct SyncFixture {
+        state: ServerState,
+        backend: RecordingBackend,
+        _peer_a: UnixStream,
+        peer_b: UnixStream,
+    }
+
+    const SYNC_A: u32 = 1;
+    const SYNC_B: u32 = 2;
+    const SYNC_C1: u32 = 0x0010_0001;
+    const SYNC_C2: u32 = 0x0010_0002;
+
+    fn sync_fixture() -> SyncFixture {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, SYNC_A);
+        let peer_b = install_client(&mut state, SYNC_B);
+        SyncFixture {
+            state,
+            backend: RecordingBackend::new(),
+            _peer_a: peer_a,
+            peer_b,
+        }
+    }
+
+    impl SyncFixture {
+        fn a(&mut self, minor: u8, body: &[u8]) {
+            sync_req(&mut self.state, &mut self.backend, SYNC_A, minor, body);
+        }
+        fn b(&mut self, minor: u8, body: &[u8]) {
+            sync_req(&mut self.state, &mut self.backend, SYNC_B, minor, body);
+        }
+        fn suspended(&self) -> bool {
+            crate::core_loop::sync_await::client_is_suspended(&self.state, ClientId(SYNC_B))
+        }
+        fn b_packets(&mut self) -> Vec<[u8; 32]> {
+            wire_packets(&mut self.peer_b)
+        }
+        fn a_packets(&mut self) -> Vec<[u8; 32]> {
+            wire_packets(&mut self._peer_a)
+        }
+    }
+
+    /// Xvfb: B awaits c1 >= 5 (PositiveComparison); A sets 3 → B stays
+    /// suspended; A sets 7 → B resumes with CounterNotify(c1, wait 5,
+    /// value 7, count 0, not destroyed).
+    #[test]
+    fn sync_await_suspends_until_the_counter_condition_holds() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        assert!(f.b_packets().is_empty());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 3));
+        assert!(f.suspended(), "3 < 5");
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 7));
+        assert!(!f.suspended());
+        let events = f.b_packets();
+        assert_eq!(events.len(), 1);
+        assert_eq!(counter_notify_fields(&events[0]), (SYNC_C1, 5, 7, 0, false));
+
+        // Already satisfied at request time: no suspension, the event
+        // still goes out (Xvfb: reply arrives with CounterNotify wait 5
+        // value 7).
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 5, 7, 0, false)
+        );
+    }
+
+    /// Transitions need a crossing and events respect the threshold, per
+    /// Xvfb: PositiveTransition 10 thr 2 from 7 → set 9 (no), set 12 →
+    /// event value 12; from 12, PositiveTransition 10 → set 1 does not
+    /// fire (no upward crossing); from 1, PositiveTransition 10 → 5 (no),
+    /// 11 → event; PositiveTransition 0 thr 5 from -5 → set 1 resumes the
+    /// client without an event (diff 1 < 5).
+    #[test]
+    fn sync_await_transitions_and_event_threshold() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 7));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                2,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 9));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 12));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 10, 12, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                100,
+            ),
+        );
+        assert!(f.suspended(), "12 >= 10 but no transition yet");
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(f.suspended());
+        f.state.sync_awaits.remove(&SYNC_B);
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_TRANSITION,
+                0,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 5));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 11));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 10, 11, 0, false)
+        );
+
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                0,
+                s::TEST_POSITIVE_TRANSITION,
+                5,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(!f.suspended());
+        assert!(f.b_packets().is_empty(), "diff below threshold: no event");
+    }
+
+    /// Xvfb: c1=11, c2=100; B awaits [c1 >= 1000 thr -2000, c2 <= 45 thr
+    /// 0]; A sets c2 50 (suspended) then 40 → both conditions report, in
+    /// order, count 1 then 0. Relative waits add to the counter (c1=11,
+    /// +3 → wait 14); NegativeTransition -3 fires on the way down.
+    #[test]
+    fn sync_await_multi_condition_relative_and_negative() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 11));
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 100));
+        let mut body = sync_wait(
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            -2000,
+        );
+        body.extend(sync_wait(
+            SYNC_C2,
+            s::VALUE_TYPE_ABSOLUTE,
+            45,
+            s::TEST_NEGATIVE_COMPARISON,
+            0,
+        ));
+        f.b(s::AWAIT, &body);
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C2, 50));
+        assert!(f.suspended());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C2, 40));
+        assert!(!f.suspended());
+        let events = f.b_packets();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            counter_notify_fields(&events[0]),
+            (SYNC_C1, 1000, 11, 1, false)
+        );
+        assert_eq!(
+            counter_notify_fields(&events[1]),
+            (SYNC_C2, 45, 40, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_RELATIVE,
+                3,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        f.a(s::CHANGE_COUNTER, &sync_counter_body(SYNC_C1, 2));
+        assert!(f.suspended());
+        f.a(s::CHANGE_COUNTER, &sync_counter_body(SYNC_C1, 1));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, 14, 14, 0, false)
+        );
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                -3,
+                s::TEST_NEGATIVE_TRANSITION,
+                0,
+            ),
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (SYNC_C1, -3, -5, 0, false)
+        );
+    }
+
+    /// Xvfb: destroying an awaited counter resumes the client with a
+    /// destroyed event carrying its last value, plus threshold events for
+    /// the other conditions; an alarm on it goes Inactive with an
+    /// AlarmNotify. A counter owner disconnecting does the same (value 0).
+    #[test]
+    fn sync_await_fires_destroyed_when_the_counter_goes_away() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, -5));
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 40));
+        let mut body = sync_wait(
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            0,
+        );
+        body.extend(sync_wait(
+            SYNC_C2,
+            s::VALUE_TYPE_ABSOLUTE,
+            1000,
+            s::TEST_POSITIVE_COMPARISON,
+            -2000,
+        ));
+        f.b(s::AWAIT, &body);
+        f.state.sync_alarms.insert(
+            0x0020_0009,
+            crate::server::SyncAlarm {
+                owner: ClientId(SYNC_B),
+                counter: SYNC_C1,
+                wait_value: 1000,
+                delta: 1,
+                test_type: s::TEST_POSITIVE_COMPARISON,
+                events: true,
+                state: s::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 1000,
+                check_type: s::TEST_POSITIVE_COMPARISON,
+            },
+        );
+        f.a(s::DESTROY_COUNTER, &SYNC_C1.to_le_bytes());
+        assert!(!f.suspended());
+        let packets = f.b_packets();
+        let notifies: Vec<_> = packets
+            .iter()
+            .filter(|p| p[0] == crate::nested::SYNC_FIRST_EVENT)
+            .map(counter_notify_fields)
+            .collect();
+        assert_eq!(
+            notifies,
+            vec![(SYNC_C1, 1000, -5, 1, true), (SYNC_C2, 1000, 40, 0, false)]
+        );
+        let alarm = packets
+            .iter()
+            .find(|p| p[0] == crate::nested::SYNC_FIRST_EVENT + 1)
+            .expect("AlarmNotify for the alarm on the destroyed counter");
+        assert_eq!(alarm[28], s::ALARM_STATE_INACTIVE);
+        assert_eq!(
+            f.state.sync_alarms[&0x0020_0009].state,
+            s::ALARM_STATE_INACTIVE
+        );
+        assert_eq!(f.state.sync_alarms[&0x0020_0009].counter, 0);
+
+        // Owner disconnect: Xvfb sends destroyed, wait 10, value 0.
+        const C3: u32 = 0x0030_0001;
+        let _peer_c = install_client(&mut f.state, 3);
+        sync_req(
+            &mut f.state,
+            &mut f.backend,
+            3,
+            s::CREATE_COUNTER,
+            &sync_counter_body(C3, 0),
+        );
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                C3,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(3),
+        );
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (C3, 10, 0, 0, true)
+        );
+    }
+
+    /// Xvfb: Initialize with client 3.1 / 3.0 / 2.0 / 4.0 always replies 3.1.
+    #[test]
+    fn sync_initialize_always_answers_the_server_version() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        for (major, minor) in [(3u8, 1u8), (3, 0), (2, 0), (4, 0)] {
+            f.b(s::INITIALIZE, &[major, minor, 0, 0]);
+            let reply = f.b_packets();
+            assert_eq!(reply[0][0], 1);
+            assert_eq!((reply[0][8], reply[0][9]), (3, 1), "client {major}.{minor}");
+        }
+    }
+
+    /// Xvfb error table for Await and the counter requests.
+    #[test]
+    fn sync_await_and_counter_errors_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 100));
+        let cases: [(Vec<u8>, u8, u32); 6] = [
+            (Vec::new(), x11::error::BAD_VALUE, 0),
+            (sync_wait(0, 0, 1, 2, 0), bad_counter, 0),
+            (sync_wait(0x0bad_bad0, 0, 1, 2, 0), bad_counter, 0x0bad_bad0),
+            (sync_wait(SYNC_C2, 7, 1, 2, 0), x11::error::BAD_VALUE, 7),
+            (sync_wait(SYNC_C2, 0, 1, 9, 0), x11::error::BAD_VALUE, 9),
+            (
+                sync_wait(SYNC_C2, 1, i64::MAX, 2, 0),
+                x11::error::BAD_VALUE,
+                0x7fff_ffff,
+            ),
+        ];
+        for (body, code, value) in cases {
+            f.b(s::AWAIT, &body);
+            assert!(!f.suspended(), "an erroring Await never suspends");
+            assert_eq!(
+                error_fields(&f.b_packets()[0]),
+                (code, value, u16::from(s::AWAIT), 142)
+            );
+        }
+        let mut peer_a = std::mem::replace(&mut f._peer_a, UnixStream::pair().unwrap().0);
+        let st = s::SERVERTIME_COUNTER;
+        let a_cases: [(u8, Vec<u8>, u8, u32); 5] = [
+            (
+                s::SET_COUNTER,
+                sync_counter_body(st, 1),
+                x11::error::BAD_ACCESS,
+                st,
+            ),
+            (
+                s::SET_COUNTER,
+                sync_counter_body(0x0bad_bad0, 1),
+                bad_counter,
+                0x0bad_bad0,
+            ),
+            (
+                s::CHANGE_COUNTER,
+                sync_counter_body(SYNC_C2, i64::MAX),
+                x11::error::BAD_VALUE,
+                0x7fff_ffff,
+            ),
+            (
+                s::DESTROY_COUNTER,
+                st.to_le_bytes().to_vec(),
+                x11::error::BAD_ACCESS,
+                st,
+            ),
+            (
+                s::DESTROY_COUNTER,
+                0x0bad_bad0u32.to_le_bytes().to_vec(),
+                bad_counter,
+                0x0bad_bad0,
+            ),
+        ];
+        for (minor, body, code, value) in a_cases {
+            f.a(minor, &body);
+            assert_eq!(
+                error_fields(&wire_packets(&mut peer_a)[0]),
+                (code, value, u16::from(minor), 142)
+            );
+        }
+        assert_eq!(
+            f.state.sync_counters[&SYNC_C2].value, 100,
+            "overflow left it alone"
+        );
+    }
+
+    /// Xvfb: AwaitFence on an untriggered fence suspends until TriggerFence
+    /// (no events); on a triggered fence it returns at once; destroying the
+    /// fence resumes with CounterNotify(counter = fence, 0, 0, destroyed).
+    /// Errors: empty → BadValue, None / unknown → BadFence; ResetFence of an
+    /// untriggered fence → BadMatch naming it.
+    #[test]
+    fn sync_await_fence_suspends_until_triggered() {
+        use yserver_protocol::x11::sync as s;
+        const F1: u32 = 0x0010_0010;
+        const F2: u32 = 0x0010_0011;
+        let mut f = sync_fixture();
+        let fence_body = |fence: u32, triggered: bool| {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&fence.to_le_bytes());
+            body.extend_from_slice(&[u8::from(triggered), 0, 0, 0]);
+            body
+        };
+        f.a(s::CREATE_FENCE, &fence_body(F1, false));
+        f.a(s::CREATE_FENCE, &fence_body(F2, true));
+
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        f.a(s::TRIGGER_FENCE, &F1.to_le_bytes());
+        assert!(!f.suspended());
+        assert!(
+            f.b_packets().is_empty(),
+            "fences send no events when triggered"
+        );
+
+        f.b(s::AWAIT_FENCE, &F2.to_le_bytes());
+        assert!(!f.suspended(), "already triggered");
+
+        f.a(s::RESET_FENCE, &F1.to_le_bytes());
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        f.a(s::DESTROY_FENCE, &F1.to_le_bytes());
+        assert!(!f.suspended());
+        assert_eq!(
+            counter_notify_fields(&f.b_packets()[0]),
+            (F1, 0, 0, 0, true)
+        );
+
+        let bad_fence = crate::nested::SYNC_FIRST_ERROR + s::BAD_FENCE;
+        for (body, code, value) in [
+            (Vec::new(), x11::error::BAD_VALUE, 0),
+            (0u32.to_le_bytes().to_vec(), bad_fence, 0),
+            (
+                0x0bad_bad0u32.to_le_bytes().to_vec(),
+                bad_fence,
+                0x0bad_bad0,
+            ),
+        ] {
+            f.b(s::AWAIT_FENCE, &body);
+            assert!(!f.suspended());
+            assert_eq!(
+                error_fields(&f.b_packets()[0]),
+                (code, value, u16::from(s::AWAIT_FENCE), 142)
+            );
+        }
+        f.b(s::RESET_FENCE, &F2.to_le_bytes());
+        f.b(s::RESET_FENCE, &F2.to_le_bytes());
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_MATCH, F2, u16::from(s::RESET_FENCE), 142)
+        );
+    }
+
+    /// A Present idle fence triggered by the server wakes an AwaitFence on
+    /// it. A deliberate difference from Xorg: `present_fence_set_triggered`
+    /// only calls the fence's `SetTriggered`, not `miSyncTriggerFence`, so
+    /// on Xorg such an await is only re-checked by a TriggerFence request
+    /// or the fence's destruction and would otherwise stay suspended.
+    #[test]
+    fn sync_await_fence_wakes_on_server_side_trigger() {
+        use yserver_protocol::x11::sync as s;
+        const F1: u32 = 0x0010_0020;
+        let mut f = sync_fixture();
+        f.state.sync_fences.insert(
+            F1,
+            crate::server::SyncFence {
+                owner: ClientId(SYNC_A),
+                triggered: false,
+            },
+        );
+        f.b(s::AWAIT_FENCE, &F1.to_le_bytes());
+        assert!(f.suspended());
+        crate::core_loop::sync_await::fence_triggered(&mut f.state, F1);
+        assert!(!f.suspended());
+        assert!(f.state.sync_fences[&F1].triggered);
+    }
+
+    /// A ChangeAlarm body: alarm, value mask, value list.
+    fn sync_alarm_body(alarm: u32, mask: u32, values: &[u32]) -> Vec<u8> {
+        let mut body = alarm.to_le_bytes().to_vec();
+        body.extend_from_slice(&mask.to_le_bytes());
+        for v in values {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body
+    }
+
+    /// Xvfb: ChangeAlarm / QueryAlarm / DestroyAlarm on an alarm that
+    /// does not exist (unknown, None, or destroyed) answer BadAlarm (SYNC
+    /// error base + 1) naming it. Xorg's order: QueryAlarm and DestroyAlarm
+    /// check the exact request size first (BadLength), ChangeAlarm checks
+    /// the minimum size, then looks the alarm up, and only then matches the
+    /// value list against the mask (BadLength naming the alarm).
+    #[test]
+    fn sync_alarm_requests_on_a_missing_alarm_answer_bad_alarm() {
+        use yserver_protocol::x11::sync as s;
+        const ALARM: u32 = 0x0010_0030;
+        const GONE: u32 = 0x0010_0031;
+        const UNKNOWN: u32 = 0x0bad_bad0;
+        let bad_alarm = crate::nested::SYNC_FIRST_ERROR + s::BAD_ALARM;
+        let bad_length = x11::error::BAD_LENGTH;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(ALARM, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(GONE, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        f.a(s::DESTROY_ALARM, &GONE.to_le_bytes());
+        let _ = f.b_packets();
+        let long = sync_alarm_body(UNKNOWN, s::CA_EVENTS, &[]);
+        let cases: Vec<(u8, Vec<u8>, u8, u32)> = vec![
+            (
+                s::QUERY_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (s::QUERY_ALARM, 0u32.to_le_bytes().to_vec(), bad_alarm, 0),
+            (s::QUERY_ALARM, GONE.to_le_bytes().to_vec(), bad_alarm, GONE),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(UNKNOWN, 0, &[]),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(GONE, 0, &[]),
+                bad_alarm,
+                GONE,
+            ),
+            (s::CHANGE_ALARM, long.clone(), bad_alarm, UNKNOWN),
+            (
+                s::DESTROY_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_alarm,
+                UNKNOWN,
+            ),
+            (
+                s::DESTROY_ALARM,
+                GONE.to_le_bytes().to_vec(),
+                bad_alarm,
+                GONE,
+            ),
+            (s::QUERY_ALARM, long.clone(), bad_length, 0),
+            (s::DESTROY_ALARM, long, bad_length, 0),
+            (
+                s::CHANGE_ALARM,
+                UNKNOWN.to_le_bytes().to_vec(),
+                bad_length,
+                0,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(ALARM, s::CA_EVENTS, &[]),
+                bad_length,
+                ALARM,
+            ),
+            (
+                s::CHANGE_ALARM,
+                sync_alarm_body(ALARM, s::CA_VALUE, &[0]),
+                bad_length,
+                ALARM,
+            ),
+        ];
+        for (minor, body, code, value) in cases {
+            f.b(minor, &body);
+            let packets = f.b_packets();
+            assert!(
+                !packets.is_empty(),
+                "minor {minor} body {body:x?}: no error"
+            );
+            assert_eq!(
+                error_fields(&packets[0]),
+                (code, value, u16::from(minor), 142),
+                "minor {minor} body {body:x?}"
+            );
+        }
+        assert!(f.state.sync_alarms.contains_key(&ALARM));
+    }
+
+    /// QueryAlarm → (counter, value type, wait value, test type, delta,
+    /// events, state), per `xSyncQueryAlarmReply`.
+    fn query_alarm_fields(f: &mut SyncFixture, alarm: u32) -> (u32, u32, i64, u32, i64, u8, u8) {
+        use yserver_protocol::x11::sync as s;
+        f.b(s::QUERY_ALARM, &alarm.to_le_bytes());
+        let r = read_all_available(&mut f.peer_b);
+        assert_eq!((r.len(), r[0]), (40, 1), "QueryAlarm reply");
+        let i64_at = |at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(&r, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(&r, at + 4))
+        };
+        (
+            le_u32(&r, 8),
+            le_u32(&r, 12),
+            i64_at(16),
+            le_u32(&r, 24),
+            i64_at(28),
+            r[36],
+            r[37],
+        )
+    }
+
+    /// Xvfb: QueryAlarm reports the alarm's test type (a fresh alarm's
+    /// default is PositiveComparison, 2) and, as Xorg's
+    /// `ProcSyncQueryAlarm`, always value type Absolute with the resolved
+    /// wait value.
+    #[test]
+    fn sync_query_alarm_reports_the_test_type() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_0080;
+        const AN: u32 = 0x0010_0081;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(AL, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C1, 0, 10]),
+        );
+        assert_eq!(
+            query_alarm_fields(&mut f, AL),
+            (
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                10,
+                s::TEST_POSITIVE_COMPARISON,
+                1,
+                1,
+                s::ALARM_STATE_ACTIVE
+            )
+        );
+        f.a(s::CREATE_ALARM, &sync_alarm_body(AN, s::CA_VALUE, &[0, 5]));
+        assert_eq!(
+            query_alarm_fields(&mut f, AN),
+            (
+                0,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                1,
+                1,
+                s::ALARM_STATE_INACTIVE
+            )
+        );
+    }
+
+    /// Xvfb ("CreateAlarm attribute errors"): Xorg's checks, in its order —
+    /// the value list in mask-bit order (`events` not True/False, unknown
+    /// bits naming the bits above), the delta sign against the test type
+    /// (the default delta 1 counts), then the trigger: unknown counter,
+    /// value type, Relative without a counter, INT64 overflow (naming the
+    /// value's high word), test type. BadMatch names the alarm. A failing
+    /// CreateAlarm creates nothing.
+    #[test]
+    fn sync_create_alarm_attribute_errors_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        let (value, matchh) = (x11::error::BAD_VALUE, x11::error::BAD_MATCH);
+        let c = SYNC_C1;
+        let unknown = 0x0bad_bad0;
+        // (mask, values, expected error (code, value; None = the alarm id)).
+        type Case = (u32, Vec<u32>, Option<(u8, Option<u32>)>);
+        let cases: Vec<Case> = vec![
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![c, 9],
+                Some((value, Some(9))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_VALUE_TYPE,
+                vec![c, 7],
+                Some((value, Some(7))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_EVENTS,
+                vec![c, 2],
+                Some((value, Some(2))),
+            ),
+            (
+                s::CA_COUNTER,
+                vec![unknown],
+                Some((bad_counter, Some(unknown))),
+            ),
+            (
+                s::CA_VALUE_TYPE,
+                vec![s::VALUE_TYPE_RELATIVE],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE | s::CA_DELTA,
+                vec![c, s::TEST_POSITIVE_COMPARISON, u32::MAX, u32::MAX],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![c, s::TEST_NEGATIVE_COMPARISON],
+                Some((matchh, None)),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE | s::CA_DELTA,
+                vec![c, s::TEST_NEGATIVE_COMPARISON, 0, 0],
+                None,
+            ),
+            (
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE,
+                vec![c, s::VALUE_TYPE_RELATIVE, 0x7fff_ffff, u32::MAX],
+                Some((value, Some(0x7fff_ffff))),
+            ),
+            (
+                s::CA_COUNTER | s::CA_TEST_TYPE,
+                vec![unknown, 9],
+                Some((bad_counter, Some(unknown))),
+            ),
+            (
+                s::CA_VALUE_TYPE | s::CA_TEST_TYPE,
+                vec![7, 9],
+                Some((value, Some(7))),
+            ),
+            (1 << 6, vec![0], Some((value, Some(0)))),
+            (s::CA_EVENTS | 1 << 6, vec![2, 0], Some((value, Some(2)))),
+        ];
+        for (index, (mask, values, expect)) in cases.into_iter().enumerate() {
+            let alarm = 0x0020_0100 + u32::try_from(index).unwrap();
+            f.b(s::CREATE_ALARM, &sync_alarm_body(alarm, mask, &values));
+            let packets = f.b_packets();
+            match expect {
+                Some((code, bad)) => {
+                    assert_eq!(
+                        error_fields(&packets[0]),
+                        (code, bad.unwrap_or(alarm), u16::from(s::CREATE_ALARM), 142),
+                        "case {index}"
+                    );
+                    assert!(!f.state.sync_alarms.contains_key(&alarm), "case {index}");
+                }
+                None => {
+                    assert!(packets.is_empty(), "case {index}");
+                    assert!(f.state.sync_alarms.contains_key(&alarm), "case {index}");
+                }
+            }
+        }
+    }
+
+    /// Xvfb ("ChangeAlarm attribute errors: what sticks"): a failing
+    /// ChangeAlarm keeps what Xorg's `SyncChangeAlarmAttributes` stored
+    /// before `SyncInitTrigger` failed — delta, value type, value and the
+    /// test type — while the counter, the resolved wait value (except an
+    /// overflowing Relative sum, which is stored wrapped), the test the
+    /// trigger runs and the state stay. A stored bad value type makes a
+    /// later value-only change Relative; a stored bad test type is what
+    /// QueryAlarm reports, passes the delta-sign check, and the alarm keeps
+    /// firing on its old PositiveComparison.
+    #[test]
+    fn sync_change_alarm_failures_keep_what_xorg_keeps() {
+        use yserver_protocol::x11::sync as s;
+        const X: u32 = 0x0010_0090;
+        let mut f = sync_fixture();
+        let bad_counter = crate::nested::SYNC_FIRST_ERROR + s::BAD_COUNTER;
+        let (value, matchh) = (x11::error::BAD_VALUE, x11::error::BAD_MATCH);
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 20));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(
+                X,
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE | s::CA_DELTA,
+                &[SYNC_C1, 0, 0, 30, s::TEST_POSITIVE_COMPARISON, 0, 1],
+            ),
+        );
+        let q = |f: &mut SyncFixture| query_alarm_fields(f, X);
+        let pc = s::TEST_POSITIVE_COMPARISON;
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 30, pc, 1, 1, 0));
+        let change = |f: &mut SyncFixture, mask: u32, values: &[u32]| {
+            f.a(s::CHANGE_ALARM, &sync_alarm_body(X, mask, values));
+            f.a_packets()
+                .first()
+                .map(error_fields)
+                .map(|(code, bad, minor, _)| {
+                    assert_eq!(minor, u16::from(s::CHANGE_ALARM));
+                    (code, bad)
+                })
+        };
+        let m = u32::MAX;
+        assert_eq!(
+            change(&mut f, s::CA_VALUE_TYPE | s::CA_VALUE, &[7, 0, 50]),
+            Some((value, 7))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 30, pc, 1, 1, 0));
+        assert_eq!(change(&mut f, s::CA_VALUE, &[0, 5]), None);
+        assert_eq!(
+            q(&mut f),
+            (SYNC_C1, 0, 25, pc, 1, 1, 0),
+            "stored type 7 acts Relative"
+        );
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_COUNTER | s::CA_VALUE | s::CA_DELTA,
+                &[0x0bad_bad0, 0, 70, 0, 3]
+            ),
+            Some((bad_counter, 0x0bad_bad0))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, pc, 3, 1, 0), "delta sticks");
+        assert_eq!(change(&mut f, s::CA_DELTA, &[m, m]), Some((matchh, X)));
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE,
+                &[0, 0, 100, s::TEST_NEGATIVE_TRANSITION]
+            ),
+            Some((matchh, X))
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, pc, 3, 1, 0));
+        assert_eq!(change(&mut f, s::CA_TEST_TYPE, &[9]), Some((value, 9)));
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, 9, 3, 1, 0));
+        assert_eq!(
+            change(&mut f, s::CA_DELTA, &[m, m]),
+            None,
+            "no sign for test type 9"
+        );
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 25, 9, -1, 1, 0));
+        assert_eq!(change(&mut f, s::CA_DELTA, &[0, 1]), None);
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 25));
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 25, 25, s::ALARM_STATE_ACTIVE)]
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 21));
+        assert!(f.a_packets().is_empty());
+        assert_eq!(q(&mut f), (SYNC_C1, 0, 26, 9, 1, 1, 0));
+        f.a(s::CHANGE_ALARM, &sync_alarm_body(X, s::CA_COUNTER, &[0]));
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 0, 26, s::ALARM_STATE_INACTIVE)]
+        );
+        assert_eq!(
+            change(&mut f, s::CA_VALUE_TYPE, &[s::VALUE_TYPE_RELATIVE]),
+            Some((matchh, X))
+        );
+        assert_eq!(q(&mut f), (0, 0, 26, 9, 1, 1, s::ALARM_STATE_INACTIVE));
+        assert_eq!(
+            change(
+                &mut f,
+                s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE,
+                &[SYNC_C1, s::VALUE_TYPE_RELATIVE, 0x7fff_ffff, m]
+            ),
+            Some((value, 0x7fff_ffff))
+        );
+        let wrapped = 21i64.wrapping_add(i64::MAX);
+        assert_eq!(q(&mut f), (0, 0, wrapped, 9, 1, 1, s::ALARM_STATE_INACTIVE));
+        assert_eq!(change(&mut f, 1 << 6, &[0]), Some((value, 0)));
+        f.a(s::DESTROY_ALARM, &X.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(X, 0, wrapped, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// Xvfb (the "bad test type" line of "AlarmNotify selection"): B's
+    /// ChangeAlarm {test type 9, events True} on A's alarm is BadValue(9),
+    /// yet B is selected (the selection precedes the check) and the alarm,
+    /// still running PositiveComparison, notifies B when the counter
+    /// reaches it; QueryAlarm reports test type 9.
+    #[test]
+    fn sync_alarm_bad_test_type_still_selects_and_fires() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_00a0;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 13));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(
+                AL,
+                s::CA_COUNTER | s::CA_VALUE | s::CA_EVENTS,
+                &[SYNC_C1, 0, 14, 0],
+            ),
+        );
+        f.b(
+            s::CHANGE_ALARM,
+            &sync_alarm_body(AL, s::CA_TEST_TYPE | s::CA_EVENTS, &[9, 1]),
+        );
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_VALUE, 9, u16::from(s::CHANGE_ALARM), 142)
+        );
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AL, 14, 14, s::ALARM_STATE_ACTIVE)]
+        );
+        assert!(f.a_packets().is_empty());
+        assert_eq!(query_alarm_fields(&mut f, AL), (SYNC_C1, 0, 15, 9, 1, 0, 0));
+    }
+
+    /// Every AlarmNotify in `packets` → (alarm, counter value, alarm
+    /// value, state).
+    fn alarm_notifies(packets: &[[u8; 32]]) -> Vec<(u32, i64, i64, u8)> {
+        let i64_at = |p: &[u8; 32], at: usize| {
+            #[allow(clippy::cast_possible_wrap)]
+            let hi = le_u32(p, at) as i32;
+            (i64::from(hi) << 32) | i64::from(le_u32(p, at + 4))
+        };
+        packets
+            .iter()
+            .filter(|p| p[0] == crate::nested::SYNC_FIRST_EVENT + 1)
+            .map(|p| {
+                assert_eq!(p[1], 1, "kind AlarmNotify");
+                (le_u32(p, 4), i64_at(p, 8), i64_at(p, 16), p[28])
+            })
+            .collect()
+    }
+
+    fn sync_events_body(alarm: u32, on: u32) -> Vec<u8> {
+        use yserver_protocol::x11::sync as s;
+        sync_alarm_body(alarm, s::CA_EVENTS, &[on])
+    }
+
+    /// Xvfb (tools/sync-await-probe.c, "AlarmNotify selection"): an alarm
+    /// owned by A (c >= 10, delta 1, events). B and D select AlarmNotify
+    /// with ChangeAlarm(events=True) — any client may — and every firing
+    /// reaches the owner (while its own flag is set) and each selecting
+    /// client once. events=False by B removes B; by A clears only the
+    /// owner's flag (what QueryAlarm reports). A selecting client that
+    /// disconnects drops off the list. A non-owner may change other
+    /// attributes too. DestroyAlarm sends a Destroyed notify to the
+    /// selecting clients. An `events` value other than True/False is
+    /// BadValue naming it and selects nothing.
+    #[test]
+    fn sync_alarm_notify_reaches_every_client_that_selected_it() {
+        use yserver_protocol::x11::sync as s;
+        const AL: u32 = 0x0010_0040;
+        const D: u32 = 3;
+        let mut f = sync_fixture();
+        let mut peer_d = install_client(&mut f.state, D);
+        let d_req = |f: &mut SyncFixture, minor: u8, body: &[u8]| {
+            sync_req(&mut f.state, &mut f.backend, D, minor, body);
+        };
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        let mut create = AL.to_le_bytes().to_vec();
+        create.extend_from_slice(
+            &(s::CA_COUNTER
+                | s::CA_VALUE_TYPE
+                | s::CA_VALUE
+                | s::CA_TEST_TYPE
+                | s::CA_DELTA
+                | s::CA_EVENTS)
+                .to_le_bytes(),
+        );
+        for v in [
+            SYNC_C1,
+            s::VALUE_TYPE_ABSOLUTE,
+            0,
+            10,
+            s::TEST_POSITIVE_COMPARISON,
+            0,
+            1,
+            1,
+        ] {
+            create.extend_from_slice(&v.to_le_bytes());
+        }
+        f.a(s::CREATE_ALARM, &create);
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        d_req(&mut f, s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        assert!(f.b_packets().is_empty(), "selecting sends nothing");
+        assert!(f.state.sync_alarms[&AL].events, "owner flag untouched");
+        assert!(f.a_packets().is_empty());
+
+        let set = |f: &mut SyncFixture, v: i64| f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, v));
+        set(&mut f, 10);
+        let fired = |v: i64| vec![(AL, v, v, s::ALARM_STATE_ACTIVE)];
+        assert_eq!(alarm_notifies(&f.a_packets()), fired(10));
+        assert_eq!(alarm_notifies(&f.b_packets()), fired(10), "B once");
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(10));
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 0));
+        set(&mut f, 11);
+        assert_eq!(alarm_notifies(&f.a_packets()), fired(11));
+        assert!(f.b_packets().is_empty(), "B deselected");
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(11));
+
+        f.a(s::CHANGE_ALARM, &sync_events_body(AL, 0));
+        set(&mut f, 12);
+        assert!(f.a_packets().is_empty(), "owner flag off");
+        assert!(!f.state.sync_alarms[&AL].events);
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_d)), fired(12));
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(D),
+        );
+        assert!(f.state.sync_alarms[&AL].event_clients.is_empty());
+        set(&mut f, 13);
+        assert!(f.a_packets().is_empty() && f.b_packets().is_empty());
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 9));
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_VALUE, 9, u16::from(s::CHANGE_ALARM), 142)
+        );
+        assert!(f.state.sync_alarms[&AL].event_clients.is_empty());
+
+        f.b(s::CHANGE_ALARM, &sync_events_body(AL, 1));
+        set(&mut f, 14);
+        assert_eq!(alarm_notifies(&f.b_packets()), fired(14));
+        f.b(
+            s::CHANGE_ALARM,
+            &sync_alarm_body(AL, s::CA_VALUE, &[0, 100]),
+        );
+        assert!(f.b_packets().is_empty(), "a non-owner may change the value");
+        assert_eq!(f.state.sync_alarms[&AL].wait_value, 100);
+
+        f.a(s::DESTROY_ALARM, &AL.to_le_bytes());
+        assert!(f.a_packets().is_empty());
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AL, 14, 100, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// Xvfb: a non-owner may DestroyAlarm (owner and selecting clients get
+    /// the Destroyed notify); the owner's disconnect destroys its alarms,
+    /// and the clients that selected them get the Destroyed notify with
+    /// the counter's value. A destroyed counter deactivates the alarm with
+    /// an Inactive notify to them as well.
+    #[test]
+    fn sync_alarm_destruction_notifies_every_selecting_client() {
+        use yserver_protocol::x11::sync as s;
+        const E: u32 = 3;
+        const CE: u32 = 0x0030_0001;
+        const AE1: u32 = 0x0030_0002;
+        const AE2: u32 = 0x0030_0003;
+        const A2: u32 = 0x0010_0050;
+        let mut f = sync_fixture();
+        let mut peer_e = install_client(&mut f.state, E);
+        let e_req = |f: &mut SyncFixture, minor: u8, body: &[u8]| {
+            sync_req(&mut f.state, &mut f.backend, E, minor, body);
+        };
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 14));
+        e_req(&mut f, s::CREATE_COUNTER, &sync_counter_body(CE, 0));
+        e_req(
+            &mut f,
+            s::CREATE_ALARM,
+            &sync_alarm_body(AE1, s::CA_COUNTER | s::CA_VALUE, &[CE, 0, 50]),
+        );
+        e_req(
+            &mut f,
+            s::CREATE_ALARM,
+            &sync_alarm_body(AE2, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C1, 0, 50]),
+        );
+        f.b(s::CHANGE_ALARM, &sync_events_body(AE1, 1));
+        f.b(s::CHANGE_ALARM, &sync_events_body(AE2, 1));
+        f.b(s::DESTROY_ALARM, &AE1.to_le_bytes());
+        let destroyed = vec![(AE1, 0, 50, s::ALARM_STATE_DESTROYED)];
+        assert_eq!(alarm_notifies(&wire_packets(&mut peer_e)), destroyed);
+        assert_eq!(alarm_notifies(&f.b_packets()), destroyed);
+        assert!(!f.state.sync_alarms.contains_key(&AE1));
+
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(E),
+        );
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AE2, 14, 50, s::ALARM_STATE_DESTROYED)]
+        );
+        assert!(!f.state.sync_alarms.contains_key(&AE2));
+
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C2, 3));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(A2, s::CA_COUNTER | s::CA_VALUE, &[SYNC_C2, 0, 50]),
+        );
+        f.b(s::CHANGE_ALARM, &sync_events_body(A2, 1));
+        f.a(s::DESTROY_COUNTER, &SYNC_C2.to_le_bytes());
+        let inactive = vec![(A2, 3, 50, s::ALARM_STATE_INACTIVE)];
+        assert_eq!(alarm_notifies(&f.a_packets()), inactive);
+        assert_eq!(alarm_notifies(&f.b_packets()), inactive);
+        f.a(s::DESTROY_ALARM, &A2.to_le_bytes());
+        let destroyed = vec![(A2, 0, 50, s::ALARM_STATE_DESTROYED)];
+        assert_eq!(alarm_notifies(&f.a_packets()), destroyed);
+        assert_eq!(alarm_notifies(&f.b_packets()), destroyed);
+    }
+
+    /// Xvfb: CreateAlarm defaults are Xorg's (PositiveComparison, value 0,
+    /// delta 1, events): on a counter at 0 it fires at once and re-arms to
+    /// a wait value of 1. Without a counter the alarm starts Inactive and
+    /// silent; a ChangeAlarm on it then fires Inactive with counter value
+    /// 0 ("NULL counter WILL trigger in ChangeAlarm").
+    #[test]
+    fn sync_alarm_defaults_and_counterless_alarms_match_xvfb() {
+        use yserver_protocol::x11::sync as s;
+        const GONE: u32 = 0x0010_0060;
+        const AN: u32 = 0x0020_0060;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.a(
+            s::CREATE_ALARM,
+            &sync_alarm_body(GONE, s::CA_COUNTER, &[SYNC_C1]),
+        );
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(GONE, 0, 0, s::ALARM_STATE_ACTIVE)]
+        );
+        f.a(s::DESTROY_ALARM, &GONE.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.a_packets()),
+            vec![(GONE, 0, 1, s::ALARM_STATE_DESTROYED)]
+        );
+
+        f.b(s::CREATE_ALARM, &sync_alarm_body(AN, s::CA_VALUE, &[0, 5]));
+        assert!(f.b_packets().is_empty());
+        assert_eq!(f.state.sync_alarms[&AN].state, s::ALARM_STATE_INACTIVE);
+        f.b(s::CHANGE_ALARM, &sync_events_body(AN, 1));
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AN, 0, 5, s::ALARM_STATE_INACTIVE)]
+        );
+        f.b(s::DESTROY_ALARM, &AN.to_le_bytes());
+        assert_eq!(
+            alarm_notifies(&f.b_packets()),
+            vec![(AN, 0, 5, s::ALARM_STATE_DESTROYED)]
+        );
+    }
+
+    /// A DRI3 FenceFromFD xshmfence keeps its state in memory the client
+    /// can trigger and reset itself (`xshmfence_trigger` /
+    /// `xshmfence_reset`). Xorg's shm fence (`misyncshm.c`) answers every
+    /// `CheckTriggered` from that memory — QueryFence, the AwaitFence
+    /// epilogue, ResetFence's BadMatch test, and `miSyncTriggerFence`'s
+    /// re-check — and never from the server's own bit; ResetFence resets
+    /// the memory and DestroyFence triggers it before unmapping. Nothing in
+    /// Xorg watches the memory, so an AwaitFence already suspended stays
+    /// suspended when the client triggers it in memory, until a
+    /// TriggerFence request or the fence's destruction. Xvfb has no DRI3,
+    /// so this follows the source (`miSyncShmFenceCheckTriggered`,
+    /// `miSyncShmFenceReset`, `miSyncShmScreenDestroyFence`,
+    /// `SyncAwaitEpilogue`, `miSyncTriggerFence`).
+    #[test]
+    fn sync_shm_fence_state_is_read_from_shared_memory() {
+        use yserver_protocol::x11::sync as s;
+        const F: u32 = 0x0010_0070;
+        const G: u32 = 0x0010_0071;
+        let mut f = sync_fixture();
+        for fence in [F, G] {
+            f.state.sync_fences.insert(
+                fence,
+                crate::server::SyncFence {
+                    owner: ClientId(SYNC_A),
+                    triggered: false,
+                },
+            );
+            f.backend.shm_fences.insert(fence, false);
+        }
+        let query = |f: &mut SyncFixture| {
+            f.b(s::QUERY_FENCE, &F.to_le_bytes());
+            let reply = f.b_packets();
+            assert_eq!(reply[0][0], 1, "QueryFence reply");
+            reply[0][8] != 0
+        };
+
+        // The client triggers it in memory: QueryFence sees it and an
+        // AwaitFence returns at once.
+        f.backend.shm_fences.insert(F, true);
+        assert!(query(&mut f));
+        f.b(s::AWAIT_FENCE, &F.to_le_bytes());
+        assert!(!f.suspended());
+
+        // The client resets it in memory after the server triggered it:
+        // the memory wins over the server's bit.
+        f.a(s::TRIGGER_FENCE, &F.to_le_bytes());
+        assert!(f.state.sync_fences[&F].triggered);
+        f.backend.shm_fences.insert(F, false);
+        assert!(!query(&mut f));
+        f.b(s::RESET_FENCE, &F.to_le_bytes());
+        assert_eq!(
+            error_fields(&f.b_packets()[0]),
+            (x11::error::BAD_MATCH, F, u16::from(s::RESET_FENCE), 142),
+            "untriggered in memory"
+        );
+        f.b(s::AWAIT_FENCE, &F.to_le_bytes());
+        assert!(f.suspended(), "untriggered in memory");
+
+        // A trigger in memory alone wakes nothing (Xorg never looks);
+        // a TriggerFence request does.
+        f.backend.shm_fences.insert(F, true);
+        assert!(f.suspended());
+        f.a(s::TRIGGER_FENCE, &F.to_le_bytes());
+        assert!(!f.suspended());
+
+        // ResetFence of a fence triggered in memory resets the memory.
+        f.b(s::RESET_FENCE, &F.to_le_bytes());
+        assert!(f.b_packets().is_empty());
+        assert_eq!(f.backend.shm_fences.get(&F), Some(&false));
+        assert!(!query(&mut f));
+
+        // DestroyFence triggers the memory (releasing client waiters) and
+        // unmaps it; so does the owner's disconnect.
+        f.a(s::DESTROY_FENCE, &F.to_le_bytes());
+        assert_eq!(f.backend.destroyed_shm_fences, vec![(F, true)]);
+        assert!(!f.backend.shm_fences.contains_key(&F));
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(SYNC_A),
+        );
+        assert_eq!(f.backend.destroyed_shm_fences, vec![(F, true), (G, true)]);
+        assert!(f.backend.shm_fences.is_empty());
+    }
+
+    /// SERVERTIME awaits wake when the clock reaches the value (Xvfb: an
+    /// absolute now+300 PositiveComparison blocked ~300 ms and reported
+    /// wait == value), and the loop gets a deadline for it.
+    #[test]
+    fn sync_await_on_servertime_fires_when_the_clock_gets_there() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        let now = i64::from(f.state.timestamp_now());
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::SERVERTIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                now + 300,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        let deadline = crate::core_loop::sync_await::system_counter_deadline(&f.state)
+            .expect("a SERVERTIME deadline");
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > std::time::Duration::from_millis(200)
+                && wait <= std::time::Duration::from_millis(300),
+            "deadline ~300 ms out, got {wait:?}"
+        );
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        assert!(f.suspended(), "not there yet");
+        // Let 400 ms of server time pass. Until the loop evaluates it, the
+        // passed value must read as due now — never as "no deadline", or
+        // an idle loop would block past it.
+        f.state.start_instant -= std::time::Duration::from_millis(400);
+        let due = crate::core_loop::sync_await::system_counter_deadline(&f.state)
+            .expect("still pending until evaluated");
+        assert!(due <= std::time::Instant::now());
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        assert!(!f.suspended());
+        let (counter, wait_value, value, count, destroyed) =
+            counter_notify_fields(&f.b_packets()[0]);
+        assert_eq!(
+            (counter, wait_value, count, destroyed),
+            (s::SERVERTIME_COUNTER, now + 300, 0, false)
+        );
+        assert!(value >= now + 300);
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_none());
+    }
+
+    /// SERVERTIME alarms fire too (Xvfb: an absolute now+200
+    /// PositiveComparison alarm with delta 0 sent AlarmNotify after ~200 ms
+    /// with state Inactive and counter >= alarm value).
+    #[test]
+    fn sync_alarm_on_servertime_fires_when_the_clock_gets_there() {
+        use yserver_protocol::x11::sync as s;
+        const ALARM: u32 = 0x0010_0030;
+        let mut f = sync_fixture();
+        let now = i64::from(f.state.timestamp_now());
+        let mut body = ALARM.to_le_bytes().to_vec();
+        let mask = s::CA_COUNTER | s::CA_VALUE_TYPE | s::CA_VALUE | s::CA_TEST_TYPE | s::CA_DELTA;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&s::SERVERTIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&s::VALUE_TYPE_ABSOLUTE.to_le_bytes());
+        body.extend_from_slice(&sync_i64(now + 200));
+        body.extend_from_slice(&s::TEST_POSITIVE_COMPARISON.to_le_bytes());
+        body.extend_from_slice(&sync_i64(0));
+        f.b(s::CREATE_ALARM, &body);
+        assert!(f.b_packets().is_empty(), "not due yet");
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_some());
+        f.state.start_instant -= std::time::Duration::from_millis(300);
+        crate::core_loop::sync_await::evaluate_servertime(&mut f.state);
+        let packets = f.b_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            packets[0][0],
+            crate::nested::SYNC_FIRST_EVENT + 1,
+            "AlarmNotify"
+        );
+        assert_eq!(packets[0][28], s::ALARM_STATE_INACTIVE);
+        assert_eq!(f.state.sync_alarms[&ALARM].state, s::ALARM_STATE_INACTIVE);
+    }
+
+    /// IDLETIME awaits: a positive test wakes when idle time reaches it; a
+    /// negative transition wakes on input (idle drops to 0).
+    #[test]
+    fn sync_await_on_idletime_fires_on_idle_and_on_input() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.state.dpms.last_activity = std::time::Instant::now();
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::IDLETIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                5_000,
+                s::TEST_POSITIVE_TRANSITION,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        assert!(crate::core_loop::sync_await::system_counter_deadline(&f.state).is_some());
+        f.state.dpms.last_activity -= std::time::Duration::from_secs(6);
+        crate::core_loop::run::evaluate_idletime_alarms_post_poll(&mut f.state, &mut f.backend);
+        assert!(!f.suspended());
+        let (counter, wait_value, _, _, _) = counter_notify_fields(&f.b_packets()[0]);
+        assert_eq!((counter, wait_value), (s::IDLETIME_COUNTER, 5_000));
+
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                s::IDLETIME_COUNTER,
+                s::VALUE_TYPE_ABSOLUTE,
+                1_000,
+                s::TEST_NEGATIVE_TRANSITION,
+                0,
+            ),
+        );
+        assert!(f.suspended(), "idle is ~6 s, no downward crossing yet");
+        evaluate_idletime_negative_alarms_on_input_wake(&mut f.state, 2, 6_000, 6_000);
+        assert!(!f.suspended());
+    }
+
+    /// The awaiting client's own disconnect drops its await.
+    #[test]
+    fn sync_await_dies_with_its_client() {
+        use yserver_protocol::x11::sync as s;
+        let mut f = sync_fixture();
+        f.a(s::CREATE_COUNTER, &sync_counter_body(SYNC_C1, 0));
+        f.b(
+            s::AWAIT,
+            &sync_wait(
+                SYNC_C1,
+                s::VALUE_TYPE_ABSOLUTE,
+                5,
+                s::TEST_POSITIVE_COMPARISON,
+                0,
+            ),
+        );
+        assert!(f.suspended());
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(SYNC_B),
+        );
+        assert!(f.state.sync_awaits.is_empty());
+        f.a(s::SET_COUNTER, &sync_counter_body(SYNC_C1, 9));
+        assert!(f.state.sync_counters.contains_key(&SYNC_C1));
     }
 
     fn xfixes_create_barrier(
@@ -57806,8 +66488,8 @@ mod tests {
     ///    → reply status=0.
     /// 3. bad mode (555 not in output's mode_ids)
     ///    → X11 error BadMatch (type byte = 0).
-    /// 4. bad rotation (rotation=2, i.e. RR_Rotate_90 which we don't support)
-    ///    → X11 error BadMatch (type byte = 0; rotation valid but not identity).
+    /// 4. bad rotation (0x41: a bit outside the CRTC's `rotations` 0x3f)
+    ///    → X11 error BadMatch (type byte = 0).
     #[test]
     fn randr_set_crtc_config_validates_mode_id() {
         use crate::randr::{RandrMode, RandrOutput, RandrState};
@@ -57837,6 +66519,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             // Equal connector names are legal across different DRM devices.
             // Address this second row by CRTC/XID to prove the core never
@@ -57857,6 +66542,9 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let mut state = ServerState::new();
@@ -57920,17 +66608,16 @@ mod tests {
         )
         .expect("bad mode → error");
 
-        // (4) Bad rotation (valid code but not RR_Rotate_0):
-        // rotation=2 (RR_Rotate_90) is valid but our CRTC is identity-only.
-        // validate_set_crtc_config succeeds (mode 3 known), then rotation check
-        // fires BadMatch.
+        // (4) Bad rotation: RR_Rotate_0 plus bit 6, which no CRTC
+        // advertises. validate_set_crtc_config succeeds (mode 3 known), then
+        // `(~crtc->rotations) & rotation` fires BadMatch (rrcrtc.c:1403).
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(4),
             header,
-            &build_body(3, 2, &[4]),
+            &build_body(3, 0x41, &[4]),
         )
         .expect("bad rotation → error");
 
@@ -58036,6 +66723,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -58096,6 +66786,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -58176,6 +66869,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -58511,11 +67207,309 @@ mod tests {
         );
     }
 
+    /// F{ A{ A1 }, B{ B1 }, C }: F viewable, A and B unmapped with their
+    /// child mapped (Unviewable), C mapped.
+    fn subwindows_delta_fixture(state: &mut ServerState) -> [ResourceId; 6] {
+        let [f, a, a1, b, b1, c] = [
+            0x0010_0200,
+            0x0010_0201,
+            0x0010_0202,
+            0x0010_0203,
+            0x0010_0204,
+            0x0010_0205,
+        ]
+        .map(ResourceId);
+        for (id, parent) in [(f, ROOT_WINDOW), (a, f), (a1, a), (b, f), (b1, b), (c, f)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(1),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent,
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        for w in [a1, b1, f, c] {
+            let _ = state.resources.map_window(w);
+        }
+        [f, a, a1, b, b1, c]
+    }
+
+    /// Window storage follows the delta: realize parent first, release child first, never the COW.
+    #[test]
+    fn window_storage_follows_viewability_delta_in_order() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, c] = subwindows_delta_fixture(&mut state);
+        for w in [f, a, a1, b, b1, c] {
+            state.resources.window_mut(w).expect("window").host_xid =
+                Some(crate::backend::WindowHandle::from_raw_for_test(w.0));
+        }
+        let _ = state.resources.map_window(a);
+        let _ = state.resources.map_window(b);
+        let storage_calls = |backend: &RecordingBackend, from: usize| -> Vec<RecordedCall> {
+            backend
+                .calls()
+                .into_iter()
+                .skip(from)
+                .filter(|c| {
+                    matches!(
+                        c,
+                        RecordedCall::RealizeWindowStorage(_)
+                            | RecordedCall::ReleaseWindowStorage(_)
+                    )
+                })
+                .collect()
+        };
+        let unmap = |state: &mut ServerState, backend: &mut RecordingBackend, w: ResourceId| {
+            handle_unmap_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                &w.0.to_le_bytes(),
+            )
+            .expect("UnmapWindow");
+        };
+        let map = |state: &mut ServerState, backend: &mut RecordingBackend, w: ResourceId| {
+            handle_map_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(2),
+                &w.0.to_le_bytes(),
+            )
+            .expect("MapWindow");
+        };
+
+        unmap(&mut state, &mut backend, f);
+        assert_eq!(
+            storage_calls(&backend, 0),
+            [a1, a, b1, b, c, f].map(|w| RecordedCall::ReleaseWindowStorage(w.0)),
+            "the whole subtree releases, child first",
+        );
+        let from = backend.calls().len();
+        map(&mut state, &mut backend, f);
+        assert_eq!(
+            storage_calls(&backend, from),
+            [f, a, a1, b, b1, c].map(|w| RecordedCall::RealizeWindowStorage(w.0)),
+            "the whole subtree realizes, parent first",
+        );
+        let realize_at = backend
+            .calls()
+            .iter()
+            .skip(from)
+            .position(|c| matches!(c, RecordedCall::RealizeWindowStorage(_)))
+            .expect("realize recorded");
+        let map_at = backend
+            .calls()
+            .iter()
+            .skip(from)
+            .position(|c| matches!(c, RecordedCall::MapSubwindow(_)))
+            .expect("map recorded");
+        assert!(
+            map_at < realize_at,
+            "map_subwindow flips `mapped` before realize reads it"
+        );
+
+        // A mapped window under an unmapped parent gets nothing; the root and the COW never do.
+        unmap(&mut state, &mut backend, a);
+        let _ = state.resources.unmap_window(a1);
+        let from = backend.calls().len();
+        map(&mut state, &mut backend, a1);
+        assert!(
+            storage_calls(&backend, from).is_empty(),
+            "Unmapped -> Unviewable is no transition"
+        );
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(
+                COMPOSITE_OVERLAY_WINDOW.0,
+            ));
+        let from = backend.calls().len();
+        unmap(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW);
+        map(&mut state, &mut backend, COMPOSITE_OVERLAY_WINDOW);
+        assert!(
+            storage_calls(&backend, from).is_empty(),
+            "the COW is outside the lifecycle"
+        );
+        assert_eq!(storage_lifecycle_host_xid(&state, ROOT_WINDOW), None);
+        assert_eq!(
+            storage_lifecycle_host_xid(&state, COMPOSITE_OVERLAY_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn map_subwindows_delta_includes_promoted_grandchildren() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, _c] = subwindows_delta_fixture(&mut state);
+
+        let (_, delta) = map_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &f.0.to_le_bytes(),
+        )
+        .expect("MapSubwindows");
+        // C was already viewable; A and B each bring their grandchild.
+        assert_eq!(delta.became_viewable, vec![a, a1, b, b1]);
+        assert!(delta.became_unviewable.is_empty());
+    }
+
+    #[test]
+    fn unmap_subwindows_delta_is_union_in_post_order() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [f, a, a1, b, b1, c] = subwindows_delta_fixture(&mut state);
+        let _ = state.resources.map_window(a);
+        let _ = state.resources.map_window(b);
+
+        let (_, delta) = unmap_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &f.0.to_le_bytes(),
+        )
+        .expect("UnmapSubwindows");
+        assert!(delta.became_viewable.is_empty());
+        assert_eq!(delta.became_unviewable, vec![a1, a, b1, b, c]);
+    }
+
+    #[test]
+    fn query_tree_of_the_root_hides_the_overlay_window() {
+        // Xorg CompositeRealChildHead (composite/compwindow.c:762), measured
+        // on Xvfb 21.1 (tools/vng-scenarios/composite-reredirect).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let child = ResourceId(0x0010_0001);
+        create_root_child(&mut state, child.0);
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
+        handle_query_tree(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("QueryTree");
+        let reply = read_all_available(&mut peer);
+        let listed: Vec<u32> = reply[32..]
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(u16::from_le_bytes([reply[16], reply[17]]), 1);
+        assert_eq!(listed, vec![child.0]);
+    }
+
+    #[test]
+    fn unmap_subwindows_of_the_root_leaves_the_overlay_window_mapped() {
+        // dix/window.c:2897 stops at RealChildHead; measured on Xvfb 21.1.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let child = ResourceId(0x0010_0001);
+        create_root_child(&mut state, child.0);
+        let _ = state.resources.map_window(child);
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(0xC0C0));
+        let (_, delta) = unmap_subwindows_with_delta(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &ROOT_WINDOW.0.to_le_bytes(),
+        )
+        .expect("UnmapSubwindows");
+        assert_eq!(delta.became_unviewable, vec![child]);
+        assert_eq!(
+            state
+                .resources
+                .window(COMPOSITE_OVERLAY_WINDOW)
+                .map(|w| w.map_state),
+            Some(MapState::Viewable)
+        );
+    }
+
+    #[test]
+    fn map_and_unmap_under_unmapped_parent_still_send_notify() {
+        const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let [_f, _a, a1, ..] = subwindows_delta_fixture(&mut state);
+        let _ = state.resources.unmap_window(a1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .event_masks
+            .insert(a1, STRUCTURE_NOTIFY);
+        let notified = |bytes: &[u8], code: u8| {
+            bytes.chunks_exact(32).any(|evt| {
+                evt[0] == code && u32::from_le_bytes([evt[8], evt[9], evt[10], evt[11]]) == a1.0
+            })
+        };
+
+        // A1 under unmapped A: Unmapped -> Unviewable, still MapNotify.
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &a1.0.to_le_bytes(),
+        )
+        .expect("MapWindow");
+        assert_eq!(
+            state.resources.window(a1).map(|w| w.map_state),
+            Some(MapState::Unviewable)
+        );
+        assert!(notified(&read_all_available(&mut peer), 19), "MapNotify");
+
+        // Unviewable -> Unmapped, still UnmapNotify.
+        handle_unmap_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &a1.0.to_le_bytes(),
+        )
+        .expect("UnmapWindow");
+        assert_eq!(
+            state.resources.window(a1).map(|w| w.map_state),
+            Some(MapState::Unmapped)
+        );
+        assert!(notified(&read_all_available(&mut peer), 18), "UnmapNotify");
+    }
+
     #[test]
     fn map_subwindows_exposes_grandchild_promoted_by_viewability_cascade() {
         // MapSubwindows(parent) maps parent's direct children. When a
         // child transitions Unmapped -> Viewable, the viewability cascade
-        // (map_window_with_promoted_descendants) also promotes any of the
+        // (map_window) also promotes any of the
         // child's descendants that were sitting Unviewable (mapped while
         // their ancestor was unmapped) to Viewable. Xorg fires Expose on
         // every newly-viewable window, not just the directly-mapped child.
@@ -58977,13 +67971,16 @@ mod tests {
                 depth: 32,
             });
         }
-        state.composite_redirects.insert(
-            (ResourceId(WINDOW_XID), false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(WINDOW_XID),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+                },
+            )
+            .unwrap();
 
         rotate_redirected_backing_on_resize(
             &mut state,
@@ -59066,6 +68063,8 @@ mod tests {
         body.extend_from_slice(&0x10u32.to_le_bytes());
         body.extend_from_slice(&0x11u32.to_le_bytes());
         body.extend_from_slice(&0x12u32.to_le_bytes());
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(1, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -59485,13 +68484,16 @@ mod tests {
             },
         );
         let _ = state.resources.map_window(ResourceId(FRAME_XID));
-        state.composite_redirects.insert(
-            (ResourceId(FRAME_XID), false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(MARCO),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                ResourceId(FRAME_XID),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(MARCO),
+                },
+            )
+            .unwrap();
         // Mark the frame as redirected (Manual-redirect activated
         // state). `host_pixmap` value is opaque to the damage path.
         if let Some(w) = state.resources.window_mut(ResourceId(FRAME_XID)) {
@@ -59620,13 +68622,17 @@ mod tests {
         let mut backend = RecordingBackend::new();
         let mut peer = install_client(&mut state, MARCO);
 
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(MARCO),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(MARCO),
+                },
+            )
+            .unwrap();
 
         state.resources.create_window(
             ClientId(MARCO),
@@ -59644,6 +68650,9 @@ mod tests {
                 ..Default::default()
             },
         );
+        state
+            .composite_redirects
+            .redirect_new_subwindow(ROOT_WINDOW, ResourceId(CHILD_XID));
         let _ = state.resources.map_window(ResourceId(CHILD_XID));
 
         state.damage_objects.insert(
@@ -59725,13 +68734,17 @@ mod tests {
         let mut backend = RecordingBackend::new();
         let mut peer = install_client(&mut state, FASTCOMPMGR);
 
-        state.composite_redirects.insert(
-            (ROOT_WINDOW, true),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(FASTCOMPMGR),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                state.resources.children(ROOT_WINDOW),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(FASTCOMPMGR),
+                },
+            )
+            .unwrap();
 
         state.resources.create_window(
             ClientId(FASTCOMPMGR),
@@ -59842,13 +68855,16 @@ mod tests {
                 },
             );
             let _ = state.resources.map_window(ResourceId(xid));
-            state.composite_redirects.insert(
-                (ResourceId(xid), false),
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(MARCO),
-                },
-            );
+            state
+                .composite_redirects
+                .redirect_window(
+                    ResourceId(xid),
+                    RedirectRecord {
+                        mode: CompositeRedirectMode::Manual,
+                        owner: ClientId(MARCO),
+                    },
+                )
+                .unwrap();
             if let Some(w) = state.resources.window_mut(ResourceId(xid)) {
                 w.host_xid = crate::backend::WindowHandle::from_raw(0xD000_0000 | xid);
                 w.redirected_backing = Some(RedirectedBacking {
@@ -60077,7 +69093,7 @@ mod tests {
             via_xi2: true,
             implicit: false,
             passive: false,
-            xi2_mask: u32::MAX,
+            xi2_mask: u64::MAX,
         });
 
         process_request(
@@ -60806,10 +69822,11 @@ mod tests {
             ResourceId(PICTURE_XID),
             crate::resources::PictureState {
                 client: ClientId(APP),
-                host_picture_xid: crate::backend::PictureHandle::from_raw_for_test(0x42),
+                host_picture_xid: Some(crate::backend::PictureHandle::from_raw_for_test(0x42)),
                 host_owned_pixmap: None,
                 kind: crate::resources::PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
 
@@ -60817,6 +69834,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&PICTURE_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -60869,6 +69888,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&UNKNOWN_PIC.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -60922,6 +69943,8 @@ mod tests {
         body.push(0); // kind = Bounding (valid)
         body.extend_from_slice(&[0u8; 3]);
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61000,6 +70023,8 @@ mod tests {
         body.push(INVALID_KIND);
         body.extend_from_slice(&[0u8; 3]);
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61070,6 +70095,8 @@ mod tests {
         let mut body = Vec::with_capacity(4);
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61207,6 +70234,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&GC_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61340,6 +70369,8 @@ mod tests {
         body.extend_from_slice(&REGION_XID.to_le_bytes());
         body.extend_from_slice(&GC_XID.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(APP, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61400,6 +70431,8 @@ mod tests {
         body.extend_from_slice(&PRIMARY.to_le_bytes());
         body.extend_from_slice(&x11xfixes::SELECTION_MASK_SET_OWNER.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(CLIENT, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61473,6 +70506,8 @@ mod tests {
         body.extend_from_slice(&PRIMARY.to_le_bytes());
         body.extend_from_slice(&ILLEGAL_MASK.to_le_bytes());
         let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        // The client negotiated XFIXES (Xorg gates requests on QueryVersion).
+        state.xfixes_client_major.insert(CLIENT, 5);
         process_request(
             &mut state,
             &mut backend,
@@ -61986,6 +71021,375 @@ mod tests {
         );
     }
 
+    // ---- Unviewable CopyArea/CopyPlane sources (Xorg micopy.c / miexpose.c) ----
+
+    const UV_FRAME: u32 = 0x0010_0101;
+    const UV_CHILD: u32 = 0x0010_0102;
+    const UV_LONE: u32 = 0x0010_0103;
+    const UV_SHOWN: u32 = 0x0010_0104;
+    const UV_PIXMAP: u32 = 0x0010_0110;
+    const UV_DST_PIXMAP: u32 = 0x0010_0111;
+    const UV_GC: u32 = 0x0010_0120;
+    const UV_GC_NOEXP: u32 = 0x0010_0121;
+
+    fn uv_gc_request(gc: u32, graphics_exposures: bool) -> yserver_protocol::x11::CreateGcRequest {
+        yserver_protocol::x11::CreateGcRequest {
+            gc: ResourceId(gc),
+            drawable: ROOT_WINDOW,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: Some(graphics_exposures),
+            clip_x_origin: None,
+            clip_y_origin: None,
+            clip_mask: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        }
+    }
+
+    fn uv_window(
+        state: &mut ServerState,
+        xid: u32,
+        parent: ResourceId,
+        map_state: crate::resources::MapState,
+    ) {
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let w = state.resources.window_mut(ResourceId(xid)).expect("window");
+        w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+            xid | 0x0040_0000,
+        ));
+        w.map_state = map_state;
+    }
+
+    fn uv_pixmap(state: &mut ServerState, xid: u32) {
+        state.resources.create_pixmap(
+            ClientId(1),
+            yserver_protocol::x11::CreatePixmapRequest {
+                pixmap: ResourceId(xid),
+                drawable: ROOT_WINDOW,
+                width: 100,
+                height: 100,
+                depth: 24,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(xid),
+            crate::backend::PixmapHandle::from_raw_for_test(xid | 0x0040_0000),
+        );
+    }
+
+    /// Unmapped frame with a mapped (so Unviewable) child, a lone unmapped
+    /// window, a viewable window, two pixmaps and GCs with exposures on/off.
+    fn uv_fixture() -> (ServerState, UnixStream) {
+        use crate::resources::MapState;
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        uv_window(&mut state, UV_FRAME, ROOT_WINDOW, MapState::Unmapped);
+        uv_window(
+            &mut state,
+            UV_CHILD,
+            ResourceId(UV_FRAME),
+            MapState::Unviewable,
+        );
+        uv_window(&mut state, UV_LONE, ROOT_WINDOW, MapState::Unmapped);
+        uv_window(&mut state, UV_SHOWN, ROOT_WINDOW, MapState::Viewable);
+        uv_pixmap(&mut state, UV_PIXMAP);
+        uv_pixmap(&mut state, UV_DST_PIXMAP);
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC, true));
+        state
+            .resources
+            .create_gc(ClientId(1), uv_gc_request(UV_GC_NOEXP, false));
+        (state, peer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn uv_copy(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        opcode: u8,
+        src: u32,
+        dst: u32,
+        gc: u32,
+        src_xy: (i16, i16),
+        dst_xy: (i16, i16),
+        size: (u16, u16),
+    ) {
+        let mut body = Vec::with_capacity(28);
+        body.extend_from_slice(&src.to_le_bytes());
+        body.extend_from_slice(&dst.to_le_bytes());
+        body.extend_from_slice(&gc.to_le_bytes());
+        body.extend_from_slice(&src_xy.0.to_le_bytes());
+        body.extend_from_slice(&src_xy.1.to_le_bytes());
+        body.extend_from_slice(&dst_xy.0.to_le_bytes());
+        body.extend_from_slice(&dst_xy.1.to_le_bytes());
+        body.extend_from_slice(&size.0.to_le_bytes());
+        body.extend_from_slice(&size.1.to_le_bytes());
+        if opcode == 63 {
+            body.extend_from_slice(&1u32.to_le_bytes());
+        }
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("dispatch copy");
+    }
+
+    fn uv_copy_calls(backend: &RecordingBackend) -> usize {
+        use crate::backend::recording::RecordedCall;
+        backend
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::CopyArea { .. } | RecordedCall::CopyPlane { .. }
+                )
+            })
+            .count()
+    }
+
+    /// Decoded (type, drawable, x, y, w, h, count, major) per 32-byte event.
+    type UvEvent = (u8, u32, u16, u16, u16, u16, u16, u8);
+
+    fn uv_events(bytes: &[u8]) -> Vec<UvEvent> {
+        bytes
+            .chunks_exact(32)
+            .map(|e| {
+                let u16_at = |i: usize| u16::from_le_bytes([e[i], e[i + 1]]);
+                let drawable = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+                if e[0] == 13 {
+                    (
+                        13,
+                        drawable,
+                        u16_at(8),
+                        u16_at(10),
+                        u16_at(12),
+                        u16_at(14),
+                        u16_at(18),
+                        e[20],
+                    )
+                } else {
+                    (e[0], drawable, 0, 0, 0, 0, 0, e[10])
+                }
+            })
+            .collect()
+    }
+
+    /// Xorg: an unrealized source window has an empty clipList
+    /// (mivaltree.c:691-696, miwindow.c:741-744, window.c:892), so miDoCopy
+    /// copies nothing and miHandleExposures exposes the whole rect.
+    #[test]
+    fn copy_area_from_unviewable_window_exposes_whole_dest_rect() {
+        for (opcode, src) in [
+            (62u8, UV_LONE),
+            (62, UV_CHILD),
+            (63, UV_LONE),
+            (63, UV_CHILD),
+        ] {
+            let (mut state, mut peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            uv_copy(
+                &mut state,
+                &mut backend,
+                opcode,
+                src,
+                UV_DST_PIXMAP,
+                UV_GC,
+                (10, 20),
+                (5, 7),
+                (30, 40),
+            );
+            assert_eq!(
+                uv_copy_calls(&backend),
+                0,
+                "op {opcode} src 0x{src:x}: nothing copied"
+            );
+            assert_eq!(
+                uv_events(&read_all_available(&mut peer)),
+                vec![(13, UV_DST_PIXMAP, 5, 7, 30, 40, 0, opcode)],
+                "op {opcode} src 0x{src:x}: one GraphicsExpose for the dest rect, no NoExpose",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_area_from_unviewable_window_without_exposures_sends_nothing() {
+        for opcode in [62u8, 63] {
+            let (mut state, mut peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            uv_copy(
+                &mut state,
+                &mut backend,
+                opcode,
+                UV_CHILD,
+                UV_DST_PIXMAP,
+                UV_GC_NOEXP,
+                (0, 0),
+                (0, 0),
+                (30, 40),
+            );
+            assert_eq!(uv_copy_calls(&backend), 0);
+            assert!(
+                read_all_available(&mut peer).is_empty(),
+                "op {opcode}: no events"
+            );
+        }
+    }
+
+    /// A pixmap or viewable window source is unchanged: copied, NoExpose.
+    #[test]
+    fn copy_area_from_pixmap_or_viewable_window_still_copies_with_no_expose() {
+        for opcode in [62u8, 63] {
+            for src in [UV_PIXMAP, UV_SHOWN] {
+                let (mut state, mut peer) = uv_fixture();
+                let mut backend = RecordingBackend::new();
+                uv_copy(
+                    &mut state,
+                    &mut backend,
+                    opcode,
+                    src,
+                    UV_DST_PIXMAP,
+                    UV_GC,
+                    (10, 20),
+                    (5, 7),
+                    (30, 40),
+                );
+                assert_eq!(uv_copy_calls(&backend), 1, "op {opcode} src 0x{src:x}");
+                assert_eq!(
+                    uv_events(&read_all_available(&mut peer)),
+                    vec![(14, UV_DST_PIXMAP, 0, 0, 0, 0, 0, opcode)],
+                    "op {opcode} src 0x{src:x}: NoExpose",
+                );
+            }
+        }
+    }
+
+    /// Xorg miDoCopy returns NULL for an unrealized destination before any
+    /// copy or exposure (micopy.c:157-160), so the requestor gets NoExpose
+    /// even when the source is unavailable.
+    #[test]
+    fn copy_area_to_unviewable_window_copies_nothing_and_sends_no_expose() {
+        for opcode in [62u8, 63] {
+            for (src, src_xy) in [(UV_PIXMAP, (0, 0)), (UV_PIXMAP, (90, 0)), (UV_LONE, (0, 0))] {
+                let (mut state, mut peer) = uv_fixture();
+                let mut backend = RecordingBackend::new();
+                uv_copy(
+                    &mut state,
+                    &mut backend,
+                    opcode,
+                    src,
+                    UV_CHILD,
+                    UV_GC,
+                    src_xy,
+                    (0, 0),
+                    (30, 40),
+                );
+                assert_eq!(uv_copy_calls(&backend), 0, "op {opcode} src 0x{src:x}");
+                assert!(
+                    !backend.calls().iter().any(|c| matches!(
+                        c,
+                        crate::backend::recording::RecordedCall::PaintWindowBackgroundRect { .. }
+                    )),
+                    "op {opcode} src 0x{src:x}: no background paint",
+                );
+                assert_eq!(
+                    uv_events(&read_all_available(&mut peer)),
+                    vec![(14, UV_CHILD, 0, 0, 0, 0, 0, opcode)],
+                    "op {opcode} src 0x{src:x} at {src_xy:?}: NoExpose",
+                );
+            }
+        }
+    }
+
+    /// Drawing to an unmapped window records no damage (Xorg damage.c:197).
+    #[test]
+    fn poly_fill_on_unmapped_window_records_no_damage() {
+        use crate::server::DamageObject;
+        const DAMAGE_XID: u32 = 0x0010_0130;
+        for (window, expect_damage) in [(UV_LONE, false), (UV_CHILD, false), (UV_SHOWN, true)] {
+            let (mut state, _peer) = uv_fixture();
+            let mut backend = RecordingBackend::new();
+            state.damage_objects.insert(
+                DAMAGE_XID,
+                DamageObject {
+                    owner: ClientId(1),
+                    drawable: ResourceId(window),
+                    level: 3,
+                    rects: Vec::new(),
+                    pending_notify_fired: false,
+                    last_reported_geometry: None,
+                },
+            );
+            let body = poly_fill_rectangle_body(window, UV_GC);
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 70,
+                    data: 0,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                &body,
+                None,
+            )
+            .expect("PolyFillRectangle");
+            let dmg = state
+                .damage_objects
+                .get(&DAMAGE_XID)
+                .expect("damage object");
+            assert_eq!(
+                !dmg.rects.is_empty() || dmg.pending_notify_fired,
+                expect_damage,
+                "window 0x{window:x}: rects={:?} fired={}",
+                dmg.rects,
+                dmg.pending_notify_fired,
+            );
+        }
+    }
+
     /// Stage 4d Manual-redirect CopyArea ClipByChildren fix.
     ///
     /// Scenario (matches marco's failing #6886 / #7450 CopyArea on
@@ -62292,6 +71696,75 @@ mod tests {
         assert_eq!(got[0].height, 80);
     }
 
+    /// A bounding-shaped child takes only its shape out of its parent
+    /// under ClipByChildren (Xorg subtracts its `borderSize`,
+    /// `dix/window.c:1747-1770`). xfce4-settings-manager's socket S at
+    /// (8,8) 730x531 is shaped to the 450 rows of its viewport, and the
+    /// manager repaints its button bar under S's rect but outside its
+    /// shape with `CopyArea(8,464 730x36)`; measured on Xorg 21.1 by
+    /// tools/vng-scenarios/xembed-scroll-probe.c, the bar is drawn.
+    #[test]
+    fn copy_area_clip_by_children_takes_out_only_a_shaped_childs_shape() {
+        use crate::resources::MapState;
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId, shape as x11shape};
+
+        let mut state = ServerState::new();
+        let (c, s) = (ResourceId(0x0020_0101), ResourceId(0x0020_0102));
+        for (window, parent, x, y, width, height) in
+            [(c, ROOT_WINDOW, 0, 0, 746, 500), (s, c, 8, 8, 730, 531)]
+        {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        state.resources.window_mut(s).expect("socket").map_state = MapState::Viewable;
+        crate::nested::set_shape_rects(
+            &mut state,
+            s,
+            x11shape::KIND_BOUNDING,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 730,
+                height: 450,
+            }],
+        );
+        let request = yserver_protocol::x11::CopyAreaRequest {
+            src: ResourceId(0x1),
+            dst: c,
+            gc: ResourceId(0x1),
+            src_x: 0,
+            src_y: 0,
+            dst_x: 8,
+            dst_y: 464,
+            width: 730,
+            height: 36,
+        };
+        let draw_state = crate::backend::DrawState {
+            subwindow_mode: crate::backend::SubwindowMode::ClipByChildren,
+            ..Default::default()
+        };
+        let got = copy_area_effective_dst_rects(&state, c, &draw_state, &request);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].x, got[0].y, got[0].width, got[0].height),
+            (8, 464, 730, 36)
+        );
+    }
+
     /// MANUALLY-redirected children must not be subtracted by
     /// ClipByChildren. They don't claim the parent's pixmap real
     /// estate — the redirecting compositor (which may be the
@@ -62362,13 +71835,16 @@ mod tests {
         // `(window, subwindows=false)` for per-window
         // RedirectWindow (vs `(parent, true)` for the inherited
         // RedirectSubwindows form).
-        state.composite_redirects.insert(
-            (child_xid, false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Manual,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                child_xid,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         let rect = yserver_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
@@ -62455,13 +71931,16 @@ mod tests {
             child.map_state = MapState::Viewable;
             assert_eq!(child.class, WindowClass::InputOutput);
         }
-        state.composite_redirects.insert(
-            (child_xid, false),
-            RedirectRecord {
-                mode: CompositeRedirectMode::Automatic,
-                owner: ClientId(1),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                child_xid,
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Automatic,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
 
         let rect = yserver_protocol::x11::CopyAreaRequest {
             src: ResourceId(0x1),
@@ -62549,20 +72028,22 @@ mod tests {
             ResourceId(SRC_PIC_XID),
             PictureState {
                 client: ClientId(COMPOSITOR),
-                host_picture_xid: PictureHandle::from_raw_for_test(HOST_SRC),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(HOST_SRC)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Drawable,
                 drawable: Some(ResourceId(WIN_XID)),
+                window: None,
             },
         );
         state.resources.create_picture(
             ResourceId(DST_PIC_XID),
             PictureState {
                 client: ClientId(COMPOSITOR),
-                host_picture_xid: PictureHandle::from_raw_for_test(HOST_DST),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(HOST_DST)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Drawable,
                 drawable: Some(ResourceId(WIN_XID)),
+                window: None,
             },
         );
         // The dst window must be MAPPED for these tests to describe a real
@@ -62946,6 +72427,10 @@ mod tests {
             // out of the backend; tests just need stable values.
             w.host_xid = crate::backend::WindowHandle::from_raw(0x8000_0000 | xid.0);
         }
+        // As CreateWindow does.
+        state
+            .composite_redirects
+            .redirect_new_subwindow(parent, xid);
     }
 
     /// Attach a `RedirectedBacking` to an already-seeded window.
@@ -63029,13 +72514,17 @@ mod tests {
         let nm_applet_xid = ResourceId(0x180_000b);
 
         // root has RedirectSubwindows(Manual); socket does not.
-        state.composite_redirects.insert(
-            (root_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root_xid,
+                state.resources.children(root_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_redirected_window(&mut state, &mut backend, mate_panel_xid);
@@ -63086,21 +72575,26 @@ mod tests {
         let frame = ResourceId(0x510_0040);
         let window = ResourceId(0x530_0003);
 
-        state.composite_redirects.insert(
-            (root, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                root,
+                state.resources.children(root),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
         seed_window(&mut state, frame, root, 1024, 768);
         seed_window(&mut state, window, root, 1024, 768);
         seed_redirected_window(&mut state, &mut backend, window);
 
         dispatch_composite_redirect(&mut state, &mut backend, ClientId(14), window.0, 1);
-        assert!(
-            !state.composite_redirects.contains_key(&(window, false)),
-            "BadAccess probe must not create a direct redirect",
+        assert_eq!(
+            state.composite_redirects.window_records(window).len(),
+            1,
+            "BadAccess probe must not add a redirect",
         );
 
         dispatch_reparent_window(&mut state, &mut backend, window, frame, 0, 0);
@@ -63131,17 +72625,25 @@ mod tests {
         let unredirected_parent_xid = ResourceId(0x300_0001);
         let target_xid = ResourceId(0x300_0010);
 
-        state.composite_redirects.insert(
-            (mate_panel_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Automatic,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                mate_panel_xid,
+                state.resources.children(mate_panel_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Automatic,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_window(&mut state, unredirected_parent_xid, root_xid, 100, 100);
         seed_window(&mut state, target_xid, unredirected_parent_xid, 50, 50);
+        // Viewable throughout: an unviewable window gets its backing at realize instead.
+        for w in [mate_panel_xid, unredirected_parent_xid, target_xid] {
+            let _ = state.resources.map_window(w);
+        }
 
         assert!(
             state
@@ -63184,13 +72686,16 @@ mod tests {
         let socket_xid = ResourceId(0x210_0013);
         let directly_redirected_xid = ResourceId(0x400_0001);
 
-        state.composite_redirects.insert(
-            (directly_redirected_xid, false),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_window(
+                directly_redirected_xid,
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
         seed_window(&mut state, socket_xid, mate_panel_xid, 26, 27);
@@ -63228,6 +72733,391 @@ mod tests {
         );
     }
 
+    // Window-storage step 4: a redirect backing follows viewability (Xorg
+    // compRealizeWindow / compUnrealizeWindow → compCheckRedirect); the
+    // redirect itself survives until Unredirect or destruction.
+
+    fn storage_req(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request must succeed");
+    }
+
+    fn storage_redirect(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        minor: u8,
+        window: ResourceId,
+    ) {
+        let mut body = window.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&[1, 0, 0, 0]); // Manual
+        storage_req(state, backend, 144, minor, &body);
+    }
+
+    fn storage_window_req(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        opcode: u8,
+        window: ResourceId,
+    ) {
+        storage_req(state, backend, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    fn drain_calls(
+        backend: &crate::backend::recording::RecordingBackend,
+    ) -> Vec<crate::backend::recording::RecordedCall> {
+        std::mem::take(&mut *backend.calls.lock().unwrap())
+    }
+
+    const MAP_WINDOW: u8 = 8;
+    const MAP_SUBWINDOWS: u8 = 9;
+    const UNMAP_WINDOW: u8 = 10;
+    const UNMAP_SUBWINDOWS: u8 = 11;
+
+    fn backing_of(state: &ServerState, window: ResourceId) -> Option<u32> {
+        state
+            .resources
+            .window(window)
+            .and_then(|w| w.redirected_backing.as_ref())
+            .map(|b| b.host_pixmap.as_raw())
+    }
+
+    fn storage_host(window: ResourceId) -> u32 {
+        0x8000_0000 | window.0
+    }
+
+    fn released(calls: &[crate::backend::recording::RecordedCall], backing: u32) -> bool {
+        calls.iter().any(|c| {
+            matches!(c, crate::backend::recording::RecordedCall::ReleaseRedirectedBacking(b) if *b == backing)
+        })
+    }
+
+    fn allocations_for(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> usize {
+        calls
+            .iter()
+            .filter(|c| {
+                matches!(c, crate::backend::recording::RecordedCall::AllocateRedirectedBacking { host_window, .. } if *host_window == storage_host(window))
+            })
+            .count()
+    }
+
+    fn participation_restored(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> bool {
+        calls.iter().any(|c| {
+            matches!(c, crate::backend::recording::RecordedCall::SetWindowSceneParticipation { host_window, participating: true } if *host_window == storage_host(window))
+        })
+    }
+
+    fn last_participation(
+        calls: &[crate::backend::recording::RecordedCall],
+        window: ResourceId,
+    ) -> Option<bool> {
+        calls.iter().rev().find_map(|c| match c {
+            crate::backend::recording::RecordedCall::SetWindowSceneParticipation {
+                host_window,
+                participating,
+            } if *host_window == storage_host(window) => Some(*participating),
+            _ => None,
+        })
+    }
+
+    /// A mapped top-level `W`, Manual-redirected through the dispatcher.
+    fn storage_redirected_top_level() -> (
+        ServerState,
+        crate::backend::recording::RecordingBackend,
+        ResourceId,
+        u32,
+    ) {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let window = ResourceId(0x0600_0001);
+        seed_window(&mut state, window, crate::resources::ROOT_WINDOW, 64, 48);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        let backing = backing_of(&state, window).expect("viewable redirected window has a backing");
+        (state, backend, window, backing)
+    }
+
+    #[test]
+    fn unmap_of_redirected_window_frees_backing_keeps_redirect_and_exclusion() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        let calls = drain_calls(&backend);
+        assert!(
+            released(&calls, backing),
+            "unmap releases the backing; calls={calls:#?}"
+        );
+        assert_eq!(backing_of(&state, window), None);
+        assert!(
+            state.composite_redirects.window_mode(window).is_some(),
+            "redirect record kept"
+        );
+        assert!(
+            !participation_restored(&calls, window),
+            "window stays out of the scene"
+        );
+    }
+
+    #[test]
+    fn remap_of_redirected_window_allocates_a_fresh_backing() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, window), 1);
+        let fresh = backing_of(&state, window).expect("remap re-creates the backing");
+        assert_ne!(fresh, backing);
+        assert_eq!(
+            last_participation(&calls, window),
+            Some(false),
+            "Manual stays excluded"
+        );
+    }
+
+    #[test]
+    fn redirect_of_unviewable_window_allocates_at_map() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let window = ResourceId(0x0600_0001);
+        seed_window(&mut state, window, crate::resources::ROOT_WINDOW, 64, 48);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        assert_eq!(
+            allocations_for(&drain_calls(&backend), window),
+            0,
+            "Xorg: not realized, no pixmap"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
+        assert!(backing_of(&state, window).is_some());
+    }
+
+    #[test]
+    fn ancestor_unmap_frees_redirected_descendant_backing_and_remap_restores_it() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let frame = ResourceId(0x0600_0010);
+        let window = ResourceId(0x0600_0011);
+        seed_window(&mut state, frame, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, window, frame, 32, 24);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        let backing = backing_of(&state, window).expect("backing");
+        drain_calls(&backend);
+
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, frame);
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.window_mode(window).is_some());
+        assert!(!participation_restored(&calls, window));
+
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        let calls = drain_calls(&backend);
+        assert_eq!(
+            allocations_for(&calls, window),
+            1,
+            "descendant realized with its ancestor"
+        );
+        assert_ne!(backing_of(&state, window), Some(backing));
+        assert!(backing_of(&state, window).is_some());
+        assert_eq!(last_participation(&calls, window), Some(false));
+    }
+
+    #[test]
+    fn redirect_subwindows_children_follow_viewability() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let parent = ResourceId(0x0600_0020);
+        let shown = ResourceId(0x0600_0021);
+        let hidden = ResourceId(0x0600_0022);
+        seed_window(&mut state, parent, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, shown, parent, 16, 16);
+        seed_window(&mut state, hidden, parent, 16, 16);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, parent);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, shown);
+        storage_redirect(&mut state, &mut backend, 2, parent); // RedirectSubwindows
+        let shown_backing = backing_of(&state, shown).expect("viewable child redirected");
+        assert_eq!(
+            backing_of(&state, hidden),
+            None,
+            "unmapped child has no backing"
+        );
+        assert_eq!(
+            backing_of(&state, parent),
+            None,
+            "the parent itself is not redirected"
+        );
+
+        storage_window_req(&mut state, &mut backend, UNMAP_SUBWINDOWS, parent);
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, shown_backing));
+        assert_eq!(backing_of(&state, shown), None);
+        assert!(state.composite_redirects.subwindows_mode(parent).is_some());
+        assert!(!participation_restored(&calls, shown));
+
+        storage_window_req(&mut state, &mut backend, MAP_SUBWINDOWS, parent);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, shown), 1);
+        assert_eq!(allocations_for(&calls, hidden), 1);
+        assert_eq!(last_participation(&calls, shown), Some(false));
+        assert_eq!(last_participation(&calls, hidden), Some(false));
+
+        let (a, b) = (
+            backing_of(&state, shown).unwrap(),
+            backing_of(&state, hidden).unwrap(),
+        );
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, parent);
+        let calls = drain_calls(&backend);
+        assert!(
+            released(&calls, a) && released(&calls, b),
+            "ancestor unmap frees every child"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, parent);
+        let calls = drain_calls(&backend);
+        assert_eq!(allocations_for(&calls, shown), 1);
+        assert_eq!(allocations_for(&calls, hidden), 1);
+    }
+
+    #[test]
+    fn unredirect_window_still_tears_down_and_restores_participation() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_redirect(&mut state, &mut backend, 3, window); // UnredirectWindow
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.window_mode(window).is_none());
+        assert_eq!(last_participation(&calls, window), Some(true));
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        assert_eq!(
+            allocations_for(&drain_calls(&backend), window),
+            0,
+            "no redirect, no backing"
+        );
+    }
+
+    #[test]
+    fn unredirect_of_hidden_mapped_window_restores_participation_without_backing() {
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+        let frame = ResourceId(0x0600_0030);
+        let window = ResourceId(0x0600_0031);
+        seed_window(&mut state, frame, crate::resources::ROOT_WINDOW, 64, 48);
+        seed_window(&mut state, window, frame, 32, 24);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        storage_redirect(&mut state, &mut backend, 1, window);
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, frame);
+        drain_calls(&backend);
+        storage_redirect(&mut state, &mut backend, 3, window);
+        let calls = drain_calls(&backend);
+        assert_eq!(
+            last_participation(&calls, window),
+            Some(true),
+            "mapped window rejoins the scene"
+        );
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, frame);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 0);
+    }
+
+    #[test]
+    fn destroy_of_redirected_window_still_releases_backing_and_record() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        drain_calls(&backend);
+        storage_window_req(&mut state, &mut backend, 4, window); // DestroyWindow
+        let calls = drain_calls(&backend);
+        assert!(released(&calls, backing));
+        assert!(state.composite_redirects.window_mode(window).is_none());
+    }
+
+    #[test]
+    fn destroy_of_unmapped_redirected_window_drops_the_record() {
+        let (mut state, mut backend, window, _backing) = storage_redirected_top_level();
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        storage_window_req(&mut state, &mut backend, 4, window);
+        assert!(state.composite_redirects.window_mode(window).is_none());
+    }
+
+    #[test]
+    fn reparent_under_unmapped_parent_frees_backing_keeps_redirect() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        let hidden_parent = ResourceId(0x0600_0040);
+        seed_window(
+            &mut state,
+            hidden_parent,
+            crate::resources::ROOT_WINDOW,
+            64,
+            48,
+        );
+        drain_calls(&backend);
+        dispatch_reparent_window(&mut state, &mut backend, window, hidden_parent, 0, 0);
+        assert!(released(&drain_calls(&backend), backing));
+        assert_eq!(backing_of(&state, window), None);
+        assert!(state.composite_redirects.window_mode(window).is_some());
+        storage_window_req(&mut state, &mut backend, MAP_WINDOW, hidden_parent);
+        assert_eq!(allocations_for(&drain_calls(&backend), window), 1);
+    }
+
+    #[test]
+    fn unmap_severs_named_pixmaps_from_the_window() {
+        let (mut state, mut backend, window, backing) = storage_redirected_top_level();
+        let named = ResourceId(0x0600_0050);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.composite_named_pixmaps
+                .push(crate::resources::NamedCompositePixmap {
+                    client_pixmap: named,
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(backing),
+                    width: 64,
+                    height: 48,
+                });
+        }
+        storage_window_req(&mut state, &mut backend, UNMAP_WINDOW, window);
+        assert!(
+            state
+                .resources
+                .window(window)
+                .unwrap()
+                .composite_named_pixmaps
+                .is_empty()
+        );
+        assert_eq!(
+            render_picture_damage_drawable(&state, named),
+            named,
+            "no longer the window's"
+        );
+    }
+
     #[test]
     fn reparent_between_redirected_parents_with_different_modes_flips_mode() {
         // Phase 2: when both old_parent and new_parent have
@@ -63247,20 +73137,28 @@ mod tests {
         let parent_automatic_xid = ResourceId(0x500_0002);
         let target_xid = ResourceId(0x500_0010);
 
-        state.composite_redirects.insert(
-            (parent_manual_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Manual,
-                owner: ClientId(14),
-            },
-        );
-        state.composite_redirects.insert(
-            (parent_automatic_xid, true),
-            crate::server::RedirectRecord {
-                mode: crate::server::CompositeRedirectMode::Automatic,
-                owner: ClientId(14),
-            },
-        );
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                parent_manual_xid,
+                state.resources.children(parent_manual_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Manual,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                parent_automatic_xid,
+                state.resources.children(parent_automatic_xid),
+                crate::server::RedirectRecord {
+                    mode: crate::server::CompositeRedirectMode::Automatic,
+                    owner: ClientId(14),
+                },
+            )
+            .unwrap();
 
         seed_window(&mut state, parent_manual_xid, root_xid, 100, 100);
         seed_window(&mut state, parent_automatic_xid, root_xid, 100, 100);
@@ -64000,6 +73898,161 @@ mod tests {
         assert!(!state.keyboard_control.global_auto_repeat);
     }
 
+    /// Xorg `DoChangeKeyboardControl` calls `XkbDisableComputedAutoRepeats`
+    /// for a per-key auto-repeat change: the key gets
+    /// `XkbExplicitAutoRepeatMask`, so a later mapping change leaves its bit
+    /// alone (`XkbUpdateDescActions`), while other keys' bits follow the
+    /// keymap and a change reports `XkbControlsNotify(PerKeyRepeat)`.
+    #[test]
+    fn per_key_auto_repeat_set_by_a_client_survives_a_mapping_change() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 1, 0x0100, 0x0008);
+        // key=64 auto-repeat-mode=On (already on by default).
+        let body = kbctrl_body(0xc0, &[64, 1]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert_eq!(state.keyboard_control.auto_repeats_explicit[8], 0x01);
+        let change = crate::backend::KeyboardMappingChange {
+            map_notify: x11::XkbMapNotify::default(),
+            num_groups: 1,
+            enabled_controls: 1,
+            repeats: vec![(64, false), (65, false)],
+            indicator_map_changed: 0,
+            indicator_state: 0,
+            compat_changed_groups: 0,
+            compat_total_si: 0,
+        };
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
+            &mut state,
+            85,
+            &change,
+            (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
+        );
+        assert_eq!(
+            state.keyboard_control.auto_repeats[8] & 0x03,
+            0x01,
+            "64 keeps the client's bit, 65 follows the keymap"
+        );
+        let ev = read_all_available(&mut peer);
+        assert_eq!(ev.len(), 32, "one ControlsNotify");
+        assert_eq!((ev[0], ev[1]), (85, 3));
+        assert_eq!(&ev[12..16], &0x4000_0000u32.to_le_bytes());
+
+        // Nothing changes: no event.
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
+            &mut state,
+            85,
+            &change,
+            (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
+        );
+        assert!(read_all_available(&mut peer).is_empty());
+    }
+
+    /// SetModifierMapping through the dispatcher on a backend without an XKB
+    /// keymap (the fallback store); returns everything the client received.
+    fn set_modifier_mapping(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        kpm: u8,
+        keys: &[u8],
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        process_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 118,
+                data: kpm,
+                length_units: u32::try_from(1 + keys.len() / 4).unwrap(),
+            },
+            keys,
+            None,
+        )
+        .expect("SetModifierMapping dispatch");
+        read_all_or_buffered(state, 1, peer)
+    }
+
+    /// Xorg `build_modmap_from_modkeymap`: a keycode listed twice is
+    /// BadValue with value 0 (golden `duplicate-keycode`), before the range
+    /// check; `check_modmap_change`: a keycode below 8 is BadValue with that
+    /// keycode, the lowest one (golden `keycode-out-of-range`). Nothing is
+    /// stored or notified.
+    #[test]
+    fn set_modifier_mapping_refusals_as_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &[50, 0, 37, 0, 0, 0, 0, 50]);
+        assert_eq!(r.len(), 32);
+        assert_eq!((r[0], r[1]), (0, x11::error::BAD_VALUE), "{r:02x?}");
+        assert_eq!(&r[4..8], &0u32.to_le_bytes(), "duplicate: value 0");
+
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &[50, 5, 37, 3, 0, 0, 0, 0]);
+        assert_eq!(r.len(), 32);
+        assert_eq!((r[0], r[1]), (0, x11::error::BAD_VALUE));
+        assert_eq!(&r[4..8], &3u32.to_le_bytes(), "the lowest keycode below 8");
+        assert_eq!(state.modifier_mapping_override, None);
+    }
+
+    /// Xorg `check_modmap_change`: MappingBusy (reply status 1, nothing
+    /// applied, no MappingNotify) when a key of the new map is down or a key
+    /// of the old one is — golden `busy-held-key-changes`,
+    /// `busy-held-modifier-unchanged`, `busy-held-key-becomes-modifier`; a
+    /// held key that is in neither doesn't block (`held-nonmodifier-
+    /// unaffected`). Xorg's loop over the old modifiers stops before the
+    /// last keycode, so a held keycode 255 in the old map doesn't block.
+    #[test]
+    fn set_modifier_mapping_busy_as_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let old = [50u8, 0, 66, 0, 37, 0, 0, 255];
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &old);
+        assert_eq!(r.len(), 64, "MappingNotify then the reply: {r:02x?}");
+        assert_eq!(r[0] & 0x7f, 34);
+        assert_eq!((r[32], r[33]), (1, 0), "Success");
+
+        let press = |state: &mut ServerState, kc: u8, down: bool| {
+            if down {
+                state.keys_down[usize::from(kc >> 3)] |= 1 << (kc & 7);
+            } else {
+                state.keys_down[usize::from(kc >> 3)] &= !(1 << (kc & 7));
+            }
+        };
+        let new = [62u8, 0, 66, 0, 37, 0, 0, 0];
+        // 50 held: an old modifier, not in the new map.
+        press(&mut state, 50, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!(r.len(), 32, "only the reply: {r:02x?}");
+        assert_eq!((r[0], r[1]), (1, 1), "MappingBusy");
+        press(&mut state, 50, false);
+        // 62 held: a new modifier.
+        press(&mut state, 62, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!((r.len(), r[1]), (32, 1), "MappingBusy");
+        press(&mut state, 62, false);
+        assert_eq!(state.modifier_mapping_override, Some((1, old.to_vec())));
+        // 38 held: neither.
+        press(&mut state, 38, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!((r.len(), r[33]), (64, 0), "applied");
+        press(&mut state, 38, false);
+
+        // 255 held and in the old map only: not checked by Xorg.
+        let with_255 = [62u8, 0, 66, 0, 37, 0, 0, 255];
+        let _ = set_modifier_mapping(&mut state, &mut peer, 1, &with_255);
+        press(&mut state, 255, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!((r.len(), r[33]), (64, 0), "held 255 doesn't block");
+        assert_eq!(state.modifier_mapping_override, Some((1, new.to_vec())));
+    }
+
     #[test]
     fn change_keyboard_control_bad_value_does_not_commit() {
         let mut state = ServerState::new();
@@ -64735,9 +74788,13 @@ mod tests {
                 counter,
                 wait_value: 100,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 100,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
 
@@ -64777,9 +74834,13 @@ mod tests {
                 counter,
                 wait_value: 100,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_COMPARISON as u8,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 100,
+                check_type: x11sync::TEST_POSITIVE_COMPARISON,
             },
         );
 
@@ -64816,9 +74877,13 @@ mod tests {
                 counter,
                 wait_value: near_max,
                 delta: 100, // would overflow on first add
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: near_max,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
 
@@ -65860,7 +75925,10 @@ mod tests {
         if let Some(w) = state.resources.window_mut(win) {
             w.border_width = 2;
         }
-        assert!(state.resources.map_window(win), "window must map");
+        assert!(
+            state.resources.map_window(win).mapping_changed,
+            "window must map"
+        );
         // Raw level: `area` on the wire then carries the real rect
         // instead of the NonEmpty full-extent substitute, so the test
         // can prove the negative origin survives the i16 encoding.
@@ -65967,7 +76035,10 @@ mod tests {
                 w.border_width = bw;
             }
             if map {
-                assert!(state.resources.map_window(win), "window must map");
+                assert!(
+                    state.resources.map_window(win).mapping_changed,
+                    "window must map"
+                );
             }
             state.damage_objects.insert(
                 DAMAGE_XID,
@@ -66040,14 +76111,20 @@ mod tests {
                     depth: 24,
                 });
             }
-            assert!(state.resources.map_window(win), "window must map");
-            state.composite_redirects.insert(
-                (win, false),
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(1),
-                },
+            assert!(
+                state.resources.map_window(win).mapping_changed,
+                "window must map"
             );
+            state
+                .composite_redirects
+                .redirect_window(
+                    win,
+                    RedirectRecord {
+                        mode: CompositeRedirectMode::Manual,
+                        owner: ClientId(1),
+                    },
+                )
+                .unwrap();
             // ReportLevel Raw, so `rects` keeps the real strips instead
             // of the NonEmpty full-extent substitute.
             state.damage_objects.insert(
@@ -66178,15 +76255,21 @@ mod tests {
                 });
             }
             if map {
-                assert!(state.resources.map_window(win), "window must map");
+                assert!(
+                    state.resources.map_window(win).mapping_changed,
+                    "window must map"
+                );
             }
-            state.composite_redirects.insert(
-                (win, false),
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(1),
-                },
-            );
+            state
+                .composite_redirects
+                .redirect_window(
+                    win,
+                    RedirectRecord {
+                        mode: CompositeRedirectMode::Manual,
+                        owner: ClientId(1),
+                    },
+                )
+                .unwrap();
             state.damage_objects.insert(
                 DAMAGE_XID,
                 DamageObject {
@@ -67116,6 +77199,668 @@ mod tests {
         );
     }
 
+    // ─── GLX 1.0 CreateGLXPixmap / DestroyGLXPixmap, QueryContext, IsDirect ───
+    //
+    // Expected wire behaviour is Xorg's, captured from Xvfb 21.1.24
+    // (llvmpipe GLX) with an xcb probe on 2026-09-26. Xvfb's GLX visual 0x21
+    // carries FBConfig 0x88; the yserver counterpart used below is
+    // ROOT_VISUAL 0x102 carrying FBConfig 0x101 (synthesise_glx_fb_configs).
+    // Error values, minors and the order in which the checks fire are
+    // Xvfb's, verbatim.
+
+    const GLX_TEST_XID_BASE: u32 = 0x0020_0000;
+    const GLX_TEST_XID_MASK: u32 = 0x001f_ffff;
+
+    /// A client whose XID range is `0x0020_0000 | 0x001f_ffff`, the range
+    /// Xvfb handed the capture probe, so `LEGAL_NEW_RESOURCE` is exercised.
+    fn glx_legacy_fixture() -> (ServerState, RecordingBackend, UnixStream) {
+        let mut state = ServerState::new();
+        let peer = install_client(&mut state, 1);
+        let client = state.clients.get_mut(&1).expect("test client");
+        client.resource_id_base = GLX_TEST_XID_BASE;
+        client.resource_id_mask = GLX_TEST_XID_MASK;
+        (state, RecordingBackend::new(), peer)
+    }
+
+    fn glx_legacy_x_pixmap(state: &mut ServerState, xid: u32, depth: u8, host: Option<u32>) {
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth,
+                pixmap: ResourceId(xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+        if let Some(host) = host {
+            assert!(state.resources.set_pixmap_host_xid(
+                ResourceId(xid),
+                crate::backend::PixmapHandle::from_raw(host).expect("non-zero host xid"),
+            ));
+        }
+    }
+
+    fn glx_legacy_words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Run one request for `client` and return every byte it wrote.
+    fn glx_legacy_send_major(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        client: u32,
+        (opcode, minor): (u8, u8),
+        body: &[u8],
+    ) -> Vec<u8> {
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("fits");
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(7),
+            RequestHeader {
+                opcode,
+                data: minor,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+        read_all_or_buffered(state, client, peer)
+    }
+
+    /// Run one GLX request for `client` and return every byte it wrote.
+    fn glx_legacy_send(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        peer: &mut UnixStream,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        glx_legacy_send_major(
+            state,
+            backend,
+            peer,
+            client,
+            (crate::nested::GLX_MAJOR_OPCODE, minor),
+            body,
+        )
+    }
+
+    /// Assert `bytes` is exactly one X error with this code, bad value and
+    /// minor opcode on the GLX major opcode.
+    fn assert_glx_legacy_error(what: &str, bytes: &[u8], code: u8, value: u32, minor: u8) {
+        assert_eq!(bytes.len(), 32, "{what}: expected exactly one error packet");
+        assert_eq!(bytes[0], 0, "{what}: expected an X error");
+        assert_eq!(bytes[1], code, "{what}: error code");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            value,
+            "{what}: bad value"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            u16::from(minor),
+            "{what}: minor opcode"
+        );
+        assert_eq!(
+            bytes[10],
+            crate::nested::GLX_MAJOR_OPCODE,
+            "{what}: major opcode"
+        );
+    }
+
+    fn create_glx_pixmap_body(screen: u32, visual: u32, pixmap: u32, glx_pixmap: u32) -> Vec<u8> {
+        glx_legacy_words(&[screen, visual, pixmap, glx_pixmap])
+    }
+
+    /// Decode the (attribute, value) pairs of a GetDrawableAttributes /
+    /// QueryContext reply, checking the header's length and count agree.
+    fn glx_legacy_reply_pairs(bytes: &[u8]) -> Vec<(u32, u32)> {
+        assert_eq!(bytes[0], 1, "expected a reply, got {bytes:02x?}");
+        let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        assert_eq!(length, 2 * n, "reply length must be 2 * n");
+        assert_eq!(bytes.len(), 32 + 8 * n, "reply size");
+        (0..n)
+            .map(|i| {
+                let at = 32 + 8 * i;
+                (
+                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    /// GLX 1.0 `glXCreateGLXPixmap` (minor 13) used to hit the
+    /// `GLXBadRenderRequest` catch-all, so Xlib's default handler killed the
+    /// app. It must create the same GLXPixmap record GLX 1.3 `CreatePixmap`
+    /// does (config = the visual's FBConfig), hold the export ref, report
+    /// Xorg's drawable attributes, and `DestroyGLXPixmap` (15) must release
+    /// the ref — also after the X pixmap was freed first (Xorg bumps the
+    /// pixmap refcount, glxcmds.c `DoCreateGLXPixmap`).
+    #[test]
+    fn glx10_create_glx_pixmap_records_pixmap_and_destroy_releases_it() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let glx_pixmap = GLX_TEST_XID_BASE | 0x02;
+        let host = 0xdead_0001;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, Some(host));
+
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &create_glx_pixmap_body(0, crate::resources::ROOT_VISUAL.0, pixmap, glx_pixmap),
+        );
+        assert!(
+            out.is_empty(),
+            "CreateGLXPixmap succeeds silently, got {out:02x?}"
+        );
+        let record = state
+            .glx_drawables
+            .get(&glx_pixmap)
+            .expect("GLXPixmap recorded");
+        assert_eq!(record.kind, crate::server::GlxDrawableKind::Pixmap);
+        assert_eq!(record.x_drawable, pixmap);
+        assert_eq!(record.fbconfig, 0x101, "the visual's FBConfig");
+        assert_eq!(record.glx_export_host_xid, Some(host));
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::AcquireGlxPixmapExport(host))
+        );
+
+        // Xvfb: 0x20d4=0 0x801d=64 0x801e=32 0x800c=0 0x20d6=0x20dd
+        //       0x801f=0 0x8013=<fbconfig> 0x8010=GLX_PIXMAP_BIT
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::GET_DRAWABLE_ATTRIBUTES,
+            &glx_pixmap.to_le_bytes(),
+        );
+        assert_eq!(
+            glx_legacy_reply_pairs(&out),
+            vec![
+                (g::GLX_Y_INVERTED_EXT, 0),
+                (g::GLX_WIDTH, 64),
+                (g::GLX_HEIGHT, 32),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_TEXTURE_TARGET_EXT, g::GLX_TEXTURE_RECTANGLE_EXT),
+                (g::GLX_EVENT_MASK, 0),
+                (g::GLX_FBCONFIG_ID, 0x101),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_PIXMAP_BIT),
+            ]
+        );
+
+        // FreePixmap first, then DestroyGLXPixmap: both Success on Xvfb.
+        let out = glx_legacy_send_major(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            (54, 0),
+            &pixmap.to_le_bytes(),
+        );
+        assert!(out.is_empty(), "FreePixmap: got {out:02x?}");
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::DESTROY_GLX_PIXMAP,
+            &glx_pixmap.to_le_bytes(),
+        );
+        assert!(
+            out.is_empty(),
+            "DestroyGLXPixmap succeeds silently, got {out:02x?}"
+        );
+        assert!(!state.glx_drawables.contains_key(&glx_pixmap));
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::ReleaseGlxPixmapExport(host))
+        );
+    }
+
+    /// Every CreateGLXPixmap failure Xvfb produced, with its error code,
+    /// bad value and the precedence between checks: size, then the new
+    /// XID (`LEGAL_NEW_RESOURCE`), then the screen (GLXVND: BadMatch), then
+    /// the visual (BadValue), then the pixmap (core BadDrawable, or core
+    /// BadPixmap for a window). A failed request creates nothing.
+    #[test]
+    fn glx10_create_glx_pixmap_errors_match_xorg() {
+        use yserver_protocol::x11::{error, glx as g};
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let other_pixmap = GLX_TEST_XID_BASE | 0x03;
+        let existing_glx = GLX_TEST_XID_BASE | 0x04;
+        let fresh = GLX_TEST_XID_BASE | 0x05;
+        let vis = crate::resources::ROOT_VISUAL.0;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        glx_legacy_x_pixmap(&mut state, other_pixmap, 32, None);
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &create_glx_pixmap_body(0, vis, pixmap, existing_glx),
+        );
+        assert!(out.is_empty());
+
+        let bad_id = error::BAD_ID_CHOICE;
+        let unknown = 0x5a_5a5a;
+        let root = ROOT_WINDOW.0;
+        let cases: &[(&str, [u32; 4], u8, u32)] = &[
+            (
+                "glx id in use",
+                [0, vis, pixmap, existing_glx],
+                bad_id,
+                existing_glx,
+            ),
+            (
+                "glx id = X pixmap",
+                [0, vis, pixmap, other_pixmap],
+                bad_id,
+                other_pixmap,
+            ),
+            (
+                "glx id out of range",
+                [0, vis, pixmap, 0x07f0_0001],
+                bad_id,
+                0x07f0_0001,
+            ),
+            ("screen 1", [1, vis, pixmap, fresh], error::BAD_MATCH, 1),
+            (
+                "unknown visual",
+                [0, 0xdead, pixmap, fresh],
+                error::BAD_VALUE,
+                0xdead,
+            ),
+            // An FBConfig ID is not a GLX visual (Xvfb: its visual-less
+            // FBConfig 0x41 → BadValue 0x41).
+            (
+                "visual-less fbconfig id",
+                [0, 0x104, pixmap, fresh],
+                error::BAD_VALUE,
+                0x104,
+            ),
+            (
+                "fbconfig id of a visual",
+                [0, 0x101, pixmap, fresh],
+                error::BAD_VALUE,
+                0x101,
+            ),
+            (
+                "screen 1 + bad visual",
+                [1, 0xdead, pixmap, fresh],
+                error::BAD_MATCH,
+                1,
+            ),
+            (
+                "root window as pixmap",
+                [0, vis, root, fresh],
+                error::BAD_PIXMAP,
+                root,
+            ),
+            (
+                "unknown pixmap",
+                [0, vis, unknown, fresh],
+                error::BAD_DRAWABLE,
+                unknown,
+            ),
+            (
+                "bad visual + bad pixmap",
+                [0, 0xdead, unknown, fresh],
+                error::BAD_VALUE,
+                0xdead,
+            ),
+            (
+                "bad pixmap + glx id in use",
+                [0, vis, unknown, existing_glx],
+                bad_id,
+                existing_glx,
+            ),
+        ];
+        for (what, [screen, visual, pix, glx], code, value) in cases {
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::CREATE_GLX_PIXMAP,
+                &create_glx_pixmap_body(*screen, *visual, *pix, *glx),
+            );
+            assert_glx_legacy_error(what, &out, *code, *value, g::CREATE_GLX_PIXMAP);
+        }
+        assert!(!state.glx_drawables.contains_key(&fresh));
+        assert!(!state.glx_drawables.contains_key(&other_pixmap));
+        assert_eq!(state.glx_drawables.len(), 1);
+    }
+
+    /// Xorg does not compare the pixmap depth with the visual: Xvfb accepted
+    /// depth-32, depth-8 and depth-1 pixmaps for its depth-24 visual.
+    #[test]
+    fn glx10_create_glx_pixmap_accepts_any_pixmap_depth() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        for (i, depth) in (0_u32..).zip([32_u8, 8, 1]) {
+            let pixmap = GLX_TEST_XID_BASE | (0x10 + i);
+            let glx_pixmap = GLX_TEST_XID_BASE | (0x20 + i);
+            glx_legacy_x_pixmap(&mut state, pixmap, depth, None);
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::CREATE_GLX_PIXMAP,
+                &create_glx_pixmap_body(0, crate::resources::ROOT_VISUAL.0, pixmap, glx_pixmap),
+            );
+            assert!(out.is_empty(), "depth {depth}: got {out:02x?}");
+            assert!(state.glx_drawables.contains_key(&glx_pixmap));
+        }
+    }
+
+    /// DestroyGLXPixmap takes only a live GLX *pixmap*: anything else is
+    /// `GLXBadPixmap` with the XID as bad value (GLXVND's XID map, then
+    /// `validGlxDrawable`'s type check). GLX 1.0 and GLX 1.3 pixmaps are the
+    /// same resource type, so either destroy request frees either.
+    #[test]
+    fn glx10_destroy_glx_pixmap_errors_and_cross_version_destroy_match_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let bad_pixmap = crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_PIXMAP;
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let legacy = GLX_TEST_XID_BASE | 0x02;
+        let modern = GLX_TEST_XID_BASE | 0x03;
+        let glx_window = GLX_TEST_XID_BASE | 0x04;
+        let pbuffer = GLX_TEST_XID_BASE | 0x05;
+        let vis = crate::resources::ROOT_VISUAL.0;
+
+        let mut send = |state: &mut ServerState, minor: u8, body: &[u8]| {
+            glx_legacy_send(state, &mut backend, &mut peer, 1, minor, body)
+        };
+        let window_body = glx_legacy_words(&[0, 0x101, ROOT_WINDOW.0, glx_window]);
+        assert!(send(&mut state, g::CREATE_WINDOW, &window_body).is_empty());
+        let pbuffer_body = glx_legacy_words(&[0, 0x101, pbuffer, 0]);
+        assert!(send(&mut state, g::CREATE_PBUFFER, &pbuffer_body).is_empty());
+
+        for (what, xid) in [
+            ("unknown xid", 0x5a_5a5a),
+            ("X pixmap", pixmap),
+            ("GLX window", glx_window),
+            ("GLX pbuffer", pbuffer),
+        ] {
+            let out = send(&mut state, g::DESTROY_GLX_PIXMAP, &xid.to_le_bytes());
+            assert_glx_legacy_error(what, &out, bad_pixmap, xid, g::DESTROY_GLX_PIXMAP);
+        }
+        assert!(state.glx_drawables.contains_key(&glx_window));
+        assert!(state.glx_drawables.contains_key(&pbuffer));
+
+        // GLX 1.0 pixmap destroyed by GLX 1.3 DestroyPixmap; a second
+        // destroy through DestroyGLXPixmap is GLXBadPixmap.
+        let body = create_glx_pixmap_body(0, vis, pixmap, legacy);
+        assert!(send(&mut state, g::CREATE_GLX_PIXMAP, &body).is_empty());
+        assert!(send(&mut state, g::DESTROY_PIXMAP, &legacy.to_le_bytes()).is_empty());
+        assert!(!state.glx_drawables.contains_key(&legacy));
+        let out = send(&mut state, g::DESTROY_GLX_PIXMAP, &legacy.to_le_bytes());
+        assert_glx_legacy_error(
+            "destroyed twice",
+            &out,
+            bad_pixmap,
+            legacy,
+            g::DESTROY_GLX_PIXMAP,
+        );
+
+        // GLX 1.3 pixmap destroyed by GLX 1.0 DestroyGLXPixmap.
+        let body = glx_legacy_words(&[0, 0x101, pixmap, modern, 0]);
+        assert!(send(&mut state, g::CREATE_PIXMAP, &body).is_empty());
+        assert!(send(&mut state, g::DESTROY_GLX_PIXMAP, &modern.to_le_bytes()).is_empty());
+        assert!(!state.glx_drawables.contains_key(&modern));
+    }
+
+    /// CreateGLXPixmap, DestroyGLXPixmap, QueryContext and IsDirect are all
+    /// `REQUEST_SIZE_MATCH` in Xorg's GLXVND stubs: a short or long request
+    /// is core `BadLength`, and nothing is created.
+    #[test]
+    fn glx10_fixed_size_requests_reject_wrong_length() {
+        use yserver_protocol::x11::{error, glx as g};
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let mut long_create = create_glx_pixmap_body(
+            0,
+            crate::resources::ROOT_VISUAL.0,
+            pixmap,
+            GLX_TEST_XID_BASE | 0x02,
+        );
+        long_create.extend_from_slice(&[0; 4]);
+        let short_create = &long_create[..12];
+        for (what, minor, body) in [
+            (
+                "CreateGLXPixmap long",
+                g::CREATE_GLX_PIXMAP,
+                long_create.as_slice(),
+            ),
+            ("CreateGLXPixmap short", g::CREATE_GLX_PIXMAP, short_create),
+            ("DestroyGLXPixmap long", g::DESTROY_GLX_PIXMAP, &[0; 8][..]),
+            ("DestroyGLXPixmap empty", g::DESTROY_GLX_PIXMAP, &[][..]),
+            ("QueryContext long", g::QUERY_CONTEXT, &[0; 8][..]),
+            ("QueryContext empty", g::QUERY_CONTEXT, &[][..]),
+            ("IsDirect long", g::IS_DIRECT, &[0; 8][..]),
+            ("IsDirect empty", g::IS_DIRECT, &[][..]),
+        ] {
+            let out = glx_legacy_send(&mut state, &mut backend, &mut peer, 1, minor, body);
+            assert_glx_legacy_error(what, &out, error::BAD_LENGTH, 0, minor);
+        }
+        assert!(state.glx_drawables.is_empty());
+    }
+
+    /// `QueryContext` (GLX_EXT_import_context) answers Xorg's five
+    /// attributes in Xorg's order (glxcmds.c `DoQueryContext`) for every
+    /// creation request, to any client, and `GLXBadContext` for an XID that
+    /// is not a live context. `IsDirect` reports the creation request's
+    /// `isDirect` and shares the `GLXBadContext` rule.
+    #[test]
+    fn glx_query_context_and_is_direct_match_xorg() {
+        use yserver_protocol::x11::glx as g;
+
+        let (mut state, mut backend, mut peer) = glx_legacy_fixture();
+        let mut peer2 = install_client(&mut state, 2);
+        let bad_context = crate::nested::GLX_FIRST_ERROR + g::ERROR_GLX_BAD_CONTEXT;
+        let root_visual = crate::resources::ROOT_VISUAL.0;
+        let ctx1 = GLX_TEST_XID_BASE | 0x11;
+        let ctx2 = GLX_TEST_XID_BASE | 0x12;
+        let ctx3 = GLX_TEST_XID_BASE | 0x13;
+        let ctx4 = GLX_TEST_XID_BASE | 0x14;
+        let ctx5 = GLX_TEST_XID_BASE | 0x15;
+
+        let creates: [(u8, Vec<u32>); 5] = [
+            // CreateContext: context visual screen share isDirect
+            (g::CREATE_CONTEXT, vec![ctx1, root_visual, 0, 0, 1]),
+            // CreateNewContext (visual-less FBConfig, share ctx1):
+            // context fbconfig screen renderType share isDirect
+            (
+                g::CREATE_NEW_CONTEXT,
+                vec![ctx2, 0x104, 0, g::GLX_RGBA_TYPE, ctx1, 1],
+            ),
+            // CreateContextAttribsARB (share ctx1, GL 3.0):
+            // context fbconfig screen share isDirect numAttribs attribs
+            (
+                g::CREATE_CONTEXT_ATTRIBS_ARB,
+                vec![ctx3, 0x101, 0, ctx1, 1, 2, 0x2091, 3, 0x2092, 0],
+            ),
+            // CreateContextAttribsARB with GLX_RENDER_TYPE = GLX_RGBA_TYPE.
+            (
+                g::CREATE_CONTEXT_ATTRIBS_ARB,
+                vec![
+                    ctx4,
+                    0x101,
+                    0,
+                    0,
+                    1,
+                    1,
+                    g::GLX_RENDER_TYPE,
+                    g::GLX_RGBA_TYPE,
+                ],
+            ),
+            // CreateContext asking for an indirect context (isDirect 0).
+            (g::CREATE_CONTEXT, vec![ctx5, root_visual, 0, 0, 0]),
+        ];
+        for (minor, words) in &creates {
+            let body = glx_legacy_words(words);
+            let out = glx_legacy_send(&mut state, &mut backend, &mut peer, 1, *minor, &body);
+            assert!(out.is_empty(), "create minor {minor}: got {out:02x?}");
+        }
+
+        let expect = |share: u32, visual: u32, fbconfig: u32| {
+            vec![
+                (g::GLX_SHARE_CONTEXT_EXT, share),
+                (g::GLX_VISUAL_ID, visual),
+                (g::GLX_SCREEN, 0),
+                (g::GLX_FBCONFIG_ID, fbconfig),
+                (g::GLX_RENDER_TYPE, g::GLX_RGBA_TYPE),
+            ]
+        };
+        for (ctx, share, visual, fbconfig) in [
+            // Xvfb: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx1, 0, root_visual, 0x101),
+            // Xvfb: 0x800a=ctx1 0x800b=0 0x800c=0 0x8013=0x41 0x8011=0x8014
+            (ctx2, ctx1, 0, 0x104),
+            // Xvfb: 0x800a=ctx1 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx3, ctx1, root_visual, 0x101),
+            // Xvfb: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx4, 0, root_visual, 0x101),
+            // Xvfb +iglx: 0x800a=0 0x800b=0x21 0x800c=0 0x8013=0x88 0x8011=0x8014
+            (ctx5, 0, root_visual, 0x101),
+        ] {
+            let out = glx_legacy_send(
+                &mut state,
+                &mut backend,
+                &mut peer,
+                1,
+                g::QUERY_CONTEXT,
+                &ctx.to_le_bytes(),
+            );
+            assert_eq!(
+                glx_legacy_reply_pairs(&out),
+                expect(share, visual, fbconfig),
+                "QueryContext(0x{ctx:x})"
+            );
+        }
+
+        // Another client may query and IsDirect it: that is what
+        // import_context is for.
+        let ctx1_body = ctx1.to_le_bytes();
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer2,
+            2,
+            g::QUERY_CONTEXT,
+            &ctx1_body,
+        );
+        assert_eq!(glx_legacy_reply_pairs(&out), expect(0, root_visual, 0x101));
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer2,
+            2,
+            g::IS_DIRECT,
+            &ctx1_body,
+        );
+        assert_eq!(out.len(), 32, "IsDirect reply is 32 bytes");
+        assert_eq!(out[0], 1, "IsDirect reply");
+        assert_eq!(&out[4..8], &[0; 4], "IsDirect reply length 0");
+        assert_eq!(out[8], 1, "IsDirect(ctx1) = True");
+        // Xvfb +iglx: IsDirect of a context created with isDirect 0 is 0.
+        // (Without +iglx Xorg refuses that CreateContext with BadValue.)
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::IS_DIRECT,
+            &ctx5.to_le_bytes(),
+        );
+        assert_eq!((out.len(), out[0], out[8]), (32, 1, 0), "IsDirect(ctx5)");
+
+        let pixmap = GLX_TEST_XID_BASE | 0x01;
+        let glx_pixmap = GLX_TEST_XID_BASE | 0x02;
+        glx_legacy_x_pixmap(&mut state, pixmap, 24, None);
+        let body = create_glx_pixmap_body(0, root_visual, pixmap, glx_pixmap);
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::CREATE_GLX_PIXMAP,
+            &body,
+        );
+        assert!(out.is_empty());
+        for (what, xid) in [
+            ("unknown", 0x5a_5a5a),
+            ("GLX pixmap", glx_pixmap),
+            ("None", 0),
+        ] {
+            for minor in [g::QUERY_CONTEXT, g::IS_DIRECT] {
+                let out = glx_legacy_send(
+                    &mut state,
+                    &mut backend,
+                    &mut peer,
+                    1,
+                    minor,
+                    &xid.to_le_bytes(),
+                );
+                assert_glx_legacy_error(what, &out, bad_context, xid, minor);
+            }
+        }
+
+        let ctx2_body = ctx2.to_le_bytes();
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::DESTROY_CONTEXT,
+            &ctx2_body,
+        );
+        assert!(out.is_empty());
+        let out = glx_legacy_send(
+            &mut state,
+            &mut backend,
+            &mut peer,
+            1,
+            g::QUERY_CONTEXT,
+            &ctx2_body,
+        );
+        assert_glx_legacy_error(
+            "destroyed context",
+            &out,
+            bad_context,
+            ctx2,
+            g::QUERY_CONTEXT,
+        );
+    }
+
     /// `GetDrawableAttributes` on a GLXPixmap/GLXWindow must report the
     /// geometry of the *backing* X drawable. The GLX XID is a fresh
     /// client-allocated id with no X resource behind it, so resolving the
@@ -67260,6 +78005,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -67315,6 +78061,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -67358,6 +78105,7 @@ mod tests {
                 height: 32,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
 
@@ -68823,6 +79571,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -68911,6 +79662,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -68920,7 +79674,6 @@ mod tests {
         state
             .resources
             .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
-        state.materialize_cow_input_shape();
         state
             .clients
             .get_mut(&CLIENT_ID)
@@ -69134,6 +79887,9 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -69212,6 +79968,97 @@ mod tests {
         .unwrap();
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], x11::error::BAD_VALUE, "mm_width=0 → BadValue");
+    }
+
+    /// `RRSetScreenSize` sends ScreenChangeNotify only when pixel size or mm
+    /// differ from the current ones (`RRScreenSizeNotify`, rrscreen.c); a
+    /// repeated size and a rejected crop send nothing, as measured on Xorg
+    /// 21.1.24 by the xrandr-rotate vng scenario.
+    #[test]
+    fn screen_set_size_notifies_only_on_change() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "Virtual-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(0, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        state.randr_select_masks.insert(
+            (CLIENT_ID, ROOT_WINDOW),
+            x11randr::NOTIFY_MASK_SCREEN_CHANGE,
+        );
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_SCREEN_SIZE,
+            length_units: 5,
+        };
+        let mut set = |state: &mut ServerState, seq: u16, w: u16, h: u16, mm_w: u32, mm_h: u32| {
+            let mut b = Vec::with_capacity(16);
+            b.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            b.extend_from_slice(&w.to_le_bytes());
+            b.extend_from_slice(&h.to_le_bytes());
+            b.extend_from_slice(&mm_w.to_le_bytes());
+            b.extend_from_slice(&mm_h.to_le_bytes());
+            handle_randr_request(
+                state,
+                &mut backend,
+                ClientId(CLIENT_ID),
+                SequenceNumber(seq),
+                header,
+                &b,
+            )
+            .unwrap();
+        };
+        // RRScreenChangeNotify is RANDR event base 89 + 0.
+        let screen_changes =
+            |bytes: &[u8]| bytes.chunks_exact(32).filter(|e| e[0] & 0x7f == 89).count();
+
+        set(&mut state, 1, 1280, 800, 300, 200);
+        assert_eq!(
+            screen_changes(&read_all_available(&mut peer)),
+            1,
+            "mm changed"
+        );
+        set(&mut state, 2, 1280, 800, 300, 200);
+        assert_eq!(
+            screen_changes(&read_all_available(&mut peer)),
+            0,
+            "unchanged"
+        );
+        set(&mut state, 3, 1279, 800, 300, 200);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "crop → BadMatch");
+        assert_eq!(screen_changes(&bytes), 0, "rejected crop");
+        set(&mut state, 4, 4000, 4000, 300, 200);
+        assert_eq!(screen_changes(&read_all_available(&mut peer)), 1, "grown");
+        set(&mut state, 5, 1280, 800, 300, 200);
+        assert_eq!(
+            screen_changes(&read_all_available(&mut peer)),
+            1,
+            "restored"
+        );
     }
 
     // DRIFT 1 + Multi-monitor Bug A regression: the Bounding-shape mirror
@@ -69335,6 +80182,98 @@ mod tests {
             ),
             "explicitly-set Bounding shape must mirror the concrete rect",
         );
+    }
+
+    /// Cinnamon's lock screen, as muffin sends it: an XFIXES region that
+    /// `InvertRegion` empties, set as the COW's Bounding shape, must reach the
+    /// backend as an explicit EMPTY region, and region None as unset — the
+    /// two stay distinct (`ProcXFixesSetWindowShapeRegion`, `xfixes/region.c`:
+    /// a NULL region pointer unshapes, a copied empty region shapes to
+    /// nothing).
+    #[test]
+    fn xfixes_set_window_shape_region_keeps_empty_distinct_from_none() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes as x11xfixes};
+
+        const REGION: u32 = 0x0010_0042;
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(cow.0));
+
+        let mut send = |state: &mut ServerState, minor: u8, body: Vec<u8>| {
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            handle_xfixes_request(
+                state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                header,
+                &body,
+            )
+            .expect("XFIXES request");
+        };
+        let full = [0_i16, 0, 5120, 1440]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let shape_body = |region: u32| {
+            let mut body = cow.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[x11shape::KIND_BOUNDING, 0, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(&region.to_le_bytes());
+            body
+        };
+
+        let mut create = REGION.to_le_bytes().to_vec();
+        create.extend_from_slice(&full);
+        send(&mut state, x11xfixes::CREATE_REGION, create);
+        let mut invert = REGION.to_le_bytes().to_vec();
+        invert.extend_from_slice(&full);
+        invert.extend_from_slice(&REGION.to_le_bytes());
+        send(&mut state, x11xfixes::INVERT_REGION, invert);
+        send(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            shape_body(REGION),
+        );
+        assert!(crate::nested::shape_kind_is_set(
+            &state,
+            cow,
+            x11shape::KIND_BOUNDING
+        ));
+        assert!(crate::nested::shape_rects_for(&state, cow, x11shape::KIND_BOUNDING).is_empty());
+
+        send(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            shape_body(0),
+        );
+        assert!(!crate::nested::shape_kind_is_set(
+            &state,
+            cow,
+            x11shape::KIND_BOUNDING
+        ));
+
+        let mirrored: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid,
+                    kind: x11shape::KIND_BOUNDING,
+                    rects,
+                } if host_xid == cow.0 => Some(rects),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mirrored, vec![Some(0), None]);
     }
 
     // #133: the CLIP mirror must make the same unset/empty/concrete
@@ -69529,6 +80468,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -69835,6 +80775,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -70027,6 +80968,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -70220,6 +81162,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             };
             let _ = pointer_event_fanout_to_state(
                 &mut state,
@@ -70442,6 +81385,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -70577,6 +81521,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -70835,6 +81780,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -70919,6 +81865,11 @@ mod tests {
 
         let mut reply = vec![0u8; 32];
         reply[0] = 1; // X_Reply
+        assert!(crate::core_loop::xkb_select::use_extension(
+            &mut state,
+            ClientId(1),
+            &[1, 0, 0, 0]
+        ));
         let mut backend = RecordingBackend::new().with_kbd_by_name_result(
             reply,
             Some(crate::backend::XkbNewKeyboardInfo {
@@ -70968,6 +81919,798 @@ mod tests {
         assert!(
             keyboard_mapping_notify.is_some(),
             "expected a MappingNotify with request=Keyboard(1): {bytes:02x?}"
+        );
+    }
+
+    fn xkb_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        handle_xkb_request(
+            state,
+            backend,
+            None,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 136,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+        )
+        .expect("XKB request");
+    }
+
+    /// Xvfb 21.1.24, XkbUseExtension(1, 0) at sequence 2 from a
+    /// little-endian client: `01010200 00000000 01000000 00…`
+    /// (supported, server 1.0).
+    #[test]
+    fn xkb_use_extension_replies_like_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 136,
+                data: 0,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+        )
+        .expect("XkbUseExtension");
+        let reply = read_all_available(&mut peer);
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 1, 2, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(reply, expected);
+        assert!(crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+    }
+
+    /// yserver's XKB request parsers and reply encoders are little-endian
+    /// only, so a big-endian client is refused the way Xorg refuses a
+    /// client it can't serve: XkbUseExtension answers supported=False
+    /// (the bytes are Xvfb's big-endian answer to an unsupported version,
+    /// `01000002 00000000 00010000 00…`), and every other XKB request is
+    /// then BadAccess, as Xorg answers an uninitialised client (Xvfb:
+    /// GetState → BadAccess, value 0, minor 4). All of it in the client's
+    /// byte order.
+    #[test]
+    fn xkb_refuses_big_endian_clients_cleanly() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.clients.get_mut(&1).unwrap().byte_order = ClientByteOrder::BigEndian;
+        // XKB request bodies are not swapped: wantedMajor=1, wantedMinor=0
+        // as a big-endian client sends them.
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 136,
+                data: 0,
+                length_units: 2,
+            },
+            &[0, 1, 0, 0],
+        )
+        .expect("XkbUseExtension");
+        let reply = read_all_available(&mut peer);
+        let mut expected = [0u8; 32];
+        expected[..10].copy_from_slice(&[1, 0, 0, 2, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(reply, expected);
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 136,
+                data: 4,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+        )
+        .expect("XkbGetState");
+        let err = read_all_available(&mut peer);
+        assert_eq!(err.len(), 32);
+        assert_eq!((err[0], err[1]), (0, x11::error::BAD_ACCESS));
+        assert_eq!(&err[2..4], &[0, 3], "big-endian sequence");
+        assert_eq!(&err[8..10], &[0, 4], "big-endian minor opcode");
+    }
+
+    /// Golden (`xorg-xkb-setmap-errors.txt`, Xvfb 21.1.24: `access`,
+    /// `access-getmap`, `access-selectevents`): an XKB request from a client
+    /// that never called XkbUseExtension answers BadAccess (value 0, minor =
+    /// the request's), and changes nothing; after UseExtension the same
+    /// requests go through.
+    #[test]
+    fn xkb_requests_need_use_extension() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let select_all = [0x00, 0x01, 0xff, 0x0f, 0, 0, 0xff, 0x0f, 0xff, 0, 0xff, 0];
+        for (minor, body) in [
+            (8u8, vec![0u8; 24]),
+            (1, select_all.to_vec()),
+            (9, vec![0; 32]),
+        ] {
+            xkb_request(&mut state, &mut backend, 1, minor, &body);
+            let err = read_all_available(&mut peer);
+            assert_eq!(err.len(), 32, "minor {minor}: one error");
+            assert_eq!(
+                (err[0], err[1], &err[4..8], err[8], err[10]),
+                (0, x11::error::BAD_ACCESS, &[0u8, 0, 0, 0][..], minor, 136),
+                "minor {minor}"
+            );
+        }
+        assert!(
+            state
+                .xkb_clients
+                .get(&1)
+                .is_none_or(|c| c.map_notify_mask == 0)
+        );
+        xkb_request(&mut state, &mut backend, 1, 0, &[1, 0, 0, 0]);
+        assert!(crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+        let _ = read_all_available(&mut peer);
+        xkb_request(&mut state, &mut backend, 1, 1, &select_all);
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "SelectEvents: no error"
+        );
+        assert_eq!(state.xkb_clients[&1].map_notify_mask, 0xff);
+    }
+
+    /// `ProcXkbUseExtension`: an unsupported version (2.0) leaves the client
+    /// uninitialised.
+    #[test]
+    fn xkb_use_extension_unsupported_version_stays_uninitialised() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        xkb_request(&mut state, &mut backend, 1, 0, &[2, 0, 0, 0]);
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+    }
+
+    /// `XkbSendLegacyMapNotify` (xkb/xkbEvents.c): a MapNotify's core
+    /// MappingNotify goes to non-XKB clients and to XKB clients whose map
+    /// details include a change; a NewKeyboardNotify's only to non-XKB
+    /// clients.
+    #[test]
+    fn legacy_map_notify_filters_xkb_clients() {
+        use crate::core_loop::xkb_select::{
+            LegacyCause, send_legacy_core_map_notify, xkb_select_events,
+        };
+        let mut state = ServerState::new();
+        let mut plain = install_client(&mut state, 1);
+        let mut xkb_keysyms = install_client(&mut state, 2);
+        let mut xkb_none = install_client(&mut state, 3);
+        xkb_select_events(&mut state, 2, 0x100, 0x0002);
+        xkb_select_events(&mut state, 3, 0x100, 0x0004);
+        let _ = send_legacy_core_map_notify(&mut state, LegacyCause::MapNotify, 0x0002, 8, 248);
+        let count = |b: Vec<u8>| b.chunks(32).filter(|e| e[0] == 34).count();
+        assert_eq!(count(read_all_available(&mut plain)), 1);
+        assert_eq!(count(read_all_available(&mut xkb_keysyms)), 1);
+        assert_eq!(count(read_all_available(&mut xkb_none)), 0);
+        let _ =
+            send_legacy_core_map_notify(&mut state, LegacyCause::NewKeyboardNotify, 0x0001, 8, 248);
+        assert_eq!(
+            count(read_all_available(&mut plain)),
+            2,
+            "Keyboard + Modifier"
+        );
+        assert_eq!(count(read_all_available(&mut xkb_keysyms)), 0);
+        assert_eq!(count(read_all_available(&mut xkb_none)), 0);
+    }
+
+    // ── Step 3 (window-storage lifecycle): Pictures on windows ──────────
+
+    const PIC_A: u32 = 0x0030_0000;
+    const PIC_B: u32 = 0x0040_0000;
+    const PIC_WIN: u32 = PIC_A | 1;
+    const PIC_WIN_HOST: u32 = 0x00E0_0001;
+    const PIC_ON_WIN: u32 = PIC_B | 1;
+    const PIC_PIXMAP: u32 = PIC_B | 2;
+    const PIC_ON_PIXMAP: u32 = PIC_B | 3;
+
+    fn picture_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// `(error code, bad value)` of every error queued on `peer`.
+    fn drain_errors(peer: &mut UnixStream) -> Vec<(u8, u32)> {
+        peer.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 32];
+        while peer.read_exact(&mut buf).is_ok() {
+            if buf[0] == 0 {
+                out.push((buf[1], u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])));
+            }
+        }
+        out
+    }
+
+    fn create_render_picture(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        pic: u32,
+        drawable: u32,
+    ) {
+        let mut body = Vec::new();
+        for v in [pic, drawable, 0, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        picture_request(state, backend, client, 133, 4, &body);
+    }
+
+    fn render_fill(state: &mut ServerState, backend: &mut RecordingBackend, client: u32, dst: u32) {
+        let mut body = vec![1u8, 0, 0, 0];
+        body.extend_from_slice(&dst.to_le_bytes());
+        body.extend_from_slice(&[0xff; 8]);
+        for v in [0i16, 0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [8u16, 8] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        picture_request(state, backend, client, 133, 26, &body);
+    }
+
+    fn render_composite_pics(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        src: u32,
+        dst: u32,
+    ) {
+        let mut body = vec![0u8; 32];
+        body[0] = 3;
+        body[4..8].copy_from_slice(&src.to_le_bytes());
+        body[12..16].copy_from_slice(&dst.to_le_bytes());
+        body[28..30].copy_from_slice(&8u16.to_le_bytes());
+        body[30..32].copy_from_slice(&8u16.to_le_bytes());
+        picture_request(state, backend, client, 133, 8, &body);
+    }
+
+    fn render_free(state: &mut ServerState, backend: &mut RecordingBackend, client: u32, pic: u32) {
+        picture_request(state, backend, client, 133, 7, &pic.to_le_bytes());
+    }
+
+    fn host_pic_of(state: &ServerState, pic: u32) -> u32 {
+        state
+            .resources
+            .picture(ResourceId(pic))
+            .expect("picture exists")
+            .host_picture_xid
+            .expect("backed picture")
+            .as_raw()
+    }
+
+    fn render_paints(backend: &RecordingBackend) -> Vec<RecordedCall> {
+        backend
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RecordedCall::RenderComposite { .. }
+                        | RecordedCall::RenderFillRectangles { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Client A owns a mapped top-level `PIC_WIN`; client B holds a Picture on it and
+    /// one on its own pixmap.
+    fn cross_client_picture_fixture() -> (ServerState, RecordingBackend, UnixStream, UnixStream) {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, 1);
+        let peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        state.resources.create_pixmap(
+            ClientId(2),
+            CreatePixmapRequest {
+                pixmap: ResourceId(PIC_PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(PIC_PIXMAP),
+            crate::backend::PixmapHandle::from_raw_for_test(0x00E0_0100),
+        ));
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_WIN);
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_PIXMAP, PIC_PIXMAP);
+        (state, backend, peer_a, peer_b)
+    }
+
+    fn create_pic_test_window(state: &mut ServerState, xid: u32, host: u32) {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                width: 64,
+                height: 64,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(xid))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host));
+        let _ = state.resources.map_window(ResourceId(xid));
+    }
+
+    /// B's Picture on A's window is dead once the window is gone: every use and
+    /// its FreePicture are BadPicture, its pixmap Picture is untouched, and a new
+    /// window on the same xid and host storage does not revive it.
+    fn assert_window_picture_dead_after(
+        destroy: impl FnOnce(&mut ServerState, &mut RecordingBackend),
+    ) {
+        let bad_picture = crate::nested::RENDER_FIRST_ERROR + 1;
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        let host_on_win = host_pic_of(&state, PIC_ON_WIN);
+        let host_on_pixmap = host_pic_of(&state, PIC_ON_PIXMAP);
+
+        destroy(&mut state, &mut backend);
+
+        assert!(state.resources.picture(ResourceId(PIC_ON_WIN)).is_none());
+        let freed: Vec<u32> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RenderFreePicture { host_pic } => Some(host_pic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            freed,
+            vec![host_on_win],
+            "only the window Picture's backend record is freed"
+        );
+        assert_eq!(host_pic_of(&state, PIC_ON_PIXMAP), host_on_pixmap);
+        backend.calls.lock().unwrap().clear();
+
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_ON_PIXMAP);
+        render_free(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(bad_picture, PIC_ON_WIN); 3],
+            "FillRectangles, Composite and FreePicture on the dead Picture",
+        );
+        assert!(render_paints(&backend).is_empty());
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::RenderFreePicture { .. }))
+        );
+
+        render_fill(&mut state, &mut backend, 2, PIC_ON_PIXMAP);
+        assert_eq!(
+            render_paints(&backend),
+            vec![RecordedCall::RenderFillRectangles {
+                host_dst: host_on_pixmap
+            }],
+        );
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    #[test]
+    fn destroy_window_frees_other_clients_pictures_on_it() {
+        assert_window_picture_dead_after(|state, backend| {
+            picture_request(state, backend, 1, 4, 0, &PIC_WIN.to_le_bytes());
+        });
+    }
+
+    #[test]
+    fn owner_disconnect_frees_other_clients_pictures_on_its_windows() {
+        assert_window_picture_dead_after(|state, backend| {
+            crate::core_loop::process_disconnect::process_disconnect(state, backend, ClientId(1));
+            let _peer = install_client(state, 1);
+        });
+    }
+
+    #[test]
+    fn destroying_a_parent_frees_pictures_on_its_descendants() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const CHILD: u32 = PIC_A | 2;
+        const PIC_ON_CHILD: u32 = PIC_B | 4;
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD),
+                parent: ResourceId(PIC_WIN),
+                width: 8,
+                height: 8,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(CHILD))
+            .unwrap()
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0x00E0_0002));
+        create_render_picture(&mut state, &mut backend, 2, PIC_ON_CHILD, CHILD);
+        assert!(state.resources.picture(ResourceId(PIC_ON_CHILD)).is_some());
+
+        picture_request(&mut state, &mut backend, 1, 4, 0, &PIC_WIN.to_le_bytes());
+
+        assert!(state.resources.picture(ResourceId(PIC_ON_CHILD)).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_ON_WIN)).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_ON_PIXMAP)).is_some());
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// Xorg: an unviewable window's clipList is empty, so a Picture on it as the
+    /// destination draws nothing; the same Picture draws again after remap.
+    #[test]
+    fn window_picture_draws_nothing_while_unmapped_and_again_after_remap() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        let host_on_win = host_pic_of(&state, PIC_ON_WIN);
+        let host_on_pixmap = host_pic_of(&state, PIC_ON_PIXMAP);
+        let fill = RecordedCall::RenderFillRectangles {
+            host_dst: host_on_win,
+        };
+
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(render_paints(&backend), vec![fill.clone()]);
+        backend.calls.lock().unwrap().clear();
+
+        picture_request(&mut state, &mut backend, 1, 10, 0, &PIC_WIN.to_le_bytes());
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_PIXMAP, PIC_ON_WIN);
+        assert!(
+            render_paints(&backend).is_empty(),
+            "unmapped: nothing drawn"
+        );
+        // As a source the hidden window's contents are undefined, not an error.
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_WIN, PIC_ON_PIXMAP);
+        assert_eq!(
+            render_paints(&backend),
+            vec![RecordedCall::RenderComposite {
+                host_src: host_on_win,
+                host_dst: host_on_pixmap,
+            }],
+        );
+        backend.calls.lock().unwrap().clear();
+
+        picture_request(&mut state, &mut backend, 1, 8, 0, &PIC_WIN.to_le_bytes());
+        render_fill(&mut state, &mut backend, 2, PIC_ON_WIN);
+        assert_eq!(render_paints(&backend), vec![fill]);
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// A Picture on a redirected window names the window, not the backing it
+    /// has at creation time, so it follows backing rotations.
+    #[test]
+    fn create_picture_on_redirected_window_names_the_window() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        create_pic_test_window(&mut state, PIC_WIN, PIC_WIN_HOST);
+        state
+            .resources
+            .window_mut(ResourceId(PIC_WIN))
+            .unwrap()
+            .redirected_backing = Some(crate::resources::RedirectedBacking {
+            host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0x00E0_0200),
+            width: 64,
+            height: 64,
+            depth: 24,
+        });
+        create_render_picture(&mut state, &mut backend, 1, PIC_A | 5, PIC_WIN);
+        let host_drawables: Vec<crate::backend::AnyHandle> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::RenderCreatePicture { host_drawable, .. } => Some(host_drawable),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            host_drawables,
+            vec![crate::backend::AnyHandle::Window(
+                crate::backend::WindowHandle::from_raw_for_test(PIC_WIN_HOST)
+            )],
+        );
+        assert_eq!(
+            state
+                .resources
+                .picture(ResourceId(PIC_A | 5))
+                .unwrap()
+                .window,
+            Some(ResourceId(PIC_WIN)),
+        );
+    }
+
+    /// Xorg `compDestroyOverlayWindow` frees the overlay through DeleteWindow, so
+    /// Pictures on it are freed with it (`composite/compoverlay.c:167-172`).
+    #[test]
+    fn overlay_release_frees_pictures_on_the_overlay() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut body = vec![0u8; 4];
+        body[0..4].copy_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        drain_errors(&mut peer);
+        create_render_picture(&mut state, &mut backend, 1, PIC_A | 6, cow.0);
+        assert!(state.resources.picture(ResourceId(PIC_A | 6)).is_some());
+        body[0..4].copy_from_slice(&cow.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            2,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &body,
+        );
+        assert!(state.resources.window(cow).is_none());
+        assert!(state.resources.picture(ResourceId(PIC_A | 6)).is_none());
+    }
+
+    /// CreateConicalGradient registers a Picture: usable as a source without an
+    /// error (drawing with it stays unimplemented) and freeable.
+    #[test]
+    fn conical_gradient_picture_is_usable_as_source_and_freeable() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const CONICAL: u32 = PIC_B | 9;
+        let mut body = Vec::new();
+        body.extend_from_slice(&CONICAL.to_le_bytes());
+        body.extend_from_slice(&[0u8; 16]); // center, angle, nstops = 0
+        picture_request(&mut state, &mut backend, 2, 133, 36, &body);
+        assert!(state.resources.picture(ResourceId(CONICAL)).is_some());
+        backend.calls.lock().unwrap().clear();
+        render_composite_pics(&mut state, &mut backend, 2, CONICAL, PIC_ON_PIXMAP);
+        assert!(
+            render_paints(&backend).is_empty(),
+            "unbacked source draws nothing"
+        );
+        render_free(&mut state, &mut backend, 2, CONICAL);
+        assert!(state.resources.picture(ResourceId(CONICAL)).is_none());
+        assert!(drain_errors(&mut peer_b).is_empty());
+    }
+
+    /// A CreatePicture the backend could not back still succeeds at protocol level:
+    /// ops on the Picture are silent no-ops and FreePicture is valid. An id that was
+    /// never created is still BadPicture.
+    #[test]
+    fn unbacked_picture_ops_are_silent_no_ops() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const UNBACKED: u32 = PIC_B | 10;
+        backend.render_create_picture_fails = true;
+        create_render_picture(&mut state, &mut backend, 2, UNBACKED, PIC_PIXMAP);
+        backend.render_create_picture_fails = false;
+        let st = state
+            .resources
+            .picture(ResourceId(UNBACKED))
+            .expect("registered");
+        assert!(st.host_picture_xid.is_none());
+        backend.calls.lock().unwrap().clear();
+
+        render_fill(&mut state, &mut backend, 2, UNBACKED);
+        render_composite_pics(&mut state, &mut backend, 2, UNBACKED, PIC_ON_PIXMAP);
+        render_composite_pics(&mut state, &mut backend, 2, PIC_ON_PIXMAP, UNBACKED);
+        render_free(&mut state, &mut backend, 2, UNBACKED);
+        assert!(drain_errors(&mut peer_b).is_empty());
+        assert!(state.resources.picture(ResourceId(UNBACKED)).is_none());
+        assert!(backend.calls().iter().all(|c| !matches!(
+            c,
+            RecordedCall::RenderComposite { .. }
+                | RecordedCall::RenderFillRectangles { .. }
+                | RecordedCall::RenderFreePicture { .. }
+        )));
+
+        const NEVER: u32 = PIC_B | 11;
+        render_fill(&mut state, &mut backend, 2, NEVER);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(crate::nested::RENDER_FIRST_ERROR + 1, NEVER)],
+        );
+    }
+
+    /// Xorg dixLookupDrawable: CreatePicture on an unknown drawable is BadDrawable
+    /// and registers nothing.
+    #[test]
+    fn create_picture_on_unknown_drawable_is_bad_drawable() {
+        let (mut state, mut backend, _peer_a, mut peer_b) = cross_client_picture_fixture();
+        const PIC: u32 = PIC_B | 12;
+        create_render_picture(&mut state, &mut backend, 2, PIC, 0x00DE_AD00);
+        assert_eq!(
+            drain_errors(&mut peer_b),
+            vec![(x11::error::BAD_DRAWABLE, 0x00DE_AD00)],
+        );
+        assert!(state.resources.picture(ResourceId(PIC)).is_none());
+    }
+
+    /// A GTK bin window taller than its viewport, inside an xfwm4 frame
+    /// under the compositor: frame F (756x534, Manual-redirected through
+    /// root), client C at (5,29) 746x500, bin window V at (8,8) 730x531.
+    /// Xorg clips a child's clip list to its parent's
+    /// (`mi/mivaltree.c:390`), so V can hold only its rows above C's
+    /// bottom edge, 500 - 8 = 492 of them; a redirected window stops the
+    /// walk, being clipped to itself only.
+    #[test]
+    fn content_within_ancestors_stops_at_the_parents_edge() {
+        use crate::server::{CompositeRedirectMode, RedirectRecord};
+        let mut state = make_test_state();
+        state
+            .composite_redirects
+            .redirect_subwindows(
+                ROOT_WINDOW,
+                &[],
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(1),
+                },
+            )
+            .unwrap();
+        let (f, c, v) = (
+            ResourceId(0x0040_0001),
+            ResourceId(0x0040_0002),
+            ResourceId(0x0040_0003),
+        );
+        seed_window(&mut state, f, ROOT_WINDOW, 756, 534);
+        seed_window(&mut state, c, f, 746, 500);
+        seed_window(&mut state, v, c, 730, 531);
+        for (w, x, y) in [(f, 900, 400), (c, 5, 29), (v, 8, 8)] {
+            let w = state.resources.window_mut(w).unwrap();
+            (w.x, w.y) = (x, y);
+        }
+        let rect = |width, height| x11::xfixes::RegionRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
+        assert_eq!(content_within_ancestors(&state, c), rect(746, 500));
+        // F's own redirect ends the walk before the root's edge.
+        state.resources.window_mut(f).unwrap().x = 32000;
+        assert_eq!(content_within_ancestors(&state, f), rect(756, 534));
+        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
+    }
+
+    /// GDK clips a native child of a client-side window with its bounding
+    /// shape and shifts the shape when it scrolls. Xorg's `miSetShape`
+    /// (`mi/miwindow.c:637-677`) then exposes what the window no longer
+    /// covers to its parent and what it newly covers to itself — the
+    /// parent's button bar is repainted only on that Expose. Measured on
+    /// Xorg 21.1 by tools/vng-scenarios/child-clip-probe.c: the shape
+    /// (0,0 170x60) of V at (10,10) becoming (0,30 170x60) exposes
+    /// P 10,10 170x30 and V 0,60 170x30.
+    #[test]
+    fn bounding_shape_change_exposes_what_it_uncovers_and_covers() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes::RegionRect};
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let (p, v) = (ResourceId(0x1c0_0001), ResourceId(0x1c0_0002));
+        seed_window(&mut state, p, ROOT_WINDOW, 190, 100);
+        seed_window(&mut state, v, p, 170, 120);
+        for w in [p, v] {
+            state.resources.window_mut(w).unwrap().map_state = crate::resources::MapState::Viewable;
+        }
+        let vw = state.resources.window_mut(v).unwrap();
+        (vw.x, vw.y) = (10, 10);
+        crate::nested::set_shape_rects(
+            &mut state,
+            v,
+            x11shape::KIND_BOUNDING,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 170,
+                height: 60,
+            }],
+        );
+        let client = state.clients.get_mut(&1).unwrap();
+        client.event_masks.insert(p, 0x0000_8000);
+        client.event_masks.insert(v, 0x0000_8000);
+
+        // RECTANGLES body: op kind ordering pad dest(4) x_off(2) y_off(2) rects.
+        let mut body = vec![x11shape::OP_SET, x11shape::KIND_BOUNDING, 0, 0];
+        body.extend_from_slice(&v.0.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        for field in [0u16, 30, 170, 60] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 129,
+            data: x11shape::RECTANGLES,
+            length_units: 6,
+        };
+        handle_shape_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("ShapeRectangles");
+
+        let exposes: Vec<(u32, [u16; 4])> = read_all_available(&mut peer)
+            .chunks_exact(32)
+            .filter(|e| e[0] & 0x7f == 12)
+            .map(|e| {
+                let at = |i: usize| u16::from_le_bytes([e[i], e[i + 1]]);
+                (
+                    u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+                    [at(8), at(10), at(12), at(14)],
+                )
+            })
+            .collect();
+        assert_eq!(
+            exposes,
+            vec![(p.0, [10, 10, 170, 30]), (v.0, [0, 60, 170, 30])]
         );
     }
 }

@@ -4,6 +4,8 @@
 //!   cargo test --test glx_tfp_export -- --ignored
 
 #![cfg(target_os = "linux")]
+// Test-side client buffers, outside the server's memory ledger.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

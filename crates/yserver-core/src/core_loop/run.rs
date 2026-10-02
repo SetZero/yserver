@@ -111,6 +111,9 @@ pub(crate) struct LoopTelemetry {
     clients: HashMap<yserver_protocol::x11::ClientId, ClientLoopTelemetry>,
     channel_request_batch_max: usize,
     channel_client_batch_max: (u32, usize),
+    /// Last `report_export_holders` run, and whether it saw a change.
+    export_holders_last: Option<Instant>,
+    export_holders_changed: bool,
 }
 
 impl LoopTelemetry {
@@ -230,6 +233,26 @@ impl LoopTelemetry {
         if iter_wall > self.max_iter_wall {
             self.max_iter_wall = iter_wall;
         }
+    }
+
+    /// Whether the export-holders report is due: enabled and 1 s since the last run.
+    fn export_holders_due(&self, now: Instant) -> bool {
+        self.enabled
+            && self
+                .export_holders_last
+                .is_none_or(|last| now.saturating_duration_since(last) >= TELEMETRY_EMIT_INTERVAL)
+    }
+
+    fn note_export_holders(&mut self, now: Instant, changed: bool) {
+        self.export_holders_last = Some(now);
+        self.export_holders_changed = changed;
+    }
+
+    /// Re-check a second after a change so a set that settles while idle still gets logged.
+    fn export_holders_deadline(&self) -> Option<Instant> {
+        let last = self.export_holders_last?;
+        self.export_holders_changed
+            .then(|| last + TELEMETRY_EMIT_INTERVAL)
     }
 
     fn maybe_emit(&mut self, now: Instant) {
@@ -613,6 +636,9 @@ impl PendingBackendRequests {
                     set_time: 0,
                     output_bbox_before: None,
                     byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                    apply_transform: None,
+                    apply_rotation: None,
+                    reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
                 },
             },
             request_wire_bytes: 0,
@@ -696,14 +722,20 @@ impl FairRequestQueue {
         self.pop_front_if(|_| true)
     }
 
-    fn has_runnable(&self, pending: &PendingBackendRequests) -> bool {
+    /// Whether some queued client may run: not waiting on backend work and
+    /// not suspended by a SYNC await.
+    fn has_runnable(&self, pending: &PendingBackendRequests, state: &ServerState) -> bool {
         self.ready
             .iter()
-            .any(|client| !pending.client_is_blocked(*client))
+            .any(|client| client_runnable(pending, state, *client))
     }
 
-    fn pop_front_unblocked(&mut self, pending: &PendingBackendRequests) -> Option<DeferredRequest> {
-        self.pop_front_if(|client| !pending.client_is_blocked(client))
+    fn pop_front_unblocked(
+        &mut self,
+        pending: &PendingBackendRequests,
+        state: &ServerState,
+    ) -> Option<DeferredRequest> {
+        self.pop_front_if(|client| client_runnable(pending, state, client))
     }
 
     fn pop_front_if(
@@ -760,6 +792,21 @@ pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
         body: Vec::new(),
         attached_fd: None,
     }
+}
+
+/// A client's queued requests may be dispatched unless it waits on
+/// asynchronous backend work, a SYNC `Await` / `AwaitFence` suspended it, or
+/// it is the data connection of an enabled RECORD context (Xorg
+/// `IgnoreClient`). Either way its requests keep their order and
+/// every other client keeps running.
+fn client_runnable(
+    pending: &PendingBackendRequests,
+    state: &ServerState,
+    client: yserver_protocol::x11::ClientId,
+) -> bool {
+    !pending.client_is_blocked(client)
+        && !crate::core_loop::sync_await::client_is_suspended(state, client)
+        && !crate::core_loop::record::client_blocks_requests(state, client)
 }
 
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
@@ -953,7 +1000,7 @@ fn drain_pending_requests(
     drain_start: Instant,
 ) {
     while !budget_exhausted(*request_budget, drain_start.elapsed()) {
-        let Some(req) = deferred_requests.pop_front_unblocked(pending) else {
+        let Some(req) = deferred_requests.pop_front_unblocked(pending, state) else {
             break;
         };
         telemetry.record_deferred_pop(req.id);
@@ -1046,6 +1093,10 @@ fn process_request_inline(
         }
         backend.mark_dirty();
     }
+    // A request that changed the displayed cursor (DefineCursor, a grab,
+    // XFIXES ChangeCursor, a map under the pointer) reports it before the
+    // client's next request runs, as Xorg does from DisplayCursor.
+    crate::core_loop::process_request::emit_xfixes_cursor_notify(state, backend);
     outcome
 }
 
@@ -1223,6 +1274,9 @@ pub fn run_core(
     // Xorg seeds `_XKB_RULES_NAMES` on the root at init; setxkbmap reads
     // it to learn the current rules before applying a new layout.
     crate::core_loop::xkb_layout::publish_xkb_rules_names(state, backend);
+    // Xorg's XkbFinishInit: the keyboard's per-key auto-repeat comes from
+    // the keymap.
+    crate::core_loop::xkb_layout::seed_keyboard_auto_repeats(state, backend);
 
     let mut events = Events::with_capacity(64);
     let mut telemetry = LoopTelemetry::new();
@@ -1261,7 +1315,7 @@ pub fn run_core(
         // to do right now. Without this, an idle moment where the
         // channel is briefly empty would let `poll.poll` block until
         // a fresh fd event, leaving the backlog stranded.
-        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests)
+        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests, state)
             || listener_readiness.has_pending()
         {
             Some(Duration::ZERO)
@@ -1277,18 +1331,23 @@ pub fn run_core(
             let ss_idle_deadline = state.screensaver_idle_deadline();
             let ss_cycle_deadline = state.screensaver_cycle_deadline();
             let idletime_alarm_deadline = state.idletime_alarm_deadline();
+            let sync_counter_deadline =
+                crate::core_loop::sync_await::system_counter_deadline(state);
             // The XDMCP retransmission/dormancy deadline joins the existing
             // computation rather than bringing a thread of its own — the
             // state machine belongs on this loop, where it can see the
             // generation boundary directly.
             let xdmcp_deadline = xdmcp.as_ref().and_then(XdmcpService::next_deadline);
+            let holders_deadline = telemetry.export_holders_deadline();
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
+                .chain(holders_deadline)
                 .chain(dpms_deadline)
                 .chain(ss_idle_deadline)
                 .chain(ss_cycle_deadline)
                 .chain(idletime_alarm_deadline)
+                .chain(sync_counter_deadline)
                 .chain(xdmcp_deadline)
                 .min()
                 .map(|deadline| {
@@ -1512,6 +1571,7 @@ pub fn run_core(
                                 byte_order,
                                 is_local,
                                 fd_passing,
+                                setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
                                     poll.registry(),
@@ -1526,6 +1586,7 @@ pub fn run_core(
                                     byte_order,
                                     is_local,
                                     fd_passing,
+                                    &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
                                     disconnect_with_pending_cleanup(
@@ -1755,6 +1816,7 @@ pub fn run_core(
         // SS: evaluate idle activation and Cycle re-fire.
         evaluate_screen_saver_post_poll(state, backend);
         evaluate_idletime_alarms_post_poll(state, backend);
+        crate::core_loop::sync_await::evaluate_servertime(state);
 
         // F2: if a `wait_for_reply` (called by `process_request`
         // mid-handler) saw the host close, propagate it as a clean
@@ -1773,6 +1835,17 @@ pub fn run_core(
         // reregister errors that mean "fd already deregistered" so a
         // disconnect that ran during this iteration doesn't break
         // the next one.
+        // RECORD data connections whose stream write failed (queued, since
+        // the write can happen inside another client's disconnect).
+        for disc_id in crate::core_loop::record::take_failed_recorders(state) {
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                &mut pending_backend_requests,
+                &mut reset_trigger,
+                disc_id,
+            );
+        }
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
             disconnect_with_pending_cleanup(
                 state,
@@ -1792,6 +1865,13 @@ pub fn run_core(
             let wall = now.saturating_duration_since(start);
             telemetry.record_iteration(requests_this_iter, wall);
             telemetry.maybe_emit(now);
+            if telemetry.export_holders_due(now) {
+                let core_state: &ServerState = state;
+                let changed = backend.report_export_holders(&|| {
+                    crate::backend::export_holders::collect_core_holders(core_state)
+                });
+                telemetry.note_export_holders(now, changed);
+            }
         }
 
         // The generation boundary. Reached only from an action the
@@ -1907,6 +1987,9 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
     backend.poll_deferred_input(state);
+
+    // Pointer motion and other input-driven sprite changes.
+    crate::core_loop::process_request::emit_xfixes_cursor_notify(state, backend);
 
     // Drain-before-compose (spec "Loop-order and clock contract" item 1):
     // an entry executed here must be visible to THIS iteration's
@@ -2336,6 +2419,18 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
             }
             HostEvent::Key(ev) => {
                 use crate::core_loop::key_fanout::key_event_fanout_to_state;
+                crate::core_loop::record::record_device_event(
+                    state,
+                    crate::core_loop::record::RecordedDeviceEvent {
+                        event_type: if ev.pressed { 2 } else { 3 },
+                        detail: ev.keycode,
+                        repeat: false,
+                        time: ev.time,
+                        root_x: ev.root_x,
+                        root_y: ev.root_y,
+                        state: ev.state,
+                    },
+                );
                 let _dropped = key_event_fanout_to_state(state, backend, ev);
             }
             HostEvent::Configure(ev) => {
@@ -2400,12 +2495,9 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
-    let width = state.randr.screen_width;
-    let height = state.randr.screen_height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Resolve each changed output's current crtc/mode for the notify payload.
-    let changed: Vec<(u32, u32, u32, u8)> = changed_outputs
+    let changed: Vec<(u32, u32, u32, u8, u16)> = changed_outputs
         .iter()
         .filter_map(|id| {
             state
@@ -2422,6 +2514,11 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                             x11randr::CONNECTION_CONNECTED
                         } else {
                             x11randr::CONNECTION_DISCONNECTED
+                        },
+                        if o.mode_id != 0 {
+                            o.rotation
+                        } else {
+                            crate::randr::RR_ROTATE_0
                         },
                     )
                 })
@@ -2444,6 +2541,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
+                    rotation: screen_rotation,
                     timestamp,
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
@@ -2462,7 +2560,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
             let _ = client_io::write_or_buffer(client, &event);
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            for &(output, crtc, mode, connection) in &changed {
+            for &(output, crtc, mode, connection, rotation) in &changed {
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2474,6 +2572,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                         output,
                         crtc,
                         mode,
+                        rotation,
                         connection,
                     },
                 );
@@ -2547,7 +2646,11 @@ pub(crate) fn notify_randr_output_property_changed(
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
-    let timestamp = state.randr.timestamp;
+    // Xorg stamps property notifies with the current time and leaves
+    // lastSetTime alone (`rrproperty.c:75`): mutter/muffin compare
+    // lastSetTime with their own SetCrtcConfig reply to tell their
+    // configuration from an external one.
+    let timestamp = state.timestamp_now();
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()
@@ -2762,8 +2865,9 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut max_y = 0i32;
     for output in state.randr.outputs.iter().filter(|o| o.mode_id != 0) {
         any = true;
-        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
-        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
+        let (width, height) = output.footprint();
+        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(width)));
+        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(height)));
     }
     any.then(|| {
         (
@@ -2803,21 +2907,18 @@ fn emit_randr_change_notifications_split(
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
-    let width = state.randr.screen_width;
-    let height = state.randr.screen_height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Per-CRTC geometry (position AND mode size). CrtcChangeNotify must
     // report each CRTC's own mode dimensions — NOT the logical screen
     // size — or a multi-monitor client sees every CRTC as e.g. 5120×1440
     // instead of its real 2560×1440. An off CRTC (no mode) reports 0×0.
-    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16)> = state
+    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16, u16)> = state
         .randr
         .outputs
         .iter()
-        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height)))
+        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height, o.rotation)))
         .collect();
-    let output_states: std::collections::HashMap<u32, (u8, u32)> = state
+    let output_states: std::collections::HashMap<u32, (u8, u32, u16)> = state
         .randr
         .outputs
         .iter()
@@ -2834,6 +2935,11 @@ fn emit_randr_change_notifications_split(
                         output.crtc_id
                     } else {
                         0
+                    },
+                    if output.mode_id != 0 {
+                        output.rotation
+                    } else {
+                        crate::randr::RR_ROTATE_0
                     },
                 ),
             )
@@ -2856,6 +2962,7 @@ fn emit_randr_change_notifications_split(
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
+                    rotation: screen_rotation,
                     timestamp,
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
@@ -2877,7 +2984,13 @@ fn emit_randr_change_notifications_split(
         // subscriber; do not interleave the two event classes per output.
         if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
             for &(_output, crtc, mode) in crtc_changed {
-                let (x, y, crtc_w, crtc_h) = crtc_geom.get(&crtc).copied().unwrap_or((0, 0, 0, 0));
+                let (x, y, crtc_w, crtc_h, rotation) = crtc_geom.get(&crtc).copied().unwrap_or((
+                    0,
+                    0,
+                    0,
+                    0,
+                    crate::randr::RR_ROTATE_0,
+                ));
                 let event = x11randr::encode_crtc_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2887,6 +3000,7 @@ fn emit_randr_change_notifications_split(
                         request_window: request_window.0,
                         crtc,
                         mode,
+                        rotation,
                         x,
                         y,
                         width: crtc_w,
@@ -2903,10 +3017,12 @@ fn emit_randr_change_notifications_split(
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
             for &(output, projected_crtc, projected_mode) in output_changed {
-                let (connection, current_crtc) = output_states
-                    .get(&output)
-                    .copied()
-                    .unwrap_or((x11randr::CONNECTION_CONNECTED, projected_crtc));
+                let (connection, current_crtc, rotation) =
+                    output_states.get(&output).copied().unwrap_or((
+                        x11randr::CONNECTION_CONNECTED,
+                        projected_crtc,
+                        crate::randr::RR_ROTATE_0,
+                    ));
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2918,6 +3034,7 @@ fn emit_randr_change_notifications_split(
                         output,
                         crtc: current_crtc,
                         mode: projected_mode,
+                        rotation,
                         connection,
                     },
                 );
@@ -3010,6 +3127,8 @@ fn handle_setup_allocate(
             resource_id_mask: mask,
             screen_width_px: state.randr.screen_width,
             screen_height_px: state.randr.screen_height,
+            screen_width_mm: u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX),
+            screen_height_mm: u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX),
             current_input_masks: state
                 .clients
                 .values()
@@ -3021,6 +3140,8 @@ fn handle_setup_allocate(
             resource_id_mask: 0,
             screen_width_px: 0,
             screen_height_px: 0,
+            screen_width_mm: 0,
+            screen_height_mm: 0,
             current_input_masks: 0,
         },
     };
@@ -3043,14 +3164,6 @@ fn handle_setup_allocate(
 pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev: HostInputEvent) {
     update_repeat_state(state, &ev);
     backend.on_host_input(state, ev);
-}
-
-/// Whether a keycode currently auto-repeats per core
-/// ChangeKeyboardControl state: the global flag gates everything,
-/// then the per-key bitmap decides (Xorg `kbdfeed->ctrl.autoRepeat`
-/// + `autoRepeats[]`).
-fn key_auto_repeats(kc: &crate::server::KeyboardControlState, keycode: u8) -> bool {
-    kc.global_auto_repeat && kc.auto_repeats[usize::from(keycode >> 3)] & (1 << (keycode & 7)) != 0
 }
 
 /// Arm / refresh / clear `state.repeat_state` from an incoming host
@@ -3076,7 +3189,7 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
         // all repeat; otherwise the per-key bitmap decides. A
         // non-repeating press still replaces (disarms) the armed key —
         // only the most recently pressed key may repeat.
-        if !key_auto_repeats(&state.keyboard_control, key.keycode) {
+        if !state.keyboard_control.key_auto_repeats(key.keycode) {
             state.repeat_state = None;
             return;
         }
@@ -3114,7 +3227,7 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> b
     };
     // Repeat may have been disabled (ChangeKeyboardControl) after the
     // key was armed — disarm instead of firing.
-    if !key_auto_repeats(&state.keyboard_control, armed.event.keycode) {
+    if !state.keyboard_control.key_auto_repeats(armed.event.keycode) {
         state.repeat_state = None;
         return false;
     }
@@ -3135,8 +3248,8 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> b
     release.pressed = false;
     let mut press = armed.event;
     press.pressed = true;
-    backend.on_host_input(state, HostInputEvent::Key(release));
-    backend.on_host_input(state, HostInputEvent::Key(press));
+    backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
+    backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     true
 }
 
@@ -3204,12 +3317,12 @@ pub(crate) fn evaluate_idletime_alarms_post_poll(
     ];
     let now = Instant::now();
     for &counter in IDLETIME_COUNTERS {
-        // Skip if no alarms reference this counter.
+        // Skip if no alarm or await references this counter.
         let has_alarm = state
             .sync_alarms
             .values()
             .any(|a| a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE);
-        if !has_alarm {
+        if !has_alarm && !crate::core_loop::sync_await::idletime_awaited(state, counter) {
             continue;
         }
         let baseline = state.idletime_baseline(counter);
@@ -3226,13 +3339,10 @@ pub(crate) fn evaluate_idletime_alarms_post_poll(
         // Run the existing evaluator helper — it walks Active alarms,
         // calls trigger_fires, applies the Task 2 state-transition fix,
         // emits AlarmNotify, and updates wait_value.
-        crate::core_loop::process_request::evaluate_alarms_for_counter(
-            state,
-            counter,
-            old_idle,
-            current_idle,
-        );
+        // Record the new value first: firing an await can re-enter the
+        // IDLETIME bookkeeping through a fresh await's baseline.
         state.idletime_last_evaluated.insert(counter, current_idle);
+        crate::core_loop::sync_await::counter_changed(state, counter, old_idle, current_idle);
     }
 }
 
@@ -3261,6 +3371,7 @@ fn handle_client_setup_complete(
     byte_order: yserver_protocol::x11::ClientByteOrder,
     is_local: bool,
     fd_passing: bool,
+    setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     let writer = stream.try_clone()?;
@@ -3338,6 +3449,9 @@ fn handle_client_setup_complete(
         transport_label,
         if fd_passing { "on" } else { "off" },
     );
+    // Xorg's ClientStateRunning callback: FutureClients contexts take the
+    // client on, and enabled ones record its setup reply.
+    crate::core_loop::record::client_started(state, id, setup_reply);
 
     // Reaching here is what "ESTABLISHED" means: the poller registration
     // and the reader spawn have both succeeded, so the client can
@@ -3548,6 +3662,21 @@ fn _hint(_: Transport) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #132: `xrandr --dpi` (RRSetScreenSize with the same pixels, new mm)
+    /// reaches NEW clients' setup reply, as Xorg's `pScreen->mmWidth`.
+    /// Measured in vng (tools/vng-scenarios/xrandr-dpi.sh): 1280x800 at
+    /// `--dpi 108` → 301x188 mm on Xorg 21.1.24 and on yserver.
+    #[test]
+    fn setup_allocate_reports_randr_screen_mm() {
+        let mut state = ServerState::new();
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        state.randr.set_logical_size(w, h, 301, 188);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle_setup_allocate(&mut state, yserver_protocol::x11::ClientId(1), tx);
+        let resp = rx.try_recv().expect("setup allocate response");
+        assert_eq!((resp.screen_width_mm, resp.screen_height_mm), (301, 188));
+    }
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -3845,6 +3974,27 @@ mod tests {
     }
 
     #[test]
+    fn export_holders_report_is_gated_paced_and_rechecks_after_change() {
+        let t0 = Instant::now();
+        let off = LoopTelemetry::default();
+        assert!(!off.export_holders_due(t0));
+        let mut on = LoopTelemetry {
+            enabled: true,
+            ..LoopTelemetry::default()
+        };
+        assert!(on.export_holders_due(t0));
+        on.note_export_holders(t0, true);
+        assert!(!on.export_holders_due(t0 + Duration::from_millis(999)));
+        assert!(on.export_holders_due(t0 + TELEMETRY_EMIT_INTERVAL));
+        assert_eq!(
+            on.export_holders_deadline(),
+            Some(t0 + TELEMETRY_EMIT_INTERVAL)
+        );
+        on.note_export_holders(t0 + TELEMETRY_EMIT_INTERVAL, false);
+        assert_eq!(on.export_holders_deadline(), None);
+    }
+
+    #[test]
     fn loop_telemetry_attributes_burst_depth_age_and_sequence_boundary() {
         let client = yserver_protocol::x11::ClientId(17);
         let other = yserver_protocol::x11::ClientId(23);
@@ -3984,32 +4134,94 @@ mod tests {
                         set_time: 0,
                         output_bbox_before: None,
                         byte_order: ClientByteOrder::LittleEndian,
+                        apply_transform: None,
+                        apply_rotation: None,
+                        reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
                     },
                 },
                 request_wire_bytes: 28,
             })
             .unwrap();
 
+        let state = ServerState::new();
         let mut queue = FairRequestQueue::default();
         queue.push_back(deferred_request(blocked.0, 2));
         queue.push_back(deferred_request(other.0, 10));
         queue.push_back(deferred_request(blocked.0, 3));
 
-        let runnable = queue.pop_front_unblocked(&pending).unwrap();
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
         assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
         assert!(
-            queue.pop_front_unblocked(&pending).is_none(),
+            queue.pop_front_unblocked(&pending, &state).is_none(),
             "later requests from the pending client must stay parked"
         );
         assert!(
-            !queue.has_runnable(&pending),
+            !queue.has_runnable(&pending, &state),
             "a blocked-only queue must not force a zero-timeout poll spin"
         );
 
         pending.take_crtc(token).unwrap();
-        let first = queue.pop_front_unblocked(&pending).unwrap();
-        let second = queue.pop_front_unblocked(&pending).unwrap();
+        let first = queue.pop_front_unblocked(&pending, &state).unwrap();
+        let second = queue.pop_front_unblocked(&pending, &state).unwrap();
         assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
+    }
+
+    /// A client suspended by SYNC Await (Xorg `IgnoreClient`) keeps its
+    /// later requests queued in order while other clients run, the queue
+    /// does not spin the poll on it, and resuming releases them in order.
+    #[test]
+    fn sync_await_suspends_only_the_awaiting_client() {
+        let awaiting = yserver_protocol::x11::ClientId(57);
+        let other = yserver_protocol::x11::ClientId(12);
+        let pending = PendingBackendRequests::default();
+        let mut state = ServerState::new();
+        state
+            .sync_awaits
+            .insert(awaiting.0, crate::server::SyncAwait::default());
+
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(awaiting.0, 2));
+        queue.push_back(deferred_request(other.0, 10));
+        queue.push_back(deferred_request(awaiting.0, 3));
+
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+        assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+        assert!(!queue.has_runnable(&pending, &state));
+
+        state.sync_awaits.remove(&awaiting.0);
+        assert!(queue.has_runnable(&pending, &state));
+        let first = queue.pop_front_unblocked(&pending, &state).unwrap();
+        let second = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
+    }
+
+    /// A RECORD data connection whose stream write failed is no longer
+    /// recording, but its pipelined requests must not run before the core
+    /// loop disconnects it.
+    #[test]
+    fn failed_record_client_keeps_its_queued_requests_parked() {
+        let failed = yserver_protocol::x11::ClientId(57);
+        let other = yserver_protocol::x11::ClientId(12);
+        let pending = PendingBackendRequests::default();
+        let mut state = ServerState::new();
+        state.record.fail_recorder_for_test(failed);
+        assert!(!crate::core_loop::record::client_is_recording(
+            &state, failed
+        ));
+
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(failed.0, 2));
+        queue.push_back(deferred_request(other.0, 10));
+
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+        assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+        assert!(!queue.has_runnable(&pending, &state));
+        assert_eq!(
+            crate::core_loop::record::take_failed_recorders(&mut state),
+            [failed]
+        );
     }
 
     #[test]
@@ -4057,8 +4269,14 @@ mod tests {
             set_time: 123,
             output_bbox_before: enabled_output_bbox(&state),
             byte_order: ClientByteOrder::LittleEndian,
+            apply_transform: None,
+            apply_rotation: None,
+            reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
         };
-        let continuation = PendingCrtcConfig { token, completion };
+        let continuation = PendingCrtcConfig {
+            token,
+            completion: completion.clone(),
+        };
         let mut pending = PendingBackendRequests::default();
         pending
             .park_crtc(ParkedCrtcConfig {
@@ -4723,6 +4941,7 @@ mod tests {
                 // the session credential the Refuse just revoked.
                 is_local: false,
                 fd_passing: false,
+                setup_reply: Vec::new(),
             })
             .expect("send the racing completion");
 
@@ -5014,6 +5233,66 @@ mod tests {
         );
     }
 
+    /// A fired repeat reaches the backend as `KeyRepeat`, not device `Key`:
+    /// it models Xorg's XKB soft repeat, which bypasses GetKeyboardEvents
+    /// and so generates no XI2 raw key event (issue #173).
+    #[test]
+    fn fire_pending_repeats_sends_key_repeat_not_device_key() {
+        use std::time::{Duration, Instant};
+
+        use crate::{
+            backend::recording::{RecordedCall, RecordingBackend},
+            host_x11::HostKeyEvent,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        handle_host_input(
+            &mut state,
+            &mut backend,
+            HostInputEvent::Key(HostKeyEvent {
+                pressed: true,
+                keycode: 38,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        if let Some(s) = state.repeat_state.as_mut() {
+            s.next_fire = Instant::now() - Duration::from_millis(1);
+        }
+        assert!(fire_pending_repeats(&mut state, &mut backend));
+
+        let keys: Vec<RecordedCall> = backend
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::HostKey { .. }))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                RecordedCall::HostKey {
+                    keycode: 38,
+                    pressed: true,
+                    repeat: false,
+                },
+                RecordedCall::HostKey {
+                    keycode: 38,
+                    pressed: false,
+                    repeat: true,
+                },
+                RecordedCall::HostKey {
+                    keycode: 38,
+                    pressed: true,
+                    repeat: true,
+                },
+            ]
+        );
+    }
+
     /// Helper: a touchpad `DeviceInfo` mirroring libinput's enumeration
     /// of a Synaptics pad (matches xinput.rs's `touchpad_info`).
     #[cfg(test)]
@@ -5251,9 +5530,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: false, // skip wire delivery; assert state mutation only
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         let mut backend = RecordingBackend::default();
@@ -6435,6 +6718,7 @@ mod server_reset {
                 byte_order: ClientByteOrder::LittleEndian,
                 is_local: true,
                 fd_passing: true,
+                setup_reply: Vec::new(),
             })
             .expect("send the stale completion");
 

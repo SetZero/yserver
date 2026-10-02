@@ -164,7 +164,7 @@ const XI2_ABSORBING_POINTER_DEVICES: [u16; 3] = [2, 1, 0];
 /// delivers — so an XI2 selection ABSORBS the event and the core
 /// propagation walk stops there, whoever selected core further up.
 fn xi2_pointer_selected_on(state: &ServerState, window: ResourceId, evtype: u16) -> bool {
-    let bit = 1u32 << evtype;
+    let bit = 1u64 << evtype;
     state.clients.values().any(|client| {
         XI2_ABSORBING_POINTER_DEVICES.iter().any(|device| {
             client
@@ -434,7 +434,7 @@ pub fn emit_xi2_device_changed_slave_pointer(
                     // delivery breadth; real clients select via
                     // XIAllDevices(0).
                     && matches!(dev, SLAVE_POINTER | 0 | 1)
-                    && (mask & XI2_DEVICE_CHANGED_MASK) != 0
+                    && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
             });
             selected.then_some(ClientId(*id))
         })

@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "ash::Device::allocate_memory", reason = "use crate::kms::vk::mem_accounting::allocate_memory so the allocation is accounted" },
+    { path = "ash::Device::free_memory", reason = "use crate::kms::vk::mem_accounting::free_memory so the free is accounted" },
+]

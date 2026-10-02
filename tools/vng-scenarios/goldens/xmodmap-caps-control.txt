@@ -1,0 +1,63 @@
+==> probe.log <==
+== before
+xmodmap:  up to 4 keys per modifier, (keycodes in parentheses):
+
+shift       Shift_L (0x32),  Shift_R (0x3e)
+lock        Caps_Lock (0x42)
+control     Control_L (0x25),  Control_R (0x69)
+mod1        Alt_L (0x40),  Alt_R (0x6c),  Alt_L (0xcc),  Meta_L (0xcd)
+mod2        Num_Lock (0x4d)
+mod3        ISO_Level5_Shift (0xcb)
+mod4        Super_L (0x85),  Super_R (0x86),  Super_L (0xce)
+mod5        ISO_Level3_Shift (0x5c)
+
+keycode  66 = Caps_Lock NoSymbol Caps_Lock
+xkbmap:before kc=66 type_index=0 nsyms=1 syms=[ Caps_Lock ] modmap=0x02 act0.type=3 act0.flags=0x00 act0.mask=0x02
+xkbmap:before kc=37 type_index=0 nsyms=1 syms=[ Control_L ] modmap=0x04 act0.type=1 act0.flags=0x05 act0.mask=0x04
+xkbcommon: kc66 layout0 level1 nsyms=1 sym=Caps_Lock
+xkbcommon: kc66 held depressed=[ Lock ] locked=[ Lock ] | kc38 sym=A utf8=[ 0x41 ]
+xkbcommon: kc66 released depressed=[ ] locked=[ Lock ] | kc38 sym=A utf8=[ 0x41 ]
+xkbcommon: server-state effective=[ ] locked=[ ]
+== xmodmap
+xmodmap rc=0
+== after
+xmodmap:  up to 4 keys per modifier, (keycodes in parentheses):
+
+shift       Shift_L (0x32),  Shift_R (0x3e)
+lock
+control     Control_L (0x25),  Control_L (0x42),  Control_R (0x69)
+mod1        Alt_L (0x40),  Alt_R (0x6c),  Alt_L (0xcc),  Meta_L (0xcd)
+mod2        Num_Lock (0x4d)
+mod3        ISO_Level5_Shift (0xcb)
+mod4        Super_L (0x85),  Super_R (0x86),  Super_L (0xce)
+mod5        ISO_Level3_Shift (0x5c)
+
+keycode  66 = Control_L NoSymbol Control_L
+xkbmap:after kc=66 type_index=0 nsyms=1 syms=[ Control_L ] modmap=0x04 act0.type=1 act0.flags=0x05 act0.mask=0x04
+xkbmap:after kc=37 type_index=0 nsyms=1 syms=[ Control_L ] modmap=0x04 act0.type=1 act0.flags=0x05 act0.mask=0x04
+xkbcommon: kc66 layout0 level1 nsyms=1 sym=Control_L
+xkbcommon: kc66 held depressed=[ Control ] locked=[ ] | kc38 sym=a utf8=[ 0x01 ]
+xkbcommon: kc66 released depressed=[ ] locked=[ ] | kc38 sym=a utf8=[ 0x61 ]
+xkbcommon: server-state effective=[ ] locked=[ ]
+== inject: keydown 66, key a, keyup 66
+== inject: key 66, then key a
+== end state
+xkbcommon: kc66 layout0 level1 nsyms=1 sym=Control_L
+xkbcommon: kc66 held depressed=[ Control ] locked=[ ] | kc38 sym=a utf8=[ 0x01 ]
+xkbcommon: kc66 released depressed=[ ] locked=[ ] | kc38 sym=a utf8=[ 0x61 ]
+xkbcommon: server-state effective=[ ] locked=[ ]
+== listener
+listen: ready focus_is_ours=1
+listen:initial kc=66 type_index=0 nsyms=1 syms=[ Caps_Lock ] modmap=0x02 act0.type=3 act0.flags=0x00 act0.mask=0x02
+listen:initial kc=37 type_index=0 nsyms=1 syms=[ Control_L ] modmap=0x04 act0.type=1 act0.flags=0x05 act0.mask=0x04
+listen: MappingNotify request=1 first=66 count=1
+listen: MappingNotify request=0 first=0 count=0
+listen: KeyPress   kc=66 state=0x0000 xkblookup=Control_L consumed=0x00 xlookupstring=Control_L nbytes=0 bytes=[ ]
+listen: KeyPress   kc=38 state=0x0004 xkblookup=a consumed=0x03 xlookupstring=a nbytes=1 bytes=[ 0x01 ]
+listen: KeyRelease kc=38 state=0x0004 xkblookup=a consumed=0x03 xlookupstring=a nbytes=1 bytes=[ 0x01 ]
+listen: KeyRelease kc=66 state=0x0004 xkblookup=Control_L consumed=0x00 xlookupstring=Control_L nbytes=0 bytes=[ ]
+listen: KeyPress   kc=66 state=0x0000 xkblookup=Control_L consumed=0x00 xlookupstring=Control_L nbytes=0 bytes=[ ]
+listen: KeyRelease kc=66 state=0x0004 xkblookup=Control_L consumed=0x00 xlookupstring=Control_L nbytes=0 bytes=[ ]
+listen: KeyPress   kc=38 state=0x0000 xkblookup=a consumed=0x03 xlookupstring=a nbytes=1 bytes=[ 0x61 ]
+listen: KeyRelease kc=38 state=0x0000 xkblookup=a consumed=0x03 xlookupstring=a nbytes=1 bytes=[ 0x61 ]
+listen: done

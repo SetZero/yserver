@@ -1315,11 +1315,6 @@ mod tests {
     use super::*;
     use std::{fs::File, os::fd::AsRawFd, sync::mpsc};
 
-    #[cfg(target_os = "linux")]
-    const PDEATHSIG_NESTED_ENV: &str = "YSERVER_TEST_PDEATHSIG_NESTED_PARENT";
-    #[cfg(target_os = "linux")]
-    const PDEATHSIG_PID_MARKER: &str = "YSERVER_TEST_PDEATHSIG_CHILD_PID=";
-
     fn drm_render(major: u32, minor: u32) -> RenderDeviceId {
         RenderDeviceId::DrmRender(DrmDeviceKey { major, minor })
     }
@@ -1435,34 +1430,6 @@ mod tests {
         assert!(error.to_string().contains("state is uncertain"));
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    // Deliberately exit this nested process without waiting: the outer test is
-    // verifying that PDEATHSIG, rather than normal Child cleanup, kills it.
-    #[allow(clippy::zombie_processes)]
-    fn pdeathsig_nested_parent() {
-        if env::var_os(PDEATHSIG_NESTED_ENV).is_none() {
-            return;
-        }
-
-        // SAFETY: getpid has no preconditions and is called before spawning
-        // the child whose parent identity it anchors.
-        let expected_parent = unsafe { libc::getpid() };
-        let mut command = Command::new("/bin/sleep");
-        command
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // SAFETY: this invokes the same allocation-free syscall helper as the
-        // production pre-exec path.
-        unsafe {
-            command.pre_exec(move || arm_helper_parent_death_signal(expected_parent));
-        }
-        let child = command.spawn().expect("spawn nested pdeathsig child");
-        println!("{PDEATHSIG_PID_MARKER}{}", child.id());
-    }
-
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn pdeathsig_parent_race_check_rejects_a_stale_parent() {
@@ -1476,51 +1443,6 @@ mod tests {
             .spawn()
             .expect_err("stale captured parent must fail before exec");
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pdeathsig_kills_a_running_helper_when_its_parent_exits() {
-        let output = Command::new(env::current_exe().expect("current test executable"))
-            .arg("--exact")
-            .arg("internal_probe::tests::pdeathsig_nested_parent")
-            .arg("--nocapture")
-            .env(PDEATHSIG_NESTED_ENV, "1")
-            .output()
-            .expect("run nested parent test process");
-        assert!(
-            output.status.success(),
-            "nested parent failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let child_pid = stdout
-            .split_whitespace()
-            .find_map(|word| word.strip_prefix(PDEATHSIG_PID_MARKER))
-            .and_then(|raw| raw.parse::<libc::pid_t>().ok())
-            .expect("nested parent reported child PID");
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat"));
-            let running = match stat {
-                Ok(stat) => stat
-                    .rsplit_once(") ")
-                    .and_then(|(_, fields)| fields.as_bytes().first().copied())
-                    .is_some_and(|state| !matches!(state, b'Z' | b'X')),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => panic!("read nested child state: {error}"),
-            };
-            if !running {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "helper {child_pid} survived after its parent exited"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     #[test]

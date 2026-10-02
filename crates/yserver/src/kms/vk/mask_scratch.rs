@@ -68,7 +68,7 @@ impl BatchResource for RetiredMaskScratchImage {
             vk.device.destroy_image_view(self.attachment_view, None);
             vk.device.destroy_image_view(self.view, None);
             vk.device.destroy_image(self.image, None);
-            vk.device.free_memory(self.image_memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, self.image_memory);
         }
     }
 }
@@ -224,7 +224,7 @@ impl Drop for MaskScratch {
                 .destroy_image_view(self.attachment_view, None);
             self.vk.device.destroy_image_view(self.view, None);
             self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.image_memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, self.image_memory);
         }
     }
 }
@@ -277,7 +277,12 @@ fn allocate_image(
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt)
         .push_next(&mut dedicated);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scratch,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -286,7 +291,7 @@ fn allocate_image(
     };
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(e.into());
@@ -308,7 +313,7 @@ fn allocate_image(
         Ok(v) => v,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());
@@ -341,7 +346,7 @@ fn allocate_image(
         Err(e) => {
             unsafe {
                 vk.device.destroy_image_view(view, None);
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());

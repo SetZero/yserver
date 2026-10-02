@@ -445,6 +445,20 @@ use crate::kms::{cpu_types::Rectangle16, vk::glyph::GlyphLayout};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PinnedStagingIdx(pub(crate) u32);
 
+/// Index into `OpenFrame::pins.upload_slices`: one request's upload data
+/// in the frame's upload arena blocks (#177).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinnedUploadIdx(pub(crate) u32);
+
+/// Where one request's upload data sits: `offset` bytes into `buffer`, a
+/// block owned by the same frame's `FramePinSet::uploads`. Replay binds or
+/// copies from exactly this `(buffer, offset)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadSlice {
+    pub(crate) buffer: vk::Buffer,
+    pub(crate) offset: vk::DeviceSize,
+}
+
 /// A glyph to draw at frame-close time. Mirrors the in-tree
 /// `TextGlyph` struct (`crate::kms::vk::ops::text::TextGlyph`); we hold
 /// our own copy here so the recorded op is independent of the live
@@ -497,11 +511,11 @@ pub(crate) struct RecordedCompositeGlyphs {
     /// job is to make each recorded op homogeneous in this.
     pub(crate) component_alpha: bool,
     pub(crate) foreground_rgba: [f32; 4],
-    /// Pin index of the per-glyph instance vertex buffer (built at
-    /// record time, `#1` glyph batching). Emit binds
-    /// `pins.staging_buffers[instance_pin.0].buffer` and issues one
-    /// instanced draw per clip rect.
-    pub(crate) instance_pin: PinnedStagingIdx,
+    /// Pin index of the per-glyph instance data (built at record time,
+    /// `#1` glyph batching). Emit binds `pins.upload_slices[instance_pin.0]`
+    /// as the instance vertex buffer and issues one instanced draw per
+    /// clip rect.
+    pub(crate) instance_pin: PinnedUploadIdx,
     /// First glyph instance this run draws (`vkCmdDraw`'s
     /// `firstInstance`). One `CompositeGlyphs` request may be recorded
     /// as several contiguous runs — glyphs of different `GlyphLayout`s
@@ -530,9 +544,9 @@ pub(crate) struct RecordedCompositeGlyphs {
 
 #[derive(Debug)]
 pub(crate) struct RecordedGlyphUpload {
-    /// Pin index into the frame's staging-buffer pin vector. Replay
-    /// reads the buffer handle from the pinned Arc.
-    pub(crate) staging_pin_idx: PinnedStagingIdx,
+    /// Pin index of the glyph's pixels in the frame's upload arena.
+    /// Replay copies from that `(buffer, offset)` into the atlas.
+    pub(crate) upload_pin: PinnedUploadIdx,
     pub(crate) atlas_x: u32,
     pub(crate) atlas_y: u32,
     /// The atlas footprint width — what the copy region covers.
@@ -832,7 +846,7 @@ pub(crate) struct RecordedLogicFill {
     pub(crate) dst_format: vk::Format,
     pub(crate) dst_old_layout: vk::ImageLayout,
     pub(crate) logic_mode: yserver_core::backend::GcFunction,
-    pub(crate) opaque_alpha: bool,
+    pub(crate) channels: crate::kms::vk::logic_fill_pipeline::LogicFillChannels,
     pub(crate) color: [f32; 4],
     pub(crate) rects: Vec<vk::Rect2D>, // pre-clamped at append, non-empty
 }
@@ -857,8 +871,8 @@ pub(crate) struct RecordedImageText {
     pub(crate) dst_bounds: Option<vk::Rect2D>,
     pub(crate) dst_old_layout: vk::ImageLayout,
     pub(crate) foreground_rgba: [f32; 4],
-    /// Pin index of the per-glyph instance vertex buffer (`#1`).
-    pub(crate) instance_pin: PinnedStagingIdx,
+    /// Pin index of the per-glyph instance data (`#1`).
+    pub(crate) instance_pin: PinnedUploadIdx,
     /// Number of glyph instances (`vkCmdDraw` instance count).
     pub(crate) instance_count: u32,
 }
@@ -915,7 +929,7 @@ pub(crate) struct RecordedRenderTrapsOrTris {
     // Composite phase rect layout (clip pre-clamped at append).
     pub(crate) clip_scissors: Vec<vk::Rect2D>,
     // Pinned resources.
-    pub(crate) vertex_pool_pin: PinnedStagingIdx,
+    pub(crate) vertex_pin: PinnedUploadIdx,
 }
 
 /// Reserved for future ops that need an explicit cross-frame layout
@@ -1064,9 +1078,10 @@ impl OpenFrame {
 use std::sync::Arc;
 
 /// Resource pins held alive across a frame. Mechanism 1 of spec
-/// § "Frame-wide resource pinning". B.1 only pins `StagingBuffer`
-/// clones (one per glyph upload). B.2 extends with sync objects,
-/// semaphores, and Mechanism 3 retired scratch `BatchResource`s.
+/// § "Frame-wide resource pinning". Pins `put_image` `StagingBuffer`
+/// clones, the frame's upload arena blocks (#177) with one slice per
+/// request that uses them, and Mechanism 3 retired scratch
+/// `BatchResource`s.
 ///
 /// `Debug` is derived: `BatchResource: Send + std::fmt::Debug` (see
 /// `paint_batch.rs:146`), so `Box<dyn BatchResource>` is `Debug` and
@@ -1077,6 +1092,17 @@ use std::sync::Arc;
 #[derive(Debug, Default)]
 pub(crate) struct FramePinSet {
     pub(crate) staging_buffers: Vec<Arc<super::engine::StagingBuffer>>,
+    /// #177: the upload arena blocks this frame bump-allocates its
+    /// per-request upload data from (glyph-run / ImageText instance data,
+    /// trapezoid vertices, glyph-atlas upload staging). Owned by the frame:
+    /// they move with the pin set to `pending_frames` at close, and only
+    /// the retire walk in `poll_retired` — after the frame's fence has
+    /// signalled — hands them back to the engine's `UploadArena`.
+    pub(crate) uploads: super::upload_arena::FrameUploads<super::engine::StagingBuffer>,
+    /// One entry per request's upload data, each pointing into a block in
+    /// `uploads`. Counted as a pin, one per request, as the per-request
+    /// buffers they replace were.
+    pub(crate) upload_slices: Vec<UploadSlice>,
     /// Phase B.2 Mechanism 3: retired scratch images adopted into this
     /// frame's pin set via
     /// `RenderEngineInner::adopt_retired_resource_for_gpu_retirement`.
@@ -1108,6 +1134,14 @@ impl FramePinSet {
         PinnedStagingIdx(idx)
     }
 
+    /// Pin one request's upload data. `slice` must point into a block
+    /// held by `self.uploads`.
+    pub(crate) fn pin_upload(&mut self, slice: UploadSlice) -> PinnedUploadIdx {
+        let idx = u32::try_from(self.upload_slices.len()).expect("< u32::MAX pins");
+        self.upload_slices.push(slice);
+        PinnedUploadIdx(idx)
+    }
+
     /// Phase B.2 Mechanism 3: attach a retired scratch `BatchResource`
     /// to this open frame's pin set. Released via explicit
     /// `boxed.release(&vk)` at frame retirement (see the
@@ -1128,12 +1162,14 @@ impl FramePinSet {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.staging_buffers.len() + self.retired_resources.len()
+        self.staging_buffers.len() + self.upload_slices.len() + self.retired_resources.len()
     }
 
     #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn is_empty(&self) -> bool {
-        self.staging_buffers.is_empty() && self.retired_resources.is_empty()
+        self.staging_buffers.is_empty()
+            && self.upload_slices.is_empty()
+            && self.retired_resources.is_empty()
     }
 }
 
@@ -1216,7 +1252,7 @@ mod op_tests {
             dst_has_alpha: true,
             component_alpha: false,
             foreground_rgba: [1.0, 0.0, 0.0, 1.0],
-            instance_pin: PinnedStagingIdx(7),
+            instance_pin: PinnedUploadIdx(7),
             first_instance: 0,
             instance_count: 3,
             clip_scissors: vec![scissor],
@@ -1231,7 +1267,7 @@ mod op_tests {
 
         assert_eq!(op.dst_id, DrawableId::for_tests(1));
         assert_eq!(op.foreground_rgba, [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(op.instance_pin, PinnedStagingIdx(7));
+        assert_eq!(op.instance_pin, PinnedUploadIdx(7));
         assert_eq!(op.instance_count, 3);
         assert_eq!(op.clip_scissors.len(), 1);
         assert!(op.damage_rect.is_some());
@@ -1254,7 +1290,7 @@ mod op_tests {
             layout: crate::kms::vk::glyph::GlyphLayout::A8,
         };
         let op = RecordedGlyphUpload {
-            staging_pin_idx: PinnedStagingIdx(3),
+            upload_pin: PinnedUploadIdx(3),
             atlas_x: 0,
             atlas_y: 32,
             packed_w: 8,
@@ -1263,7 +1299,7 @@ mod op_tests {
             insert_entry: entry,
         };
 
-        assert_eq!(op.staging_pin_idx, PinnedStagingIdx(3));
+        assert_eq!(op.upload_pin, PinnedUploadIdx(3));
         assert_eq!(op.atlas_x, 0);
         assert_eq!(op.atlas_y, 32);
         assert_eq!(op.packed_w, 8);
@@ -1334,7 +1370,7 @@ mod op_tests {
             dst_has_alpha: true,
             component_alpha: false,
             foreground_rgba: [0.0; 4],
-            instance_pin: PinnedStagingIdx(0),
+            instance_pin: PinnedUploadIdx(0),
             first_instance: 0,
             instance_count: 0,
             clip_scissors: Vec::new(),
@@ -1344,7 +1380,7 @@ mod op_tests {
 
         // GlyphUpload → None (utility variant — writes to atlas).
         let glyph_upload = RecordedOp::GlyphUpload(RecordedGlyphUpload {
-            staging_pin_idx: PinnedStagingIdx(0),
+            upload_pin: PinnedUploadIdx(0),
             atlas_x: 0,
             atlas_y: 0,
             packed_w: 0,
@@ -1425,7 +1461,7 @@ mod op_tests {
             dst_format: vk::Format::B8G8R8A8_UNORM,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             logic_mode: yserver_core::backend::GcFunction::Copy,
-            opaque_alpha: false,
+            channels: crate::kms::vk::logic_fill_pipeline::LogicFillChannels::All,
             color: [0.0; 4],
             rects: Vec::new(),
         }));
@@ -1438,7 +1474,7 @@ mod op_tests {
             dst_bounds: None,
             dst_old_layout: vk::ImageLayout::UNDEFINED,
             foreground_rgba: [0.0; 4],
-            instance_pin: PinnedStagingIdx(0),
+            instance_pin: PinnedUploadIdx(0),
             instance_count: 0,
         }));
         assert_eq!(image_text.dst_id(), Some(id7));
@@ -1469,7 +1505,7 @@ mod op_tests {
             bbox_h: 0,
             instance_count: 0,
             clip_scissors: Vec::new(),
-            vertex_pool_pin: PinnedStagingIdx(0),
+            vertex_pin: PinnedUploadIdx(0),
         }));
         assert_eq!(render_traps.dst_id(), Some(id7));
     }
@@ -1503,7 +1539,7 @@ mod op_tests {
                 dst_bounds: None,
                 dst_old_layout: vk::ImageLayout::UNDEFINED,
                 foreground_rgba: [0.0; 4],
-                instance_pin: PinnedStagingIdx(0),
+                instance_pin: PinnedUploadIdx(0),
                 instance_count: 0,
             })),
         ];
@@ -1963,7 +1999,9 @@ mod lifecycle_tests {
 /// One in-flight frame's resource pin set, parked until the frame's
 /// `FenceTicket` signals. Walked by `RenderEngine::poll_retired` next
 /// to the existing `submitted` queue; both gate retirement on the same
-/// ticket. Drop order: when the ticket signals, the record drops, its
+/// ticket. Drop order: when the ticket signals, the retire walk hands
+/// `pins.uploads` back to the upload arena and pooled `put_image`
+/// staging back to its pool; the record then drops, its remaining
 /// `pins.staging_buffers` Arcs decrement, and any `StagingBuffer`
 /// whose Arc refcount hits zero releases its Vk handles.
 #[derive(Debug)]

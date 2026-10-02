@@ -50,6 +50,11 @@ pub const SET_CLIENT_INFO_2_ARB: u8 = 35;
 // ChangeDrawableAttributes).
 pub const CREATE_PIXMAP: u8 = 22;
 pub const DESTROY_PIXMAP: u8 = 23;
+// GLX 1.0 visual-based pixmap lifecycle (glxproto.h `X_GLXCreateGLXPixmap`
+// / `X_GLXDestroyGLXPixmap`). Mesa's `glXCreateGLXPixmap` sends 13 even
+// for direct contexts (src/glx/glx_pbuffer.c `__glXCreateGLXPixmap`).
+pub const CREATE_GLX_PIXMAP: u8 = 13;
+pub const DESTROY_GLX_PIXMAP: u8 = 15;
 pub const CREATE_PBUFFER: u8 = 27;
 pub const DESTROY_PBUFFER: u8 = 28;
 pub const GET_DRAWABLE_ATTRIBUTES: u8 = 29;
@@ -76,6 +81,10 @@ pub const MINOR_VERSION: u32 = 4;
 /// RC_DRAWABLE, then `dixLookupWindow` fails (glx/vnd_dispatch_stubs.c:456-472,
 /// glx/vndservermapping.c:56-73, glxcmds.c:1873-1880). Matches
 /// `/usr/include/GL/glxproto.h:43` `GLXBadDrawable = 2`.
+/// `GLXBadContext` (0) — `QueryContext`/`IsDirect` on an XID that names
+/// no GLX context (glx/vnd_dispatch_stubs.c:504-506, :521-523;
+/// glxcmds.c `validGlxContext`).
+pub const ERROR_GLX_BAD_CONTEXT: u8 = 0;
 pub const ERROR_GLX_BAD_DRAWABLE: u8 = 2;
 pub const ERROR_GLX_BAD_PIXMAP: u8 = 3;
 pub const ERROR_GLX_BAD_RENDER_REQUEST: u8 = 6;
@@ -198,10 +207,15 @@ pub const VENDOR_NAMES: &str = "mesa";
 /// [`VENDOR_NAMES_EXT`]) instead of guessing a default vendor. Xorg
 /// advertises it; without it libglvnd's fallback returns no vendor on
 /// Asahi/ALARM → NULL `glXQueryExtensionsString` → Cinnamon/cogl SIGSEGV.
+///
+/// `GLX_EXT_import_context` is absent on purpose: Xorg lists it only with
+/// indirect GLX enabled (`+iglx`, glx/extension_string.c:183-184), and
+/// yserver has no indirect GLX. `QueryContext` is still answered, as Xorg
+/// answers it without the listing.
 pub const SERVER_EXTENSIONS: &str = "GLX_ARB_create_context GLX_ARB_create_context_profile \
     GLX_EXT_create_context_es2_profile GLX_EXT_swap_control \
     GLX_ARB_fbconfig_float GLX_EXT_visual_info \
-    GLX_EXT_visual_rating GLX_EXT_import_context GLX_EXT_libglvnd";
+    GLX_EXT_visual_rating GLX_EXT_libglvnd";
 
 /// Extension token appended to the advertised extension string when the
 /// backend can allocate and export a BGRA8 dma-buf (probed once at init).
@@ -331,8 +345,17 @@ pub const GLX_CONFIG_CAVEAT: u32 = 0x20;
 pub const GLX_X_VISUAL_TYPE: u32 = 0x22;
 pub const GLX_TRANSPARENT_TYPE: u32 = 0x23;
 
+/// `GLX_SHARE_CONTEXT_EXT` (glxext.h, 0x800A) — first attribute of a
+/// `QueryContext` reply: the share-list context XID the context was
+/// created with (Xorg `ctx->share_id`, glxcmds.c:1678).
+pub const GLX_SHARE_CONTEXT_EXT: u32 = 0x800A;
+/// Also `GLX_VISUAL_ID_EXT` — the same token (glxext.h).
 pub const GLX_VISUAL_ID: u32 = 0x800B;
+/// Also `GLX_SCREEN_EXT` — the same token (glxext.h).
 pub const GLX_SCREEN: u32 = 0x800C;
+/// `GLX_RGBA_TYPE` (glx.h, 0x8014) — the render type Xorg records for a
+/// GLX 1.0 `CreateContext` and the `CreateContextAttribsARB` default.
+pub const GLX_RGBA_TYPE: u32 = 0x8014;
 pub const GLX_DRAWABLE_TYPE: u32 = 0x8010;
 pub const GLX_RENDER_TYPE: u32 = 0x8011;
 pub const GLX_X_RENDERABLE: u32 = 0x8012;
@@ -369,6 +392,10 @@ pub const GLX_Y_INVERTED_EXT: u32 = 0x20D4;
 pub const GLX_STEREO_TREE_EXT: u32 = 0x20F5;
 pub const GLX_TEXTURE_TARGET_EXT: u32 = 0x20D6;
 pub const GLX_TEXTURE_2D_EXT: u32 = 0x20DC;
+/// `GLX_TEXTURE_RECTANGLE_EXT` (glxext.h, 0x20DD) — what Xorg reports as
+/// `GLX_TEXTURE_TARGET_EXT` for a drawable whose target is not
+/// `GL_TEXTURE_2D` (glxcmds.c:1896-1897), e.g. a GLX 1.0 GLXPixmap.
+pub const GLX_TEXTURE_RECTANGLE_EXT: u32 = 0x20DD;
 // Bind-to-texture target bitmask values (GLX_TEXTURE_*_BIT_EXT).
 pub const GLX_TEXTURE_1D_BIT_EXT: u32 = 0x0001;
 pub const GLX_TEXTURE_2D_BIT_EXT: u32 = 0x0002;
@@ -829,6 +856,141 @@ pub struct CreateGlxWindowRequest {
     pub glx_window: u32,
 }
 
+/// `CreateGLXPixmap` (GLX 1.0, minor 13) request fields —
+/// `xGLXCreateGLXPixmapReq` (glxproto.h:301-310). The visual-based
+/// counterpart of GLX 1.3 `CreatePixmap`: a GLX *visual* ID instead of
+/// an FBConfig ID, and no attribute list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateGlxPixmapRequest {
+    pub screen: u32,
+    pub visual: u32,
+    pub pixmap: u32,
+    pub glx_pixmap: u32,
+}
+
+/// Parse a `CreateGLXPixmap` body. The request is fixed-size
+/// (`sz_xGLXCreateGLXPixmapReq` = 20, so a 16-byte body); any other
+/// length is `None`, which the dispatcher reports as `BadLength` like
+/// Xorg's `REQUEST_SIZE_MATCH` (glx/vnd_dispatch_stubs.c:148).
+#[must_use]
+pub fn parse_create_glx_pixmap(body: &[u8]) -> Option<CreateGlxPixmapRequest> {
+    if body.len() != 16 {
+        return None;
+    }
+    Some(CreateGlxPixmapRequest {
+        screen: read_u32_le(body),
+        visual: read_u32_le(&body[4..]),
+        pixmap: read_u32_le(&body[8..]),
+        glx_pixmap: read_u32_le(&body[12..]),
+    })
+}
+
+/// Parse a request whose whole body is one XID — `DestroyGLXPixmap`
+/// (15), `QueryContext` (25), `IsDirect` (6). All three are
+/// `REQUEST_SIZE_MATCH` in Xorg's GLXVND stubs, so a body that is not
+/// exactly 4 bytes is `None` (→ `BadLength`).
+#[must_use]
+pub fn parse_single_xid(body: &[u8]) -> Option<u32> {
+    if body.len() != 4 {
+        return None;
+    }
+    Some(read_u32_le(body))
+}
+
+/// How a context request names its configuration: GLX 1.0
+/// `CreateContext` carries a visual ID, every later form an FBConfig ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextConfigRef {
+    Visual(u32),
+    FbConfig(u32),
+}
+
+/// The fields of `CreateContext` (3), `CreateNewContext` (24) and
+/// `CreateContextAttribsARB` (34) that `QueryContext`/`IsDirect` report
+/// back. `render_type` is what Xorg stores in `glxc->renderType`:
+/// `GLX_RGBA_TYPE` for `CreateContext` (glxcmds.c:386-388), the request
+/// field for `CreateNewContext`, and the `GLX_RENDER_TYPE` attribute
+/// (default `GLX_RGBA_TYPE`) for `CreateContextAttribsARB`
+/// (glx/createcontext.c:90, :353).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateContextRequest {
+    pub context: u32,
+    pub config: ContextConfigRef,
+    pub screen: u32,
+    pub render_type: u32,
+    pub share_list: u32,
+    pub is_direct: bool,
+}
+
+/// Parse one of the three core context-creation requests, selected by
+/// `minor`. Layouts (body-relative, glxproto.h):
+///
+/// ```text
+/// 3  CreateContext:           context visual   screen shareList  isDirect
+/// 24 CreateNewContext:        context fbconfig screen renderType shareList isDirect
+/// 34 CreateContextAttribsARB: context fbconfig screen shareList  isDirect(+3) numAttribs attribs…
+/// ```
+///
+/// Returns `None` for a body too short for its fixed part or another
+/// minor.
+#[must_use]
+pub fn parse_create_context(minor: u8, body: &[u8]) -> Option<CreateContextRequest> {
+    let u32_at = |off: usize| body.get(off..off + 4).map(read_u32_le);
+    match minor {
+        CREATE_CONTEXT => Some(CreateContextRequest {
+            context: u32_at(0)?,
+            config: ContextConfigRef::Visual(u32_at(4)?),
+            screen: u32_at(8)?,
+            render_type: GLX_RGBA_TYPE,
+            share_list: u32_at(12)?,
+            is_direct: *body.get(16)? != 0,
+        }),
+        CREATE_NEW_CONTEXT => Some(CreateContextRequest {
+            context: u32_at(0)?,
+            config: ContextConfigRef::FbConfig(u32_at(4)?),
+            screen: u32_at(8)?,
+            render_type: u32_at(12)?,
+            share_list: u32_at(16)?,
+            is_direct: *body.get(20)? != 0,
+        }),
+        CREATE_CONTEXT_ATTRIBS_ARB => {
+            let num_attribs = u32_at(20)? as usize;
+            let mut render_type = GLX_RGBA_TYPE;
+            for i in 0..num_attribs {
+                let off = 24 + i * 8;
+                let (Some(attrib), Some(value)) = (u32_at(off), u32_at(off + 4)) else {
+                    break;
+                };
+                if attrib == GLX_RENDER_TYPE {
+                    render_type = value;
+                }
+            }
+            Some(CreateContextRequest {
+                context: u32_at(0)?,
+                config: ContextConfigRef::FbConfig(u32_at(4)?),
+                screen: u32_at(8)?,
+                render_type,
+                share_list: u32_at(12)?,
+                is_direct: *body.get(16)? != 0,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Encode a `QueryContext` reply (`xGLXQueryContextReply`,
+/// glxproto.h:829-841): the same header shape as `GetDrawableAttributes`
+/// — `n` at offset 8, 20 bytes of pad, then `n` (attribute, value)
+/// pairs.
+#[must_use]
+pub fn encode_query_context_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    attribs: &[(u32, u32)],
+) -> Vec<u8> {
+    encode_get_drawable_attributes_reply(byte_order, sequence, attribs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1358,120 @@ mod tests {
         assert_eq!(req.glx_pixmap, 0x5000_0001);
         // Too short → None
         assert_eq!(parse_create_glx_pixmap_with_config_sgix(&body[..16]), None);
+    }
+
+    /// Xorg lists `GLX_EXT_import_context` only when indirect GLX is enabled
+    /// (`+iglx`, glx/extension_string.c:183-184); Xvfb 21.1.24's default
+    /// server string lacks it (glxinfo, 2026-09-26). yserver has no
+    /// indirect GLX, and the extension only shares indirect contexts —
+    /// Mesa's glXImportContextEXT returns NULL for a direct one.
+    #[test]
+    fn import_context_not_advertised_without_indirect_glx() {
+        assert!(!SERVER_EXTENSIONS.contains("GLX_EXT_import_context"));
+    }
+
+    fn words(w: &[u32]) -> Vec<u8> {
+        w.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// `xGLXCreateGLXPixmapReq` (glxproto.h:301-310): screen, visual,
+    /// pixmap, glxpixmap after the 4-byte header; exactly 16 body bytes.
+    #[test]
+    fn parse_create_glx_pixmap_layout_and_exact_size() {
+        let body = words(&[0, 0x102, 0x2000, 0x2001]);
+        assert_eq!(
+            parse_create_glx_pixmap(&body),
+            Some(CreateGlxPixmapRequest {
+                screen: 0,
+                visual: 0x102,
+                pixmap: 0x2000,
+                glx_pixmap: 0x2001,
+            })
+        );
+        assert_eq!(parse_create_glx_pixmap(&body[..12]), None);
+        assert_eq!(parse_create_glx_pixmap(&words(&[0, 1, 2, 3, 4])), None);
+        assert_eq!(parse_single_xid(&words(&[0x42])), Some(0x42));
+        assert_eq!(parse_single_xid(&[]), None);
+        assert_eq!(parse_single_xid(&words(&[1, 2])), None);
+    }
+
+    /// Context-creation layouts per glxproto.h: `xGLXCreateContextReq`
+    /// (:197-208), `xGLXCreateNewContextReq` (:443-455) and
+    /// `xGLXCreateContextAttribsARBReq` (:1340-1353) — the three put the
+    /// share list and isDirect at different offsets, and only the ARB form
+    /// carries the render type as an attribute.
+    #[test]
+    fn parse_create_context_layouts() {
+        assert_eq!(
+            parse_create_context(CREATE_CONTEXT, &words(&[0xc1, 0x102, 0, 0xc0, 1])),
+            Some(CreateContextRequest {
+                context: 0xc1,
+                config: ContextConfigRef::Visual(0x102),
+                screen: 0,
+                render_type: GLX_RGBA_TYPE,
+                share_list: 0xc0,
+                is_direct: true,
+            })
+        );
+        assert_eq!(
+            parse_create_context(
+                CREATE_NEW_CONTEXT,
+                &words(&[0xc2, 0x103, 0, 0x8015, 0xc0, 0])
+            ),
+            Some(CreateContextRequest {
+                context: 0xc2,
+                config: ContextConfigRef::FbConfig(0x103),
+                screen: 0,
+                render_type: 0x8015,
+                share_list: 0xc0,
+                is_direct: false,
+            })
+        );
+        // numAttribs = 2: GL 3.0 major/minor, no render type → RGBA default.
+        let arb = words(&[0xc3, 0x101, 0, 0xc0, 1, 2, 0x2091, 3, 0x2092, 0]);
+        assert_eq!(
+            parse_create_context(CREATE_CONTEXT_ATTRIBS_ARB, &arb),
+            Some(CreateContextRequest {
+                context: 0xc3,
+                config: ContextConfigRef::FbConfig(0x101),
+                screen: 0,
+                render_type: GLX_RGBA_TYPE,
+                share_list: 0xc0,
+                is_direct: true,
+            })
+        );
+        let arb = words(&[0xc4, 0x101, 0, 0, 1, 2, 0x2091, 3, GLX_RENDER_TYPE, 0x8015]);
+        assert_eq!(
+            parse_create_context(CREATE_CONTEXT_ATTRIBS_ARB, &arb).map(|r| r.render_type),
+            Some(0x8015)
+        );
+        assert_eq!(parse_create_context(CREATE_CONTEXT, &[0; 16]), None);
+        assert_eq!(parse_create_context(CREATE_NEW_CONTEXT, &[0; 20]), None);
+        assert_eq!(
+            parse_create_context(CREATE_CONTEXT_ATTRIBS_ARB, &[0; 20]),
+            None
+        );
+        assert_eq!(parse_create_context(QUERY_CONTEXT, &[0; 32]), None);
+    }
+
+    /// `xGLXQueryContextReply` (glxproto.h:829-841): n at offset 8, pairs
+    /// after the 32-byte header, length = 2n.
+    #[test]
+    fn encode_query_context_reply_layout() {
+        let out = encode_query_context_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(5),
+            &[(GLX_SHARE_CONTEXT_EXT, 7), (GLX_RENDER_TYPE, GLX_RGBA_TYPE)],
+        );
+        assert_eq!(out.len(), 48);
+        assert_eq!(&out[0..4], &[1, 0, 5, 0]);
+        assert_eq!(read_u32_le(&out[4..]), 4);
+        assert_eq!(read_u32_le(&out[8..]), 2);
+        assert_eq!(&out[12..32], &[0; 20]);
+        assert_eq!(read_u32_le(&out[32..]), GLX_SHARE_CONTEXT_EXT);
+        assert_eq!(read_u32_le(&out[36..]), 7);
+        assert_eq!(read_u32_le(&out[40..]), GLX_RENDER_TYPE);
+        assert_eq!(read_u32_le(&out[44..]), GLX_RGBA_TYPE);
     }
 
     /// `SERVER_EXTENSIONS` must NOT yet contain `GLX_SGIX_fbconfig` —

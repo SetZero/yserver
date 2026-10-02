@@ -1,0 +1,274 @@
+==> monitors.log <==
+outputs: out1=Virtual-1 out2=Virtual-2 screen 2304x800
+--- initial
+  get_active=0 n=2 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=2 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=2 active=1 screens=[(0, 0, 1280, 800), (1280, 0, 1024, 768)]
+=== xrandr split Virtual-1 into left/right
+output list Virtual-1
+add monitor Virtual-1
+output name Virtual-1
+Monitors: 3
+ 0: left 1152/170x800/211+0+0  Virtual-1
+ 1: right 1152/170x800/211+1152+0
+ 2: +Virtual-2 1024/<mm>x768/<mm>+1280+0  Virtual-2
+Monitors: 3
+ 0: left 1152/170x800/211+0+0  Virtual-1
+ 1: right 1152/170x800/211+1152+0
+ 2: +Virtual-2 1024/<mm>x768/<mm>+1280+0  Virtual-2
+XINERAMA version 1.1 opcode: <op>
+  head #0: 1152x800 @ 0,0
+  head #1: 1152x800 @ 1152,0
+  head #2: 1024x768 @ 1280,0
+--- split
+  get_active=0 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+=== reuse the name left (new geometry)
+X Error of failed request:  BadValue (integer parameter out of range for operation)
+  Major opcode of failed request:  <op> (RANDR)
+  Minor opcode of failed request:  43 ()
+  Value in failed request:  <atom>
+  Serial number of failed request: <serial>
+  Current serial number in output stream: <serial>
+output list Virtual-1
+add monitor Virtual-1
+output name Virtual-1
+Monitors: 3
+ 0: left 1152/170x800/211+0+0  Virtual-1
+ 1: right 1152/170x800/211+1152+0
+ 2: +Virtual-2 1024/<mm>x768/<mm>+1280+0  Virtual-2
+--- reuse-left
+  get_active=0 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+=== '*' prefix through xrandr
+--- star
+  get_active=0 n=4 noutputs=2
+    star primary=1 automatic=0 100/20x100/20+10+10 outputs=[]
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=4 noutputs=2
+    star primary=1 automatic=0 100/20x100/20+10+10 outputs=[]
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=4 active=1 screens=[(10, 10, 100, 100), (0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+No monitor named '*star'
+--- star-deleted
+  get_active=0 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/170x800/211+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+=== primary: client monitor primary, Virtual-1 is the RANDR primary output
+del right: []
+set right: []
+--- right-primary
+  get_active=0 n=3 noutputs=2
+    right primary=1 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    right primary=1 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(1152, 0, 1152, 800), (0, 0, 1152, 800), (1280, 0, 1024, 768)]
+=== a second primary client monitor clears the first
+set extra: []
+--- extra-primary
+  get_active=0 n=4 noutputs=2
+    extra primary=1 automatic=0 10/100x10/50+0+0 outputs=[]
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=4 noutputs=2
+    extra primary=1 automatic=0 10/100x10/50+0+0 outputs=[]
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=4 active=1 screens=[(0, 0, 10, 10), (0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+del extra: []
+--- extra-deleted
+  get_active=0 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+=== zero-geometry, no outputs
+set empty: []
+--- empty
+  get_active=0 n=4 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    empty primary=0 automatic=0 0/100x0/50+0+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    left primary=0 automatic=0 1152/170x800/211+0+0 outputs=['Virtual-1']
+    right primary=0 automatic=0 1152/100x800/50+1152+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=4 active=1 screens=[(0, 0, 1152, 800), (1152, 0, 1152, 800), (1280, 0, 1024, 768)]
+=== automatic geometry from outputs
+output list Virtual-1
+add monitor Virtual-1
+output name Virtual-1
+Monitors: 2
+ 0: autogeo 1280/<mm>x800/<mm>+0+0  Virtual-1
+ 1: +Virtual-2 1024/<mm>x768/<mm>+1280+0  Virtual-2
+--- autogeo
+  get_active=0 n=2 noutputs=2
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=2 noutputs=2
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=2 active=1 screens=[(0, 0, 1280, 800), (1280, 0, 1024, 768)]
+=== two outputs: automatic geometry across both, then CRTC changes
+output list Virtual-1,Virtual-2
+add monitor Virtual-1
+output name Virtual-1
+add monitor Virtual-2
+output name Virtual-2
+--- both
+  get_active=0 n=2 noutputs=3
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+  get_active=1 n=2 noutputs=3
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+  xinerama count=2 active=1 screens=[(0, 0, 1280, 800), (0, 0, 2304, 800)]
+output list Virtual-2
+add monitor Virtual-2
+output name Virtual-2
+--- on2
+  get_active=0 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1280, 800), (0, 0, 2304, 800), (5, 5, 300, 200)]
+--- out2-off
+  get_active=0 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1280, 800), (0, 0, 1280, 800), (5, 5, 300, 200)]
+--- out2-back
+  get_active=0 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1280, 800), (0, 0, 2304, 800), (5, 5, 300, 200)]
+--- out2-primary
+  get_active=0 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=4
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    both primary=0 automatic=0 2304/0x800/0+0+0 outputs=['Virtual-1', 'Virtual-2']
+    on2 primary=0 automatic=0 300/80x200/50+5+5 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1280, 800), (0, 0, 2304, 800), (5, 5, 300, 200)]
+=== client primary on Virtual-1 while uncovered Virtual-2 is the primary output
+set cprim: []
+--- cprim
+  get_active=0 n=3 noutputs=3
+    cprim primary=1 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=1 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=3
+    cprim primary=1 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    autogeo primary=0 automatic=0 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=1 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1280, 800), (0, 0, 1280, 800), (1280, 0, 1024, 768)]
+del cprim: []
+--- all-deleted
+  get_active=0 n=2 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=2 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=2 active=1 screens=[(0, 0, 1280, 800), (1280, 0, 1024, 768)]
+=== errors
+  set name=output-name: [('BadValue', 2, 'output-atom', 43)]
+  set name=None: [('BadAtom', 5, 'root', 43)]
+  set name=0x7fffff: [('BadAtom', 5, 'root', 43)]
+  set bad window: [('BadWindow', 3, 'badwin', 43)]
+  set noutput=1 with 0 outputs: [('BadLength', 16, <stale>, 43)]
+  set noutput=0 with 1 output: [('BadLength', 16, <stale>, 43)]
+  set bogus output id: []
+  del never-set atom: [('BadValue', 2, 'name-atom', 44)]
+  del None: [('BadAtom', 5, '0x0', 44)]
+  del 0x7fffff: [('BadAtom', 5, '0x7fffff', 44)]
+  del bad window: [('BadWindow', 3, 'badwin', 44)]
+  del output-name: [('BadValue', 2, 'output-atom', 44)]
+  del bogusout: []
+--- after-errors
+  get_active=0 n=2 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=2 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=2 active=1 screens=[(0, 0, 1280, 800), (1280, 0, 1024, 768)]
+=== events
+  baseline: []
+  errs []
+  after SetMonitor: ['ConfigureNotify(win=root 2304x800)']
+  errs [('BadValue', 2)]
+  after SetMonitor reusing a monitor name: []
+  errs [('BadValue', 2)]
+  after failed SetMonitor: []
+  errs []
+  after DeleteMonitor: ['ConfigureNotify(win=root 2304x800)']
+  errs [('BadValue', 2)]
+  after failed DeleteMonitor: []
+=== persistence after the setting client exits
+--- persist
+  get_active=0 n=3 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    persist primary=0 automatic=0 50/10x50/10+0+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  get_active=1 n=3 noutputs=2
+    Virtual-1 primary=1 automatic=1 1280/<mm>x800/<mm>+0+0 outputs=['Virtual-1']
+    persist primary=0 automatic=0 50/10x50/10+0+0 outputs=[]
+    Virtual-2 primary=0 automatic=1 1024/<mm>x768/<mm>+1280+0 outputs=['Virtual-2']
+  xinerama count=3 active=1 screens=[(0, 0, 1280, 800), (0, 0, 50, 50), (1280, 0, 1024, 768)]
+=== end

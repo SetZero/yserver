@@ -66,7 +66,7 @@ impl BatchResource for RetiredDstReadbackImage {
             }
             vk.device.destroy_image_view(self.view, None);
             vk.device.destroy_image(self.image, None);
-            vk.device.free_memory(self.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, self.memory);
         }
     }
 }
@@ -325,7 +325,7 @@ impl Drop for DstReadback {
                 }
                 self.vk.device.destroy_image_view(img.view, None);
                 self.vk.device.destroy_image(img.image, None);
-                self.vk.device.free_memory(img.memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&self.vk.device, img.memory);
             }
         }
     }
@@ -376,7 +376,12 @@ fn allocate(
         .allocation_size(mem_reqs.size)
         .memory_type_index(mt)
         .push_next(&mut dedicated);
-    let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+    let memory = match crate::kms::vk::mem_accounting::allocate_memory(
+        &vk.device,
+        &alloc_info,
+        crate::kms::vk::mem_accounting::MemCategory::Scratch,
+        &mem_props,
+    ) {
         Ok(m) => m,
         Err(e) => {
             unsafe { vk.device.destroy_image(image, None) };
@@ -385,7 +390,7 @@ fn allocate(
     };
     if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
         unsafe {
-            vk.device.free_memory(memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
             vk.device.destroy_image(image, None);
         }
         return Err(e.into());
@@ -413,7 +418,7 @@ fn allocate(
         Ok(v) => v,
         Err(e) => {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e.into());

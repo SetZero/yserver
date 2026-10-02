@@ -68,6 +68,7 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
     atlas_extent: vk::Extent2D,
     pipeline: &TextPipeline,
     instance_buf: vk::Buffer,
+    instance_offset: vk::DeviceSize,
     instance_count: u32,
     foreground: [f32; 4],
 ) -> Result<(), vk::Result> {
@@ -83,6 +84,7 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
         atlas_extent,
         pipeline,
         instance_buf,
+        instance_offset,
         // Core text is never split into runs: one buffer, one draw,
         // from instance 0.
         0,
@@ -100,8 +102,10 @@ pub fn record_text_run<T: TextRunTarget + ?Sized>(
 /// fixes v1's latent `_clip unused` bug).
 ///
 /// `first_instance` / `instance_count` are the run's half-open range
-/// into `instance_buf`, which may hold the instances of several runs
-/// of the same request (see `RecordedCompositeGlyphs::first_instance`).
+/// into the instance data at `instance_offset` in `instance_buf`, which
+/// may hold the instances of several runs of the same request (see
+/// `RecordedCompositeGlyphs::first_instance`). `instance_offset` must be
+/// 4-byte aligned: every instance attribute has 32-bit components.
 ///
 /// If `scissors` is empty the function returns without recording
 /// any draw (matches "every clip rect culled" semantics in
@@ -113,6 +117,7 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
     atlas_extent: vk::Extent2D,
     pipeline: &TextPipeline,
     instance_buf: vk::Buffer,
+    instance_offset: vk::DeviceSize,
     first_instance: u32,
     instance_count: u32,
     foreground: [f32; 4],
@@ -199,7 +204,7 @@ pub fn record_text_run_scissored<T: TextRunTarget + ?Sized>(
         // across all scissor rects; the 4-vertex quad comes from
         // gl_VertexIndex. (No vk_count field for bind_vertex_buffers,
         // matching the trapezoid emit path.)
-        device.cmd_bind_vertex_buffers(cb, 0, &[instance_buf], &[0]);
+        device.cmd_bind_vertex_buffers(cb, 0, &[instance_buf], &[instance_offset]);
         crate::vk_count!(cmd_push_constants);
         device.cmd_push_constants(
             cb,

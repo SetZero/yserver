@@ -61,6 +61,47 @@ pub enum LogicFillError {
     SpirvUnaligned(usize),
 }
 
+/// Which channels a logic fill writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogicFillChannels {
+    /// All four — the depth-32 ARGB path.
+    All,
+    /// RGB only, preserving the destination's alpha byte — the
+    /// depth-24/8/1 (server-owned α) path.
+    Color,
+    /// Alpha only. With `GcFunction::Set` this stamps alpha = 0xFF and
+    /// leaves RGB untouched: how a depth-24 window's pixels are made
+    /// opaque inside the depth-32 ancestor backing it paints into, after
+    /// a raw copy has carried the source's undefined X byte across.
+    Alpha,
+}
+
+impl LogicFillChannels {
+    /// The pre-enum `opaque_alpha` flag: `true` preserves alpha.
+    #[must_use]
+    pub fn from_opaque_alpha(opaque_alpha: bool) -> Self {
+        if opaque_alpha { Self::Color } else { Self::All }
+    }
+
+    fn key(self) -> u8 {
+        match self {
+            Self::All => 0,
+            Self::Color => 1,
+            Self::Alpha => 2,
+        }
+    }
+
+    fn write_mask(self) -> vk::ColorComponentFlags {
+        match self {
+            Self::All => vk::ColorComponentFlags::RGBA,
+            Self::Color => {
+                vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
+            }
+            Self::Alpha => vk::ColorComponentFlags::A,
+        }
+    }
+}
+
 impl From<vk::Result> for LogicFillError {
     fn from(r: vk::Result) -> Self {
         LogicFillError::Vk(r)
@@ -70,7 +111,7 @@ impl From<vk::Result> for LogicFillError {
 pub struct LogicFillPipelineCache {
     vk: Arc<VkContext>,
     pipeline_layout: vk::PipelineLayout,
-    /// Keyed by `(function_key, opaque_alpha as u8)`. The
+    /// Keyed by `(function_key, LogicFillChannels::key)`. The
     /// `opaque_alpha=true` variant masks the alpha channel out of
     /// the color write so the LogicOp only affects RGB — preserves
     /// the L1 server-owned α invariant on depth-24 destinations.
@@ -113,9 +154,9 @@ impl LogicFillPipelineCache {
     pub fn get(
         &mut self,
         function: GcFunction,
-        opaque_alpha: bool,
+        channels: LogicFillChannels,
     ) -> Result<vk::Pipeline, LogicFillError> {
-        let key = (function_key(function), u8::from(opaque_alpha));
+        let key = (function_key(function), channels.key());
         if let Some(p) = self.pipelines.get(&key) {
             return Ok(*p);
         }
@@ -124,7 +165,7 @@ impl LogicFillPipelineCache {
             self.pipeline_layout,
             function,
             self.color_format,
-            opaque_alpha,
+            channels,
         )?;
         self.pipelines.insert(key, p);
         Ok(p)
@@ -193,7 +234,7 @@ fn build_pipeline(
     pipeline_layout: vk::PipelineLayout,
     function: GcFunction,
     color_format: vk::Format,
-    opaque_alpha: bool,
+    channels: LogicFillChannels,
 ) -> Result<vk::Pipeline, LogicFillError> {
     let device = &vk.device;
     let vert_module = create_shader_module(device, VERTEX_SPV)?;
@@ -231,15 +272,7 @@ fn build_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-    let write_mask = if opaque_alpha {
-        // Mask α out of the color write so the `VkLogicOp` only
-        // touches RGB. Preserves the destination's α byte (server-
-        // owned on depth-24, which by the L1 contract is already
-        // 0xFF on every painted pixel).
-        vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B
-    } else {
-        vk::ColorComponentFlags::RGBA
-    };
+    let write_mask = channels.write_mask();
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(false)
         .color_write_mask(write_mask)];

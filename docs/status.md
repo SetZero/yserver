@@ -33,6 +33,380 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-29 RANDR CRTC rotation and reflection (branch
+  `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
+  `rotations = 0x3f`; GetCrtcInfo and the three RANDR events carry the
+  rotation. The rotation is combined with the client transform as
+  `RRTransformCompute` (`randr::crtc_matrix`, fixed point) and runs through
+  #185's intermediate + scale pass (now a full affine pass, pixman-exact
+  nearest), SW cursor, confinement and framebuffer-space GetImage.
+  SetScreenSize's crop box swaps for 90/270 (measured). Client matrices stay
+  pure scale (D2). RANDR 1.0 (`xrandr -o`) is real now: GetScreenInfo lists
+  the first output's mode sizes and `RRVerticalRefresh` rates (rate lists
+  only for a ≥ 1.1 client, per-client QueryVersion kept), SetScreenConfig
+  follows `ProcRRSetScreenConfig` (size-by-version BadLength, statuses
+  InvalidConfigTime/InvalidTime/Failed, lastSetTime moves on every success,
+  other CRTCs off + screen resized when the size changes, CRTC at 0,0) over
+  the SetCrtcConfig path. vng A/B (`xrandr-rotate*.sh`,
+  `xrandr-orientation.sh`, `pointer-rotate*.sh`): geometry, root captures,
+  scanout-vs-matrix and pointer deltas identical to Xorg. Divergences: Xorg
+  keeps a rotated HW cursor for rotation without a client transform (we use
+  the SW cursor); SetScreenConfig reconfigures the first CRTC in place, so
+  Xorg's intermediate disable notifies (Screen/Crtc off/Output) are not
+  sent; an in-place rotation also sends OutputChangeNotify (Xorg: Crtc
+  only); yserver's initial `lastSetTime` is 1, not server start, so a stale
+  client time before the first set is not InvalidTime; screen mm at startup
+  round (339×212) where Xorg truncates (338×211). Two-output vng runs hang in
+  the known blocking DRM read when a CRTC is re-enabled (not this branch).
+  Spec addendum in the #185 design doc.
+
+- **2026-09-29 RANDR CRTC transforms / fractional scaling, partial (#185,
+  branch `feat/185-crtc-transform`):** `hasTransforms = 1`; SetCrtcTransform
+  / GetCrtcTransform with Xorg's validation order and pending→current on
+  SetCrtcConfig; footprint = `pixman_transform_bounds` port
+  (`randr/transform.rs`). Accepted: pure scale, filters nearest/bilinear
+  (+ fast/good/best); client matrices with translation, rotation, shear,
+  reflection or projection, and convolution → BadMatch on purpose (CRTC
+  rotation/reflection through SetCrtcConfig is supported, see the entry
+  above). A transformed output composites into a
+  footprint-sized intermediate, then a scale pass writes the mode-sized
+  scanout; direct scanout off and SW cursor on every output while any CRTC is
+  transformed; root reads in framebuffer space with the SW cursor removed
+  (save-under, as misprite). SetScreenSize's crop check stays on the
+  untransformed box (measured). Design + measurements:
+  `docs/superpowers/specs/2026-09-29-randr-crtc-transform-design.md`; probes
+  `tools/vng-scenarios/xrandr-scale*.sh`, `pointer-scale*.sh`. ★ RANDR
+  timestamps: muffin compares `timestamp` with its last SetCrtcConfig reply
+  (`meta-monitor-manager-xrandr.c:1427`) and rebuilds its config on a
+  mismatch (Cinnamon came back at 200%); only SetCrtcConfig/SetScreenConfig
+  may move `timestamp`, never SetScreenSize or output-property writes, as
+  Xorg. Also: GetMonitors/GetScreenResources replies now honour the client's
+  byte order. HW: silence, two 2560×1440, Cinnamon scale-down 100/125/150%
+  and back, screenshot without pointer.
+
+- **2026-09-28 RECORD 1.13, partial (#180, branch `feat/180-record`):**
+  advertised (major 154, first error 189) so python-xlib/pynput find it.
+  All eight requests with Xorg's validation order and GetContext range
+  rebuild (`core_loop/record.rs`, wire in `x11::record`). Recorded: core
+  device events KeyPress..MotionNotify (once, before grabs, not on replay;
+  autorepeat as a press with the sequence field set, no release),
+  ClientStarted (the setup bytes the client got) and ClientDied. Request,
+  reply, error and delivered-event ranges are accepted, validated, stored and
+  returned by GetContext but NOT recorded yet; XI1 device events neither. The
+  enabling client is suspended via `client_runnable`; a data connection whose
+  write fails (incl. `OUTBOUND_CAP`) stops recording and is disconnected from
+  the core loop (`take_failed_recorders`). Ground truth:
+  `tools/record-probe.c` on Xvfb 21.1.24; vng A/B
+  (`tools/vng-scenarios/record-host.sh yserver|xorg`) matches apart from the
+  items below. Deviations: one reply per element (Xorg batches), zeroed pads,
+  stale Xorg error values sent as 0, ClientDied rec seq is the 16-bit client
+  sequence, retained clients' contexts are freed, the nested backend records
+  host autorepeat as release+press pairs. Pre-existing, not RECORD: XTEST-held
+  keys do not autorepeat on yserver (XTEST bypasses the repeat timer). Xorg
+  and Xvfb 21.1 abort (`free(): invalid pointer`) in the server reset after
+  the probe's `basic` scenario, so run Xvfb with `-noreset`.
+- **2026-09-26 XI2 raw key events (#173, branch `fix/173-xi2-raw-keys`):**
+  `XI_RawKeyPress` / `XI_RawKeyRelease` were never generated (only the pointer
+  path had raw events), so global-hotkey clients selecting them on the root
+  saw nothing. Keys from the device path (libinput and XTEST) now produce them
+  the way Xorg's `GetKeyboardEvents` + `DeliverRawEvent` do: generated before
+  the #168 duplicate guard (a stray release still yields a raw release; a
+  press while down yields one only for an auto-repeating non-modifier),
+  sharing the device event's timestamp and delivered ahead of it; a slave form
+  (deviceid 5) then a master form (deviceid 3), both sourceid 5, 40 bytes with
+  an empty two-word valuator mask; the master form queued behind a frozen
+  keyboard and delivered on thaw; `FilterRawEvents` under a grab (XI 2.0
+  clients lose the master form, the owner of a root grab is skipped) and
+  `DeliverGrabbedEvent` for XI2 grabs (owner_events, then the grab's own mask
+  — `XIGrabDevice` / XI2 passive key grabs now keep their event mask). Software
+  auto-repeat arrives as `HostInputEvent::KeyRepeat` and makes none, like XKB
+  soft repeat. XIQueryVersion now records each client's version with Xorg's
+  storage rules (replies unchanged). Ground truth: Xvfb captures with
+  `tools/vng-scenarios/xi2-raw-keys-probe.c`; vng A/B
+  (`tools/vng-scenarios/xi2-raw-keys-host.sh yserver|xorg`) matches Xorg on
+  every raw event, XTEST and physical PS/2 keys, auto-repeat included; the
+  physical keyboard's slave id differs (Xorg 7, yserver 5). Divergences seen
+  in the same run, not addressed: the pointer raw path has no slave form and
+  no grab filtering; auto-repeat reaches XI2 clients as release+press pairs
+  instead of a press with `XIKeyRepeat`; `XIGrabDevice(keyboard)` sends the
+  grabber unselected XI_FocusIn/Out; XIQueryVersion replies do not follow
+  Xorg's stored version / BadValue.
+- **2026-09-26 GLX 1.0 pixmaps, QueryContext and IsDirect as Xorg answers
+  them (extension audit §6):** `CreateGLXPixmap` (13) and `DestroyGLXPixmap`
+  (15) used to fall into the `GLXBadRenderRequest` catch-all, so an app
+  calling `glXCreateGLXPixmap` (mesa sends 13 even for direct contexts) was
+  killed by Xlib's default error handler. Both now follow Xorg's GLXVND stub
+  and `DoCreateGLXPixmap` / `DoDestroyDrawable`: the same errors, bad values
+  and check order as Xvfb 21.1.24, and the same GLXPixmap record and export
+  ref as GLX 1.3 `CreatePixmap`, so TFP is untouched. A GLX 1.0 pixmap
+  reports `GLX_TEXTURE_RECTANGLE_EXT`, as on Xorg. `QueryContext` answers
+  Xorg's five attributes from a context record that now keeps the screen,
+  visual, FBConfig, render type, share list and isDirect (CreateNewContext
+  used to store the screen as the render type). `IsDirect` answers the
+  recorded flag, and both answer GLXBadContext for an XID that is not a
+  context. `GLX_EXT_import_context` is no longer advertised: Xorg lists it
+  only with `+iglx`, and yserver has no indirect GLX. Open, not changed
+  here: yserver accepts `isDirect=0` contexts, which Xorg refuses with
+  BadValue by default. It always reports `GLX_TEXTURE_2D_EXT` for windows,
+  pbuffers, SGIX pixmaps and NPOT GLX 1.3 pixmaps, where Xorg says
+  RECTANGLE; left alone because Compiz picks its TFP target from this
+  reply. A GLX pixmap whose X pixmap was freed reports 0×0, where Xorg
+  still reports the pixmap's size. GLX requests from big-endian clients are
+  not byte-swapped.
+- **2026-09-26 reply byte order: GE, MIT-SHM, XKB (extension audit §7/§8):**
+  GE QueryVersion writes major/minor in the client's byte order (a big-endian
+  client read 256.0). MIT-SHM QueryVersion reports the server's euid/egid and
+  pixmapFormat 0 without shared pixmaps, as `ProcShmQueryVersion`. XKB stays
+  little-endian only (request parsers and reply encoders), so big-endian
+  clients are now refused the Xorg way instead of getting little-endian
+  replies with a mangled sequence number: XkbUseExtension answers
+  supported=False in the client's byte order (byte-for-byte Xvfb's
+  big-endian refusal), and every other XKB request is then BadAccess, as for
+  any client that isn't XKB-initialised; Xlib and xkbcommon-x11 fall back to
+  the core keyboard protocol. The UseExtension reply is built by the core
+  loop; backend XKB replies get their sequence number in the client's byte
+  order. Still little-endian only for big-endian clients: the XI
+  XIQueryDevice/DeviceChanged class blocks and the XTEST/DPMS/
+  MIT-SCREEN-SAVER/X-Resource request parsers (audit §8 project).
+
+- **2026-09-26 XI 2.0 XIWarpPointer / XISetFocus / XIChangeHierarchy (extension
+  audit §1):** the three XI minors that fell into a silent catch-all now
+  answer as Xorg does, and the catch-all is gone — every minor outside 1..=61
+  is BadRequest, like `ProcIDispatch`. **XIWarpPointer** runs the core warp
+  path (now shared: dst-before-src BadWindow, Xorg's source-rectangle test
+  with inclusive edges and `PointInWindowIsVisible`, clamp to the screen,
+  barrier bypass, `warp_pointer_root` motion/crossing) for the master pointer
+  only (anything else BadDevice, errorValue = id); FP16.16 coordinates
+  truncate toward zero, and the XI source test keeps Xorg's slip (right edge
+  compared against 0). Core WarpPointer picked up the same Xorg-exact source
+  test (it had exclusive right/bottom edges and no visibility check).
+  **XISetFocus** on the master keyboard is core SetInputFocus with
+  RevertToParent (core + XI2 focus events); on the slave keyboard it sets
+  that device's own focus; pointers/unknown ids BadDevice (errorValue 0).
+  FollowKeyboard on the master keyboard → BadValue (Xvfb segfaults on it).
+  **XIGetFocus(3)** now reads the core focus; pointers are BadDevice.
+  **XIChangeHierarchy** walks the change list like Xorg (length checks,
+  unknown types skipped) and gives Xorg's answer for the fixed devices:
+  RemoveMaster/Attach/Detach → BadDevice/BadValue exactly as Xvfb answers for
+  its fixed XTest slaves at the same ids, AddMaster → BadAlloc; no change
+  succeeds, so no HierarchyChanged. **XISelectEvents** keeps bit 32 (masks
+  are u64), rejects bits past XI2LASTEVENT with BadValue(bit) before applying
+  anything; XIGetSelectedEvents writes masks in device order, trimmed to 1 or
+  2 words, header fields in client byte order. All expected values are Xvfb
+  21.1.24 captures. Known gaps kept: XI1 Set/GetDeviceFocus(3) still use
+  their own record rather than the core focus, and slave-keyboard focus
+  changes emit XI1 DeviceFocus events but no XI2 FocusIn/Out.
+- **2026-09-26 SYNC Await / AwaitFence suspend the client (extension audit
+  §2):** an Await or AwaitFence now suspends the client the way Xorg's
+  `IgnoreClient` does: the fair request queue treats a client with an entry
+  in `ServerState::sync_awaits` as not runnable (the same predicate that
+  parks a client behind an asynchronous CRTC configuration), so its later
+  requests stay queued in order while every other client runs, and the poll
+  does not spin on it. `core_loop/sync_await.rs` ports
+  `SyncAwaitEpilogue` / `SyncAwaitTriggerFired`: a trigger that already
+  holds fires at once; firing sends the CounterNotify events (threshold
+  rule, contiguous with descending `count`, `destroyed` for a destroyed
+  counter or fence) and resumes the client. Triggers: Set/ChangeCounter,
+  DestroyCounter and a counter owner's disconnect (which also deactivate
+  alarms on the counter with an AlarmNotify), TriggerFence, Present idle
+  fences, DestroyFence / fence owner disconnect, and the SERVERTIME and
+  IDLETIME system counters (post-poll evaluation plus a poll deadline;
+  SERVERTIME alarms now fire too). Await/AwaitFence/counter/fence requests
+  raise Xorg's errors (BadCounter, BadFence, BadAccess on system counters,
+  BadValue, BadMatch for resetting an untriggered fence); Initialize always
+  answers 3.1. Ground truth: Xvfb 21.1.24 with a two-connection xcb probe.
+  Deliberate deviation: a PositiveTransition on SERVERTIME fires when the
+  clock crosses it; Xorg never wakes for it (`SyncComputeBracketValues`
+  skips positive transitions on a never-decreasing counter), which only
+  ever hangs the client. DRI3 FenceFromFD xshmfences are read from their
+  shared memory, as Xorg's `misyncshm.c`: QueryFence, the AwaitFence
+  check and ResetFence's BadMatch test see the client's own
+  `xshmfence_trigger` / `xshmfence_reset`; ResetFence resets the memory and
+  DestroyFence (or the owner's disconnect) triggers it before unmapping.
+  As in Xorg nothing watches the memory, so an AwaitFence already suspended
+  on such a fence resumes on a TriggerFence request or the fence's
+  destruction, not on the client's in-memory trigger. ChangeAlarm / QueryAlarm / DestroyAlarm on a missing
+  alarm answer BadAlarm in Xorg's check order (size, lookup, then the value
+  list against the mask). Alarms keep Xorg's event-client list: any client
+  may ChangeAlarm (events selects AlarmNotify for it; the owner's flag is
+  separate) or DestroyAlarm; every AlarmNotify — fired, Inactive on counter
+  destruction, Destroyed on DestroyAlarm or the owner's disconnect — goes
+  to the owner (if selected) and each selecting client; CreateAlarm uses
+  Xorg's defaults and counterless alarms behave as Xorg's. CreateAlarm /
+  ChangeAlarm port `SyncChangeAlarmAttributes` + `SyncInitTrigger`: BadValue
+  (events, unknown mask bits, value type, INT64 overflow, test type),
+  BadMatch (delta sign, Relative without a counter), BadCounter, in Xorg's
+  order, with Xorg's partial effects on a failing ChangeAlarm (the event
+  selection, delta, value type, raw value and test type stick; a stored bad
+  test type is what QueryAlarm reports while the alarm keeps its old test).
+  One bound Xorg lacks: after that quirk a wrong-sign delta can reach the
+  re-arm loop, which on Xorg steps toward INT64 overflow (a hung Xvfb);
+  yserver caps it.
+
+- **2026-09-26 XFIXES 5.0 completed (extension audit §5):** QueryVersion
+  now follows Xorg's rule (the client's minor below 5.0, capped at 5.0,
+  sticky per-client major) and gates requests on the negotiated major
+  (`ProcXFixesDispatch`: before QueryVersion only QueryVersion is legal).
+  HideCursor/ShowCursor keep per-client counts; the KMS sprite blanks on the
+  first hide anywhere and returns on the last show or the hider's
+  disconnect (scene cursor entry dropped; under direct scanout the legacy
+  plane is detached in place). CursorNotify is sent per (client, window)
+  selection whenever the effective cursor switches, with the serial
+  GetCursorImage reports and the cursor's name; selections die with their
+  window. ChangeCursor/ChangeCursorByName retarget every XID of the old
+  cursor and the backend replaces window, root-default and grab uses
+  (names are kept per host cursor, so a freed-but-displayed cursor still
+  matches); ExpandRegion is real; GetCursorImageAndName reports the name;
+  SetCursorName/GetCursorName/ChangeCursor raise BadCursor. Ground truth:
+  Xvfb 21.1.24 captures with an xcb probe. Known limit: a hidden cursor
+  reads as a software/hidden cursor mode, so fullscreen direct scanout is
+  not entered while a client hides the cursor (content stays correct).
+
+- **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
+  branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports
+  `ProcXkbSetNames` / `_XkbSetNamesCheck` / `_XkbSetNames` literally (the
+  one-more-word bounds check before every component name, sent or not; atom
+  validation through the core loop's atom table → BadAtom; type, level,
+  indicator, vmod, group, key, alias and radio-group names; `XkbAllocNames`'
+  level-name arrays and counts) with Xorg's NamesNotify field slips
+  (`nLevelNames` = the request's nTypes, `changedVirtualMods` overwritten by
+  the group mask, `changedGroupNames` never set) and the IndicatorNames
+  ExtensionDeviceNotify. `set_geometry` ports `_CheckSetGeom`'s whole walk
+  (counted strings, colors/shapes/sections/rows/keys/doodads/overlays/aliases
+  with the allocators' name lookups) but keeps only the geometry **name**
+  (review decision): NamesNotify(GeometryName) when it changes, then
+  NewKeyboardNotify(Geometry); GetGeometry still answers found=False. The
+  keyboard LEDs now follow the indicators by index (as Xorg's drivers do), so
+  a renamed indicator keeps its LED; duplicate indicator names are written
+  apart in the cooking keymap. New `XkbNamesNotify` encoder; the probe's
+  GetNames parser had bits 9–12 permuted (harmless while all were present).
+  Goldens: all 5 steps of all 9 xkbcomp uploads on one server, 58 new
+  SetNames/SetGeometry vectors in `xorg-xkb-setmap-errors.txt` (incl. 3 odd
+  requests Xorg accepts), new `xorg-xkb-setnames.txt` (11 behaviour cases).
+  One captured deviation from the 21.1.22 source: Xvfb 21.1.24 refuses an
+  overlay row over row == num_rows. vng A/B `tools/vng-scenarios/
+  xkbcomp-upload.sh` (dump → upload → dump round trip, then swapped
+  <AC01>/<AC02> + Caps as Control, keys through Xlib-XKB and xkbcommon-x11)
+  matches Xorg. Open: HW gate.
+
+- **2026-09-26 XKB SetCompatMap + SetIndicatorMap on the model (#171 phase
+  4d, branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_compat` ports
+  `_XkbSetCompatMap` (dry-run checks, interprets stored from firstSI with the
+  broken `Any+AnyOfOrNone(all)->Private` interpret skipped and the tail closed
+  up, truncateSI, group compat maps, `recomputeActions` →
+  `XkbUpdateActions` over the whole range) and `ProcXkbSetIndicatorMap` /
+  `_XkbSetIndicatorMap` (which=0 no-op, `CHK_MASK_LEGAL`, the wire realMods
+  byte ignored) with `XkbApplyLedMapChanges`' lit-state rules; the keyboard
+  LEDs follow the new maps. New encoders `XkbCompatMapNotify` /
+  `XkbExtensionDeviceNotify`; IndicatorMapNotify / IndicatorStateNotify /
+  ExtensionDeviceNotify / CompatMapNotify filtered on the per-device
+  interests; `XkbSendNotification`'s CompatMapNotify for group compat masks a
+  virtual modifier change altered (also after ChangeKeyboardMapping /
+  SetModifierMapping). Fixes on the way: `XkbApplyCompatMapToKey` only sets
+  the type of an unmatched slot to NoAction (its bytes stay, as Xorg), and a
+  fresh cooking state computes its LEDs (xkbcommon leaves them off until the
+  first update). Goldens: steps 1–3 of all 9 xkbcomp uploads replayed on one
+  server (cumulative state + events), 13 new SetCompatMap/SetIndicatorMap
+  error vectors in `xorg-xkb-setmap-errors.txt`, new `xorg-xkb-setcompat.txt`
+  (13 behaviour cases), from `tools/xkb-mutation-goldens.sh errors|setcompat`.
+  SetNames / SetGeometry are still accepted no-ops (4e).
+
+- **2026-09-26 XKB SetMap on the model (#171 phase 4c, branch
+  `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_map` ports Xorg's
+  `ProcXkbSetMap` literally: `_XkbSetMapCheckLength`, `_XkbSetMapChecks`
+  (with its request-bounds checks and request edits) and `_XkbSetMap`
+  (`XkbChangeKeycodeRange` + NewKeyboardNotify, `SetKeyTypes` with
+  `XkbResizeKeyType`'s level names and key-width resizing, `SetKeySyms`,
+  `SetKeyActions`, `SetKeyBehaviors`, `SetVirtualMods`, the
+  explicit/modmap/vmodmap parts that set a range but no `changed` bit, the
+  RecomputeActions recompute), through the one mutation path. New
+  `Backend::xkb_set` returns the error or Xorg's ordered events; the core loop
+  now keeps Xorg's per-client XKB state (`core_loop::xkb_select`: the
+  UseExtension flag, a `ProcXkbSelectEvents` port into per-client map/NKN and
+  per-device detail masks), answers BadAccess to every XKB request but
+  UseExtension without it, filters MapNotify/NewKeyboardNotify/ControlsNotify/
+  IndicatorMapNotify on the detail masks and sends the legacy core
+  MappingNotify as `XkbSendLegacyMapNotify` (also for ChangeKeyboardMapping /
+  SetModifierMapping). Goldens: step 1 of all 9 recorded xkbcomp uploads
+  (state + events), new `xorg-xkb-setmap-errors.txt` (31 error vectors incl.
+  BadAccess) and `xorg-xkb-setmap-resize.txt` (key-width resizing), all from
+  `tools/xkb-mutation-goldens.sh errors|resize`. SetCompatMap / SetIndicatorMap
+  / SetNames / SetGeometry are still accepted no-ops (4d/4e).
+
+- **2026-09-26 the keyboard is an Xorg `XkbDesc` model (#171 phase 4a+4b,
+  branch `feat/171-phase4-xkbcomp`):** new `kms::xkb_desc` holds Xorg's
+  server-side keyboard description (types by index with vmods/preserve/level
+  names, per-key syms/acts/behaviors/explicit/modmap/vmodmap, vmods, compat
+  SIs, indicator maps, names, num_groups, per-key repeat) and is authoritative
+  for GetMap / GetCompatMap (real SIs) / GetNames / GetIndicatorMap /
+  GetNamedIndicator / GetControls numGroups / GetKbdByName's blocks /
+  GetKeyboardMapping / GetModifierMapping, all encoded as Xorg's
+  `ProcXkbGet*`/`XkbSend*` do (request parts and ranges, BadValue/BadMatch).
+  It is seeded from xkbcommon's compile on every by-name load (xkbcomp's type
+  normalisation incl. its `DeleteLevel1MapEntries` and preserve-vmod bugs,
+  libX11 `XConvertCase` for automatic types, identical-group collapse), then
+  Xorg's `XkbUpdateDescActions` over all keys. xkbcommon only cooks: the model
+  is written as V1 text (resolved real modifiers, per-key actions, explicit
+  types and repeat, no interprets) and compiled after every mutation
+  (`KmsCore::install_desc`). ChangeKeyboardMapping / SetModifierMapping are
+  literal ports on the model (`XkbUpdateKeyTypesFromCore`,
+  `XkbChangeTypesOfKey`, `XkbApplyCompatMapToKey`, `XkbUpdateDescActions`,
+  `XkbApplyVirtualModChanges`); `xkb_edit`, `xkb_derive`, the explicit-type /
+  stale-vmodmap side tables, the vmod pin re-install and the type probes are
+  gone. Goldens: `xorg-xkb-pristine.txt` (us/gb/de/us,ru, listed seed
+  tolerances), CKM/SMM goldens now compared exactly by type index incl.
+  explicit/behaviors/all actions, and a cooking gate (press/release on fresh
+  `xkb_state`s) after every golden mutation and on all 45 captured xkbcomp
+  states. SetMap & co (4c–4e) next.
+
+- **2026-09-25 SetModifierMapping edits the real keymap (#171 phase 3,
+  branch `feat/171-xkb-keymap-mutation`):** core `SetModifierMapping` and XI1
+  `SetDeviceModifierMapping` share Xorg's `change_modmap` in the core loop
+  (BadValue for a duplicate keycode, value 0, or a keycode < 8, the lowest;
+  MappingBusy when a new or old modifier key is held, Xorg's off-by-one on 255
+  kept), then `Backend::set_modifier_mapping` rewrites the keymap's
+  `modifier_map` and reinstalls it. `modifier_mapping_override` /
+  `xi1_modifier_map` stay only as the fallback for backends without an XKB
+  keymap. New `kms::xkb_derive` replays Xorg's `XkbApplyCompatMapToKey` /
+  `XkbUpdateDescActions` / `XkbApplyVirtualModChanges` over the V1 dump: GetMap
+  now sends Xorg's per-key modifier actions and vmodmap and the vmod table in
+  Xorg's indices (was guessed from keysym names; the IndicatorMap/NamedIndicator
+  vmod divergence is gone), and MapNotify carries Xorg's exact action / vmodmap /
+  type / vmod ranges, quirks included, for SetModifierMapping and now also
+  ChangeKeyboardMapping (was a fixed `0x0012` over the requested keys, wrong for
+  mixed keys). Xorg keeps the mapping of a vmod no key names any more; the edit
+  pins it in `virtual_modifiers` so cooking matches. The vmodmap Xorg keeps on
+  keys no interpret matches lives in `KmsCore::xkb_stale_vmodmap`.
+  IndicatorMapNotify encoder added. Per-key repeat is derived with Xorg's rule
+  (fixes the startup bits of `<ALT>`/`<META>`/`<SUPR>`, golden
+  `xorg-per-key-repeat.txt`); a keymap load keeps it, as Xorg's
+  `XkbCopyControls` does (captured). Found on the way: libxkbcommon ≥ 1.12
+  drops unused interprets/types from `get_as_string`, which lost e.g.
+  `Any+Exactly(Lock)` on every edit; edits now dump with
+  `XKB_KEYMAP_SERIALIZE_KEEP_UNUSED` (`xkb_edit::keymap_text`). GetModifierMapping
+  reports kpm 0 for an empty map. Golden: `xorg-xkb-set-modifier-mapping.txt`
+  (40 cases), test `xkb_view_of_set_modifier_mapping_matches_xorg`; caps-as-control
+  end to end in `xmodmap_caps_as_control_reaches_key_cooking`. Phase 4 (XKB
+  SetMap & co) next.
+
+- **2026-09-25 ChangeKeyboardMapping edits the real keymap (#171 phase 2,
+  branch `feat/171-xkb-keymap-mutation`):** core `ChangeKeyboardMapping` and
+  XI1 `ChangeDeviceKeyMapping` no longer write the `core_map_overrides`
+  overlay (removed). `xkb::core_mapping_change` (the `XkbUpdateKeyTypesFromCore`
+  port) yields each changed key's groups with explicit type names;
+  `xkb_edit::set_key` writes them into the live keymap text, which is
+  recompiled and installed. Cooking, XKB GetMap and GetKeyboardMapping read
+  the one keymap. Xorg's explicit-type mask lives in `KmsCore` (taken from
+  the loaded keymap, kept across edits); implicitly typed protected groups
+  get their type name from a probe compile. XKB `MapNotify(0x0012)` →
+  core `MappingNotify` → `ControlsNotify(PerKeyRepeat)` in Xorg's order; the
+  per-key repeat is seeded from the keymap at startup (Xorg
+  `XkbFinishInit`), re-derived for changed keys, and GetControls reports it.
+  The XKB keycode range is 8..=255 (was xkbcommon's lowest named keycode, 9).
+  Golden: `xorg-xkb-change-keyboard-mapping.txt`, test
+  `xkb_view_of_change_keyboard_mapping_matches_xorg`. Phase 3
+  (SetModifierMapping) next.
+
 - **2026-09-17 on-screen reads follow the directly-flipped buffer:** while a
   CRTC scans out a client buffer directly, the compositor's pool BOs are not
   painted at all (`retire_direct_output` calls `invalidate_all_scanout_damage`

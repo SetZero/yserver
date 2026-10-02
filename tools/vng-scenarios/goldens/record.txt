@@ -1,0 +1,377 @@
+==> record.log <==
+=== basic l 0
+QueryExtension RECORD present=1 events=0
+QueryVersion: 1.13 seq=2
+GetContext(created): GetContext enabled=0 ehdr=0 nclients=3 len=24 seq=4
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+GetContext(ctl joined): GetContext enabled=0 ehdr=0 nclients=4 len=32 seq=5
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Enable: StartOfData seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+ctl GetContext(enabled): GetContext enabled=1 ehdr=0 nclients=3 len=24 seq=3
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+ctl Enable(already enabled): BadMatch value=- minor=5 major=RECORD seq=4
+ctl RegisterClients(recorder): BadMatch value=- minor=2 major=RECORD seq=5
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=6 detail=0 seqfield=0 root=root event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=2 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=3 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=4 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=5 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x100 same=0
+rec: ClientStarted seq=6 ehdr=0 swapped=0 idbase=c3 recseq=0 setup success=1 major=11 len=<len> base=c3 same-bytes-as-client=yes
+rec: ClientDied seq=6 ehdr=0 swapped=0 idbase=c3 recseq=1 len=0
+rec: EndOfData seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+GetContext(disabled): GetContext enabled=0 ehdr=0 nclients=3 len=24 seq=7
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Disable(already disabled): ok (no error)
+GetContext(freed): BadContext value=rec+1 minor=4 major=RECORD seq=10
+Disable(freed): BadContext value=rec+1 minor=6 major=RECORD seq=11
+minor 9: BadRequest value=- minor=9 major=RECORD seq=12
+=== basic l 7
+QueryExtension RECORD present=1 events=0
+QueryVersion: 1.13 seq=2
+GetContext(created): GetContext enabled=0 ehdr=7 nclients=3 len=24 seq=4
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+GetContext(ctl joined): GetContext enabled=0 ehdr=7 nclients=4 len=32 seq=5
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Enable: StartOfData seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 len=0
+ctl GetContext(enabled): GetContext enabled=1 ehdr=7 nclients=3 len=24 seq=3
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+ctl Enable(already enabled): BadMatch value=- minor=5 major=RECORD seq=4
+ctl RegisterClients(recorder): BadMatch value=- minor=2 major=RECORD seq=5
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=6 detail=0 seqfield=0 root=root event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=2 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=3 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=4 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=5 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x100 same=0
+rec: ClientStarted seq=6 ehdr=7 swapped=0 idbase=c3 recseq=0 setup success=1 major=11 len=<len> base=c3 same-bytes-as-client=yes
+rec: ClientDied seq=6 ehdr=7 swapped=0 idbase=c3 recseq=1 len=1 seqheader=1
+rec: EndOfData seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 len=0
+GetContext(disabled): GetContext enabled=0 ehdr=7 nclients=3 len=24 seq=7
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Disable(already disabled): ok (no error)
+GetContext(freed): BadContext value=rec+1 minor=4 major=RECORD seq=10
+Disable(freed): BadContext value=rec+1 minor=6 major=RECORD seq=11
+minor 9: BadRequest value=- minor=9 major=RECORD seq=12
+=== basic B 7
+QueryExtension RECORD present=1 events=0
+QueryVersion: 1.13 seq=2
+GetContext(created): GetContext enabled=0 ehdr=7 nclients=3 len=24 seq=4
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+GetContext(ctl joined): GetContext enabled=0 ehdr=7 nclients=4 len=32 seq=5
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Enable: StartOfData seq=6 ehdr=7 swapped=1 idbase=0 recseq=0 len=0
+ctl GetContext(enabled): GetContext enabled=1 ehdr=7 nclients=3 len=24 seq=3
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+ctl Enable(already enabled): BadMatch value=- minor=5 major=RECORD seq=4
+ctl RegisterClients(recorder): BadMatch value=- minor=2 major=RECORD seq=5
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=6 detail=0 seqfield=0 root=root event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=2 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=3 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=4 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=7 swapped=0 idbase=0 recseq=0 +time ev type=5 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x100 same=0
+rec: ClientStarted seq=6 ehdr=7 swapped=1 idbase=c3 recseq=0 setup success=1 major=11 len=<len> base=c3 same-bytes-as-client=yes
+rec: ClientDied seq=6 ehdr=7 swapped=1 idbase=c3 recseq=1 len=1 seqheader=1
+rec: EndOfData seq=6 ehdr=7 swapped=1 idbase=0 recseq=0 len=0
+GetContext(disabled): GetContext enabled=0 ehdr=7 nclients=3 len=24 seq=7
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Disable(already disabled): ok (no error)
+GetContext(freed): BadContext value=rec+1 minor=4 major=RECORD seq=10
+Disable(freed): BadContext value=rec+1 minor=6 major=RECORD seq=11
+minor 9: BadRequest value=- minor=9 major=RECORD seq=12
+=== basic B 0
+QueryExtension RECORD present=1 events=0
+QueryVersion: 1.13 seq=2
+GetContext(created): GetContext enabled=0 ehdr=0 nclients=3 len=24 seq=4
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+GetContext(ctl joined): GetContext enabled=0 ehdr=0 nclients=4 len=32 seq=5
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Enable: StartOfData seq=6 ehdr=0 swapped=1 idbase=0 recseq=0 len=0
+ctl GetContext(enabled): GetContext enabled=1 ehdr=0 nclients=3 len=24 seq=3
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+ctl Enable(already enabled): BadMatch value=- minor=5 major=RECORD seq=4
+ctl RegisterClients(recorder): BadMatch value=- minor=2 major=RECORD seq=5
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=6 detail=0 seqfield=0 root=root event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=2 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=3 detail=38 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=4 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x0 same=0
+rec: FromServer seq=6 ehdr=0 swapped=0 idbase=0 recseq=0 ev type=5 detail=1 seqfield=0 root=0 event=0 child=0 rx=100 ry=50 ex=0 ey=0 state=0x100 same=0
+rec: ClientStarted seq=6 ehdr=0 swapped=1 idbase=c3 recseq=0 setup success=1 major=11 len=<len> base=c3 same-bytes-as-client=yes
+rec: ClientDied seq=6 ehdr=0 swapped=1 idbase=c3 recseq=1 len=0
+rec: EndOfData seq=6 ehdr=0 swapped=1 idbase=0 recseq=0 len=0
+GetContext(disabled): GetContext enabled=0 ehdr=0 nclients=3 len=24 seq=7
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+Disable(already disabled): ok (no error)
+GetContext(freed): BadContext value=rec+1 minor=4 major=RECORD seq=10
+Disable(freed): BadContext value=rec+1 minor=6 major=RECORD seq=11
+minor 9: BadRequest value=- minor=9 major=RECORD seq=12
+=== ranges l
+QueryExtension RECORD present=1 events=0
+GetContext(3 ranges, dup client): GetContext enabled=0 ehdr=0 nclients=2 len=28 seq=3
+  client=ctl nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+  client=spec2 nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+GetContext(+rcap by ctx xid): GetContext enabled=0 ehdr=1 nclients=3 len=36 seq=5
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+  client=ctl nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+  client=spec2 nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+GetContext(register 0 clients, ehdr 5): GetContext enabled=0 ehdr=5 nclients=3 len=36 seq=7
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+  client=ctl nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+  client=spec2 nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+GetContext(unregister future): GetContext enabled=0 ehdr=5 nclients=2 len=22 seq=9
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+  client=ctl nranges=2
+    range req=10-30 rep=1-2 extreq=150-150/3-9 extrep=140-141/1-2 dlv=12-14 dev=2-3 err=1-4 started=1 died=1
+    range req=100-127 rep=5-5 extreq=160-170/0-0 extrep=0-0/0-0 dlv=0-0 dev=5-6 err=0-0 started=0 died=0
+GetContext(unregister current): GetContext enabled=0 ehdr=5 nclients=0 len=0 seq=11
+GetContext(register ctl,all,rec): GetContext enabled=0 ehdr=0 nclients=4 len=32 seq=13
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=1 died=1
+GetContext(create current): GetContext enabled=0 ehdr=0 nclients=3 len=24 seq=15
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+GetContext(after ctl left): GetContext enabled=0 ehdr=0 nclients=2 len=16 seq=16
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+  client=rec nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=4-4 err=0-0 started=0 died=0
+=== errors l
+QueryExtension RECORD present=1 events=0
+Create short: BadLength value=- minor=1 major=RECORD seq=2
+Create foreign id: BadIDChoice value=ctl+1 minor=1 major=RECORD seq=3
+Create foreign id + ehdr 8: BadIDChoice value=ctl+1 minor=1 major=RECORD seq=4
+Create nClients=1000 no data: BadValue value=<stale> minor=1 major=RECORD seq=5
+Create nClients=300 short: BadValue value=<stale> minor=1 major=RECORD seq=6
+Create length mismatch: BadLength value=- minor=1 major=RECORD seq=7
+Create ehdr 8: BadValue value=0x8 minor=1 major=RECORD seq=8
+Create spec 4: BadMatch value=- minor=1 major=RECORD seq=9
+Create spec root: BadMatch value=- minor=1 major=RECORD seq=10
+Create spec ctl+77: BadValue value=ctl+77 minor=1 major=RECORD seq=11
+Create spec ctl window: ok (no error)
+Free: ok (no error)
+Create spec 0x1ff00000: BadMatch value=- minor=1 major=RECORD seq=14
+Create spec rec+5: BadValue value=rec+5 minor=1 major=RECORD seq=15
+Create range core req 5-4: BadValue value=0x5 minor=1 major=RECORD seq=16
+Create range core rep 9-8: BadValue value=0x9 minor=1 major=RECORD seq=17
+Create range ext req 100-100: BadValue value=0x64 minor=1 major=RECORD seq=18
+Create range ext req 200-150: BadValue value=0xc8 minor=1 major=RECORD seq=19
+Create range ext req minor 3-2: BadValue value=spec3 minor=1 major=RECORD seq=20
+Create range ext rep 128-127: BadValue value=0x80 minor=1 major=RECORD seq=21
+Create range ext rep minor 7-1: BadValue value=0x7 minor=1 major=RECORD seq=22
+Create range delivered 2-1: BadValue value=spec2 minor=1 major=RECORD seq=23
+Create range delivered 0-5: BadValue value=<stale> minor=1 major=RECORD seq=24
+Create range device 1-6: BadValue value=spec1 minor=1 major=RECORD seq=25
+Create range errors 9-3: BadValue value=0x9 minor=1 major=RECORD seq=26
+Create range clientStarted 2: BadValue value=spec2 minor=1 major=RECORD seq=27
+Create range clientDied 7: BadValue value=0x7 minor=1 major=RECORD seq=28
+Register bogus ctx: BadContext value=rec+32 minor=2 major=RECORD seq=29
+Create ok: ok (no error)
+Create dup id: BadIDChoice value=rec+1 minor=1 major=RECORD seq=31
+Unregister length mismatch: BadLength value=- minor=3 major=RECORD seq=32
+Unregister bogus ctx: BadContext value=rec+32 minor=3 major=RECORD seq=33
+Unregister spec 4: BadMatch value=- minor=3 major=RECORD seq=34
+Unregister spec ctl+77: BadValue value=ctl+77 minor=3 major=RECORD seq=35
+GetContext length 3: BadLength value=- minor=4 major=RECORD seq=36
+QueryVersion length 1: BadLength value=- minor=0 major=RECORD seq=37
+Enable length 1: BadLength value=- minor=5 major=RECORD seq=38
+Enable bogus: BadContext value=rec+32 minor=5 major=RECORD seq=39
+Free bogus: BadContext value=rec+32 minor=7 major=RECORD seq=40
+=== errors B
+QueryExtension RECORD present=1 events=0
+Create short: BadLength value=- minor=1 major=RECORD seq=2
+Create foreign id: BadIDChoice value=ctl+1 minor=1 major=RECORD seq=3
+Create foreign id + ehdr 8: BadIDChoice value=ctl+1 minor=1 major=RECORD seq=4
+Create nClients=1000 no data: BadLength value=- minor=1 major=RECORD seq=5
+Create nClients=300 short: BadLength value=- minor=1 major=RECORD seq=6
+Create length mismatch: BadLength value=- minor=1 major=RECORD seq=7
+Create ehdr 8: BadValue value=0x8 minor=1 major=RECORD seq=8
+Create spec 4: BadMatch value=- minor=1 major=RECORD seq=9
+Create spec root: BadMatch value=- minor=1 major=RECORD seq=10
+Create spec ctl+77: BadValue value=ctl+77 minor=1 major=RECORD seq=11
+Create spec ctl window: ok (no error)
+Free: ok (no error)
+Create spec 0x1ff00000: BadMatch value=- minor=1 major=RECORD seq=14
+Create spec rec+5: BadValue value=rec+5 minor=1 major=RECORD seq=15
+Create range core req 5-4: BadValue value=0x5 minor=1 major=RECORD seq=16
+Create range core rep 9-8: BadValue value=0x9 minor=1 major=RECORD seq=17
+Create range ext req 100-100: BadValue value=0x64 minor=1 major=RECORD seq=18
+Create range ext req 200-150: BadValue value=0xc8 minor=1 major=RECORD seq=19
+Create range ext req minor 3-2: BadValue value=spec3 minor=1 major=RECORD seq=20
+Create range ext rep 128-127: BadValue value=0x80 minor=1 major=RECORD seq=21
+Create range ext rep minor 7-1: BadValue value=0x7 minor=1 major=RECORD seq=22
+Create range delivered 2-1: BadValue value=spec2 minor=1 major=RECORD seq=23
+Create range delivered 0-5: BadValue value=<stale> minor=1 major=RECORD seq=24
+Create range device 1-6: BadValue value=spec1 minor=1 major=RECORD seq=25
+Create range errors 9-3: BadValue value=0x9 minor=1 major=RECORD seq=26
+Create range clientStarted 2: BadValue value=spec2 minor=1 major=RECORD seq=27
+Create range clientDied 7: BadValue value=0x7 minor=1 major=RECORD seq=28
+Register bogus ctx: BadContext value=rec+32 minor=2 major=RECORD seq=29
+Create ok: ok (no error)
+Create dup id: BadIDChoice value=rec+1 minor=1 major=RECORD seq=31
+Unregister length mismatch: BadLength value=- minor=3 major=RECORD seq=32
+Unregister bogus ctx: BadContext value=rec+32 minor=3 major=RECORD seq=33
+Unregister spec 4: BadMatch value=- minor=3 major=RECORD seq=34
+Unregister spec ctl+77: BadValue value=ctl+77 minor=3 major=RECORD seq=35
+GetContext length 3: BadLength value=- minor=4 major=RECORD seq=36
+QueryVersion length 1: BadLength value=- minor=0 major=RECORD seq=37
+Enable length 1: BadLength value=- minor=5 major=RECORD seq=38
+Enable bogus: BadContext value=rec+32 minor=5 major=RECORD seq=39
+Free bogus: BadContext value=rec+32 minor=7 major=RECORD seq=40
+=== free l
+QueryExtension RECORD present=1 events=0
+Enable: StartOfData seq=3 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+queued GetInputFocus while enabled: ok (no error)
+rec: EndOfData seq=3 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+queued GetInputFocus after free: reply len=32 seq=4
+ctl GetContext(freed): BadContext value=rec+1 minor=4 major=RECORD seq=5
+=== recdie l
+QueryExtension RECORD present=1 events=0
+ctl Create: ok (no error)
+Enable: StartOfData seq=2 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+ctl GetContext(enabled): GetContext enabled=1 ehdr=0 nclients=3 len=24 seq=5
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=0 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=0 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=0 died=1
+ctl GetContext(recorder gone): GetContext enabled=0 ehdr=0 nclients=3 len=24 seq=6
+  client=<xid> nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=0 died=1
+  client=spec2 nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=0 died=1
+  client=ctl nranges=1
+    range req=0-0 rep=0-0 extreq=0-0/0-0 extrep=0-0/0-0 dlv=0-0 dev=2-6 err=0-0 started=0 died=1
+=== ownerdie l
+QueryExtension RECORD present=1 events=0
+ctl Create: ok (no error)
+Enable: StartOfData seq=2 ehdr=4 swapped=0 idbase=0 recseq=0 len=0
+rec: ClientDied seq=2 ehdr=4 swapped=0 idbase=ctl recseq=3 len=1 seqheader=3
+rec: EndOfData seq=2 ehdr=4 swapped=0 idbase=0 recseq=0 len=0
+GetContext(owner gone): BadContext value=ctl+1 minor=4 major=RECORD seq=3
+=== repeat l
+QueryExtension RECORD present=1 events=0
+Enable: StartOfData seq=3 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+rec: ev type=2 detail=38 seqfield=0 state=0x0
+rec: ev type=3 detail=38 seqfield=0 state=0x0
+rec: EndOfData seq=3 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+=== end
+==> physical.log <==
+QueryExtension RECORD present=1 events=0
+Enable: StartOfData seq=3 ehdr=0 swapped=0 idbase=0 recseq=0 len=0
+rec: ev type=2 detail=38 seqfield=0 state=0x0
+rec: ev type=3 detail=38 seqfield=0 state=0x0
+rec: ev type=2 detail=56 seqfield=0 state=0x0
+rec: ev type=3 detail=56 seqfield=0 state=0x0
+rec: EndOfData seq=3 ehdr=0 swapped=0 idbase=0 recseq=0 len=0

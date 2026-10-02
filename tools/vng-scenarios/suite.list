@@ -1,0 +1,35 @@
+# Scenarios run by tools/vng-suite.sh, one per line: name, then key=value.
+#   guest=   script sourced in the guest; must write RESULT (pass | fail: <reason>)
+#   host=    optional host driver: host.sh <name> [vng-shot args...], exit 1 on failure
+#   outputs= heads (default 1)   timeout= seconds (default 300)
+#   gpu=     supported modes (default none,venus)   root-hook= see vng-shot --root-hook
+# A guest script with a `# golden:` line is also diffed against goldens/<name>.txt.
+#   golden=  stored (default: goldens/<name>.txt) | live (an Xorg run in the same guest, every time)
+# Paths are relative to this file.
+xterm                guest=xterm.sh                  timeout=300
+span-paint           guest=span-paint.sh             host=span-paint-host.sh             outputs=2 timeout=900
+# Venus root captures are corrupt under KVM (plan, open issues): pixel checks gate on none.
+rotate-scanout       guest=xrandr-rotate-scanout.sh  host=xrandr-rotate-scanout-host.sh  timeout=600 gpu=none
+pixel-oracle         guest=pixel-oracle.sh           host=pixel-oracle-host.sh           outputs=2 timeout=900 gpu=none
+xrandr-scale         guest=xrandr-scale.sh           timeout=300
+xrandr-scale-crop    guest=xrandr-scale-crop.sh      outputs=2 timeout=300
+xrandr-dpi           guest=xrandr-dpi.sh             timeout=300
+xrandr-monitors      guest=xrandr-monitors.sh        timeout=300
+xrandr-monitors-2    guest=xrandr-monitors.sh        outputs=2 timeout=400
+xrandr-rotate        guest=xrandr-rotate.sh          timeout=600 gpu=none
+xrandr-rotate-2      guest=xrandr-rotate.sh          outputs=2 timeout=600 gpu=none
+xrandr-orientation   guest=xrandr-orientation.sh     timeout=400
+xrandr-scale-cursor  guest=xrandr-scale-cursor.sh    timeout=300 gpu=none
+pointer-scale        guest=pointer-scale.sh          host=pointer-scale-host.sh          timeout=300
+pointer-rotate       guest=pointer-rotate.sh         host=pointer-rotate-host.sh         timeout=400
+record               guest=record.sh                 host=record-host.sh                 timeout=400
+xi2-raw-keys         guest=xi2-raw-keys.sh           host=xi2-raw-keys-host.sh           timeout=400
+xmodmap-caps-control guest=xmodmap-caps-control.sh   timeout=300
+xkbcomp-upload       guest=xkbcomp-upload.sh         timeout=300 golden=live
+root-bg-resize       guest=root-background-resize.sh timeout=300 gpu=none
+cow-empty-shape      guest=cow-empty-shape.sh        host=cow-empty-shape-host.sh        outputs=2 timeout=400 gpu=none
+composite-reredirect guest=composite-reredirect.sh   host=composite-reredirect-host.sh   timeout=400 gpu=none
+cow-input-shape      guest=cow-input-shape.sh        timeout=300
+crossing-tree        guest=crossing-tree.sh          timeout=300
+subwindow-move       guest=subwindow-move.sh         timeout=300
+child-clip           guest=child-clip.sh             timeout=300

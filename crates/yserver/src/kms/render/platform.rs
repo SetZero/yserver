@@ -125,10 +125,14 @@ struct FenceTicketInner {
     /// has released. `None` only for the test-only `for_tests_stub`
     /// constructor which has no real device available.
     vk: Option<Arc<VkContext>>,
-    /// Temporary SYNC_FD semaphore payloads waited by this submission.
-    /// Vulkan requires each semaphore handle to remain alive until the
-    /// queue operation retires, so these share the submission fence's
-    /// lifetime rather than being destroyed immediately after submit.
+    /// Semaphores this submission names that must outlive it: the
+    /// temporary SYNC_FD payloads it waits on, and the exportable
+    /// signal semaphore of a GLX-TFP write publish
+    /// ([`FenceTicket::retain_signal_semaphore`]). Vulkan requires each
+    /// handle to remain alive until the queue operation retires
+    /// (VUID-vkDestroySemaphore-semaphore-05149), so these share the
+    /// submission fence's lifetime rather than being destroyed
+    /// immediately after submit.
     imported_wait_semaphores: RefCell<Vec<vk::Semaphore>>,
 }
 
@@ -219,6 +223,17 @@ impl FenceTicket {
     /// lifetime via the pool.
     pub(crate) fn fence(&self) -> vk::Fence {
         self.inner.fence
+    }
+
+    /// Keep this submission's exported signal semaphore alive until its
+    /// fence retires. Called only after a successful `vkQueueSubmit2`,
+    /// once the semaphore's sync_file has been exported — destroying it
+    /// any earlier destroys a semaphore the queue is still using.
+    fn retain_signal_semaphore(&self, semaphore: vk::Semaphore) {
+        self.inner
+            .imported_wait_semaphores
+            .borrow_mut()
+            .push(semaphore);
     }
 
     /// Keep imported binary wait semaphores alive until this submission's
@@ -334,6 +349,13 @@ impl PresentCompletionSignal {
         self.semaphore
     }
 
+    /// Give up ownership of the semaphore without destroying it, for a
+    /// caller that ties its lifetime to a submission fence instead.
+    /// The `Arc<VkContext>` is still released normally.
+    fn into_raw(mut self) -> vk::Semaphore {
+        std::mem::replace(&mut self.semaphore, vk::Semaphore::null())
+    }
+
     pub(crate) fn export_sync_file_fd(&self) -> Result<Option<OwnedFd>, vk::Result> {
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)
@@ -355,6 +377,10 @@ fn create_present_completion_signal(
 
 impl Drop for PresentCompletionSignal {
     fn drop(&mut self) {
+        // Null after `into_raw`: ownership moved to a fence ticket.
+        if self.semaphore == vk::Semaphore::null() {
+            return;
+        }
         unsafe {
             self.vk.device.destroy_semaphore(self.semaphore, None);
         }
@@ -414,7 +440,7 @@ impl FencePool {
         }
     }
 
-    fn acquire(&self) -> Result<FenceTicket, vk::Result> {
+    pub(crate) fn acquire(&self) -> Result<FenceTicket, vk::Result> {
         let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f
@@ -2178,6 +2204,10 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),
+    /// client-owned like the logical screen size, so keyed by output and
+    /// kept across the `outputs` rebuilds of a topology change.
+    pub(crate) output_transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform>,
     /// Latest general kernel `(msc, ust_micros)` per device-qualified CRTC, updated
     /// by pageflip retirements and standalone sequence events. Drives
     /// `PresentNotifyMSC` (`present_get_ust_msc`): a compositor's
@@ -2235,12 +2265,19 @@ pub(crate) struct PlatformBackend {
     // skip Vk init (`for_tests`). Production `open_with_commit`
     // always returns `Some`. v2 has no pixman fallback.
     pub(crate) vk: Option<Arc<VkContext>>,
+    /// Command buffer + fence reused by scanout reads; allocated from
+    /// `ops_command_pool`, so declared before it to drop first.
+    pub(crate) scanout_readback_op: Option<crate::kms::vk::ops::ReusableOneShot>,
     /// Wrapped in `Option` for the same reason. Drop order
     /// matters: ops_command_pool BEFORE fence_pool BEFORE vk
     /// (handled by struct field order — Rust drops fields in
     /// declaration order).
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
+    /// Reused `HOST_CACHED`-preferred destination for synchronous scanout
+    /// reads (root GetImage / ShmGetImage). Idle between reads, which wait
+    /// on their own fence; grown on demand. Holds its own `Arc<VkContext>`.
+    pub(crate) scanout_readback: Option<crate::kms::render::engine::StagingBuffer>,
 
     /// Stage 3f.10: recycled `(image, view, memory)` triples for
     /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
@@ -2985,6 +3022,7 @@ impl PlatformBackend {
             outputs,
             fb_w,
             fb_h,
+            output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
@@ -2997,8 +3035,10 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             vk: Some(vk),
+            scanout_readback_op: None,
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
+            scanout_readback: None,
             pixmap_pool,
             copy_vk_contexts,
             scanout_pools,
@@ -3100,6 +3140,7 @@ impl PlatformBackend {
             )],
             fb_w: 800,
             fb_h: 600,
+            output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
@@ -3112,8 +3153,10 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             vk: None,
+            scanout_readback_op: None,
             ops_command_pool: None,
             fence_pool: None,
+            scanout_readback: None,
             pixmap_pool: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
@@ -3815,6 +3858,31 @@ impl PlatformBackend {
 
     pub(crate) fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
         self.input_ctx.take()
+    }
+
+    /// The current CRTC transform of live output `idx`, `None` at identity.
+    pub(crate) fn output_transform(
+        &self,
+        idx: usize,
+    ) -> Option<&yserver_core::randr::CrtcTransform> {
+        self.output_transforms.get(&self.outputs.get(idx)?.key)
+    }
+
+    /// Whether any live output scans out through a transform.
+    pub(crate) fn any_output_transformed(&self) -> bool {
+        (0..self.outputs.len()).any(|idx| self.output_transform(idx).is_some())
+    }
+
+    /// The root rectangle live output `idx` shows: its mode at the CRTC
+    /// origin, or the transformed footprint there (spec D3).
+    pub(crate) fn output_root_rect(&self, idx: usize) -> (i32, i32, u32, u32) {
+        let layout = &self.outputs[idx];
+        let (w, h) = self
+            .output_transform(idx)
+            .map_or((layout.width, layout.height), |t| {
+                t.footprint(layout.width, layout.height)
+            });
+        (layout.x, layout.y, u32::from(w), u32::from(h))
     }
 
     pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {
@@ -4525,6 +4593,22 @@ impl PlatformBackend {
         height: u16,
         depth: u8,
     ) -> Result<Storage, vk::Result> {
+        self.allocate_drawable_storage_as(
+            width,
+            height,
+            depth,
+            crate::kms::vk::mem_accounting::MemCategory::Pixmap,
+        )
+    }
+
+    /// [`Self::allocate_drawable_storage`], accounting the memory under `category`.
+    pub(crate) fn allocate_drawable_storage_as(
+        &self,
+        width: u16,
+        height: u16,
+        depth: u8,
+        category: crate::kms::vk::mem_accounting::MemCategory,
+    ) -> Result<Storage, vk::Result> {
         let vk = self
             .vk
             .as_ref()
@@ -4568,6 +4652,7 @@ impl PlatformBackend {
                         return Err(e);
                     }
                 };
+                crate::kms::vk::mem_accounting::recategorise(pooled.memory, category);
                 return Ok(Storage::from_pooled(
                     pooled,
                     sample_view,
@@ -4619,7 +4704,17 @@ impl PlatformBackend {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mt);
-        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+        // Pool-sized storage only reaches here on a pool miss; the split
+        // tells `vram churn` which side of `MAX_POOLED_DIM` allocates.
+        let pool_sized = extent.width <= crate::kms::vk::pixmap_pool::MAX_POOLED_DIM
+            && extent.height <= crate::kms::vk::pixmap_pool::MAX_POOLED_DIM;
+        let memory = match crate::kms::vk::mem_accounting::allocate_storage_memory(
+            &vk.device,
+            &alloc_info,
+            category,
+            pool_sized,
+            &mem_props,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 unsafe { vk.device.destroy_image(image, None) };
@@ -4628,7 +4723,7 @@ impl PlatformBackend {
         };
         if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                vk.device.free_memory(memory, None);
+                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                 vk.device.destroy_image(image, None);
             }
             return Err(e);
@@ -4648,7 +4743,7 @@ impl PlatformBackend {
             Ok(v) => v,
             Err(e) => {
                 unsafe {
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e);
@@ -4667,7 +4762,7 @@ impl PlatformBackend {
             Err(e) => {
                 unsafe {
                     vk.device.destroy_image_view(view, None);
-                    vk.device.free_memory(memory, None);
+                    crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
                     vk.device.destroy_image(image, None);
                 }
                 return Err(e);
@@ -4965,8 +5060,14 @@ impl PlatformBackend {
                 // GLX-TFP write→read publish: export the submit's
                 // completion sync_file and import it onto every exported
                 // dma-buf the group wrote.
-                if let Some(sig) = export_signal.as_ref() {
-                    Self::publish_export_write_fences(sig, exported_writes);
+                if let Some(sig) = export_signal {
+                    Self::publish_export_write_fences(&sig, exported_writes);
+                    // The semaphore is a signal operation of the submit
+                    // just queued. Dropping it here — as this did before —
+                    // destroyed it while the queue was still using it,
+                    // once per write to any exported pixmap. The ticket
+                    // destroys it when the fence retires.
+                    ticket.retain_signal_semaphore(sig.into_raw());
                 }
                 let outcome = FlushOutcome {
                     flushed_entries: n,

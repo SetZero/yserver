@@ -7,7 +7,7 @@
 # own stacking order and on nothing reparenting the tree.
 set -u
 src=$(dirname "$0")/../redirect-subtree-probe.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/redirect-subtree-probe.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/redirect-subtree-probe.c
 
 cc -O1 -o redirect-subtree-probe "$src" -lX11 -lXcomposite > cc.log 2>&1 || {
     echo "redirect-subtree: compile failed" >&2

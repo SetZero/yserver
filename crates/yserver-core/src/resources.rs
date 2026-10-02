@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use yserver_protocol::x11::{
     AtomId, ChangeWindowAttributesRequest, ClientId, ClipRectangles, ConfigureWindowRequest,
@@ -22,6 +22,8 @@ pub const SERVER_OWNER: ClientId = ClientId(0);
 pub struct ClientRemovedResources {
     pub closed_fonts: Vec<u32>,
     pub freed_pixmaps: Vec<u32>,
+    /// One host backing per removed `NameWindowPixmap` name, NOT deduplicated: each owns a ref.
+    pub freed_names: Vec<crate::backend::PixmapHandle>,
     pub freed_pictures: Vec<(u32, Option<u32>)>,
     pub freed_glyphsets: Vec<u32>,
     pub freed_cursors: Vec<u32>,
@@ -142,7 +144,37 @@ pub struct ExposedRect {
     pub height: u16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Windows whose viewability changed in one operation: `became_viewable` in
+/// pre-order (parent before child), `became_unviewable` in post-order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ViewabilityDelta {
+    pub became_viewable: Vec<ResourceId>,
+    pub became_unviewable: Vec<ResourceId>,
+}
+
+impl ViewabilityDelta {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.became_viewable.is_empty() && self.became_unviewable.is_empty()
+    }
+
+    /// Appends a disjoint sibling subtree's delta, keeping both orders.
+    pub fn extend(&mut self, other: ViewabilityDelta) {
+        self.became_viewable.extend(other.became_viewable);
+        self.became_unviewable.extend(other.became_unviewable);
+    }
+}
+
+/// Result of a map/unmap: `mapping_changed` is the Unmapped<->mapped flip
+/// that drives MapNotify/UnmapNotify, independent of the viewability delta.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[must_use]
+pub struct MapTransition {
+    pub mapping_changed: bool,
+    pub delta: ViewabilityDelta,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReparentResult {
     pub window: ResourceId,
     pub old_parent: ResourceId,
@@ -153,6 +185,7 @@ pub struct ReparentResult {
     pub host_xid: Option<crate::backend::WindowHandle>,
     pub old_map_state: MapState,
     pub new_map_state: MapState,
+    pub delta: ViewabilityDelta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,7 +210,9 @@ pub enum PictureKind {
 #[derive(Debug)]
 pub struct PictureState {
     pub client: ClientId,
-    pub host_picture_xid: crate::backend::PictureHandle,
+    /// `None` when the backend could not back an otherwise valid Picture: it still
+    /// exists at protocol level, and every op on it is a no-op.
+    pub host_picture_xid: Option<crate::backend::PictureHandle>,
     pub host_owned_pixmap: Option<crate::backend::PixmapHandle>,
     pub kind: PictureKind,
     /// For `PictureKind::Drawable` pictures: the client-visible XID of
@@ -185,6 +220,11 @@ pub struct PictureState {
     /// accumulate damage on the right drawable after painting.
     /// `None` for `Sourceless` pictures (SolidFill / gradient).
     pub drawable: Option<ResourceId>,
+    /// The window this Picture was created on (`None` for pixmap and
+    /// sourceless Pictures). Destroying that window frees the Picture,
+    /// whichever client owns it (Xorg `PictureDestroyWindow`,
+    /// `render/picture.c:67`).
+    pub window: Option<ResourceId>,
 }
 
 #[derive(Debug)]
@@ -200,6 +240,12 @@ pub struct ResourceTable {
     gcs: HashMap<u32, Gc>,
     fonts: HashMap<u32, Font>,
     cursors: HashMap<u32, Cursor>,
+    /// XFIXES cursor names keyed by host cursor handle. In Xorg the name
+    /// lives on the cursor object, so it outlives the client's cursor XID
+    /// while a window still displays the cursor (`XFreeCursor` right after
+    /// `XDefineCursor` is the common Xlib idiom) — `CursorNotify` and
+    /// `ChangeCursorByName` must still see it.
+    cursor_host_names: HashMap<u32, yserver_protocol::x11::AtomId>,
     pub pictures: HashMap<u32, PictureState>,
     pub glyphsets: HashMap<u32, GlyphSetState>,
     host_glyphset_refcounts: HashMap<u32, usize>,
@@ -209,6 +255,8 @@ pub struct ResourceTable {
     /// backend, but the XIDs belong to the ordinary global X resource
     /// namespace and obey close-down retention semantics.
     dri3_syncobjs: HashMap<u32, ClientId>,
+    /// Backings whose last freed name's alias ref waits for a background/border/GC release site.
+    deferred_name_refs: HashSet<u32>,
 }
 
 impl Default for ResourceTable {
@@ -335,12 +383,14 @@ impl Default for ResourceTable {
             gcs: HashMap::new(),
             fonts: HashMap::new(),
             cursors: HashMap::new(),
+            cursor_host_names: HashMap::new(),
             pictures: HashMap::new(),
             glyphsets: HashMap::new(),
             host_glyphset_refcounts: HashMap::new(),
             visuals,
             colormaps,
             dri3_syncobjs: HashMap::new(),
+            deferred_name_refs: HashSet::new(),
         }
     }
 }
@@ -1253,16 +1303,7 @@ impl ResourceTable {
         false
     }
 
-    #[must_use]
-    pub fn map_window(&mut self, id: ResourceId) -> bool {
-        self.map_window_with_promoted_descendants(id).0
-    }
-
-    #[must_use]
-    pub fn map_window_with_promoted_descendants(
-        &mut self,
-        id: ResourceId,
-    ) -> (bool, Vec<ResourceId>) {
+    pub fn map_window(&mut self, id: ResourceId) -> MapTransition {
         // A window is Viewable only if it is mapped AND all ancestors
         // up to the root are also mapped (Viewable). If any ancestor
         // is not Viewable, the window becomes Unviewable instead.
@@ -1275,18 +1316,24 @@ impl ResourceTable {
                 .is_some_and(|p| p.map_state == MapState::Viewable),
             None => false,
         };
+        let mut delta = ViewabilityDelta::default();
         let was_unmapped = if let Some(window) = self.windows.get_mut(&id.0) {
             let was_unmapped = window.map_state == MapState::Unmapped;
+            let was_viewable = window.map_state == MapState::Viewable;
             window.map_state = if parent_viewable {
                 MapState::Viewable
             } else {
                 MapState::Unviewable
             };
+            if !was_viewable && parent_viewable {
+                delta.became_viewable.push(id);
+            } else if was_viewable && !parent_viewable {
+                delta.became_unviewable.push(id);
+            }
             was_unmapped
         } else {
-            return (false, Vec::new());
+            return MapTransition::default();
         };
-        let mut promoted_descendants = Vec::new();
         // If we just transitioned to Viewable, promote any descendant
         // that was Unviewable (i.e. mapped before its ancestor became
         // viewable — e.g. xclock's child window after the WM frame
@@ -1294,9 +1341,12 @@ impl ResourceTable {
         // staying Unviewable; mapping the parent must propagate down or
         // Expose-fanout silently skips it because of the Viewable filter).
         if parent_viewable {
-            self.promote_unviewable_descendants(id, &mut promoted_descendants);
+            self.promote_unviewable_descendants(id, &mut delta.became_viewable);
         }
-        (was_unmapped, promoted_descendants)
+        MapTransition {
+            mapping_changed: was_unmapped,
+            delta,
+        }
     }
 
     fn promote_unviewable_descendants(
@@ -1353,7 +1403,6 @@ impl ResourceTable {
             let demoted = if let Some(w) = self.windows.get_mut(&child.0) {
                 if w.map_state == MapState::Viewable {
                     w.map_state = MapState::Unviewable;
-                    demoted_descendants.push(child);
                     true
                 } else {
                     false
@@ -1363,22 +1412,23 @@ impl ResourceTable {
             };
             // Recurse only through descendants that were on-screen (now
             // demoted, or already Unviewable under us); Unmapped subtrees
-            // stay Unmapped and halt the cascade.
+            // stay Unmapped and halt the cascade. Post-order: child first.
             if demoted {
                 self.demote_viewable_descendants(child, demoted_descendants);
+                demoted_descendants.push(child);
             }
         }
     }
 
-    #[must_use]
-    pub fn unmap_window(&mut self, id: ResourceId) -> bool {
+    pub fn unmap_window(&mut self, id: ResourceId) -> MapTransition {
         if id == ROOT_WINDOW {
-            return false;
+            return MapTransition::default();
         }
         let Some(window) = self.windows.get_mut(&id.0) else {
-            return false;
+            return MapTransition::default();
         };
         let was_mapped = window.map_state != MapState::Unmapped;
+        let was_viewable = window.map_state == MapState::Viewable;
         window.map_state = MapState::Unmapped;
         // Mirror of `promote_unviewable_descendants`: X11 defines
         // Viewable as "mapped AND every ancestor mapped", so unmapping
@@ -1391,13 +1441,17 @@ impl ResourceTable {
         // every viewability-gated path (damage in particular) treated
         // that subtree as on-screen, so the compositor kept compositing
         // a window that had left the workspace.
-        // Reuses the helper the reparent path already relies on. X11 sends
-        // NO UnmapNotify for descendants of an unmapped window, so the
-        // demoted list is intentionally discarded — the state change is the
-        // whole point, not an event fanout.
-        let mut demoted = Vec::new();
-        self.demote_viewable_descendants(id, &mut demoted);
-        was_mapped
+        // X11 sends NO UnmapNotify for descendants of an unmapped window;
+        // the demoted list is the viewability delta, not an event fanout.
+        let mut delta = ViewabilityDelta::default();
+        self.demote_viewable_descendants(id, &mut delta.became_unviewable);
+        if was_viewable {
+            delta.became_unviewable.push(id);
+        }
+        MapTransition {
+            mapping_changed: was_mapped,
+            delta,
+        }
     }
 
     pub fn window(&self, id: ResourceId) -> Option<&Window> {
@@ -1406,6 +1460,14 @@ impl ResourceTable {
 
     pub fn window_mut(&mut self, id: ResourceId) -> Option<&mut Window> {
         self.windows.get_mut(&id.0)
+    }
+
+    pub fn windows_iter(&self) -> impl Iterator<Item = &Window> {
+        self.windows.values()
+    }
+
+    pub fn pixmaps_iter(&self) -> impl Iterator<Item = &Pixmap> {
+        self.pixmaps.values()
     }
 
     pub fn children(&self, parent: ResourceId) -> &[ResourceId] {
@@ -1422,36 +1484,11 @@ impl ResourceTable {
     /// On `ROOT_WINDOW`, the Composite Overlay Window (COW) is excluded from
     /// the rotation — it stays pinned at the top, mirroring Xorg's
     /// `CompositeRealChildHead` semantics.
-    pub fn circulate_window(&mut self, container: ResourceId, direction: u8) -> Option<ResourceId> {
-        let parent = self.windows.get_mut(&container.0)?;
-        // Slice end: exclude COW when operating on root. Anywhere else this
-        // is just `children.len()`.
-        let top = if container == ROOT_WINDOW {
-            cow_aware_top_index(parent)
-        } else {
-            parent.children.len()
-        };
-        let kids = &mut parent.children;
-        if top < 2 {
-            return None;
-        }
-        match direction {
-            0 => {
-                let last = kids.remove(top - 1);
-                kids.insert(0, last);
-                Some(last)
-            }
-            1 => {
-                let first = kids.remove(0);
-                // `top` was the slice end before the remove; after removing
-                // index 0 the slice end shifts left by one, so insert at
-                // `top - 1` to land just below COW (or at the very end when
-                // COW is absent).
-                kids.insert(top - 1, first);
-                Some(first)
-            }
-            _ => None,
-        }
+    /// Restack `child` to the top of its siblings (below the overlay window
+    /// on the root) or to the bottom — the move CirculateWindow makes once
+    /// `ServerState::circulate_candidate` picked the child.
+    pub fn circulate_child(&mut self, child: ResourceId, to_top: bool) {
+        self.restack_window(child, None, Some(if to_top { 0 } else { 1 }));
     }
 
     pub fn mapped_children_bottom_to_top(&self, parent: ResourceId) -> Option<Vec<ResourceId>> {
@@ -1684,22 +1721,39 @@ impl ResourceTable {
         }
     }
 
-    pub fn reparent_window(
-        &mut self,
+    /// The errors [`Self::reparent_window`] would return, without reparenting.
+    ///
+    /// # Errors
+    ///
+    /// `BadMatch` for the root, the window itself or one of its inferiors as
+    /// the new parent; `BadWindow` for an unknown window or parent.
+    pub fn check_reparent_window(
+        &self,
         request: ReparentWindowRequest,
-    ) -> Result<ReparentResult, ReparentWindowError> {
+    ) -> Result<(), ReparentWindowError> {
         if request.window == ROOT_WINDOW
             || request.window == request.parent
             || self.is_descendant_of(request.parent, request.window)
         {
             return Err(ReparentWindowError::BadMatch);
         }
-        let Some(window) = self.windows.get(&request.window.0) else {
-            return Err(ReparentWindowError::BadWindow);
-        };
-        if !self.windows.contains_key(&request.parent.0) {
+        if !self.windows.contains_key(&request.window.0)
+            || !self.windows.contains_key(&request.parent.0)
+        {
             return Err(ReparentWindowError::BadWindow);
         }
+        Ok(())
+    }
+
+    pub fn reparent_window(
+        &mut self,
+        request: ReparentWindowRequest,
+    ) -> Result<ReparentResult, ReparentWindowError> {
+        self.check_reparent_window(request)?;
+        let window = self
+            .windows
+            .get(&request.window.0)
+            .expect("window validated above");
 
         let old_parent = window.parent;
         let override_redirect = window.override_redirect;
@@ -1749,12 +1803,19 @@ impl ResourceTable {
             };
         }
         let new_map_state = window.map_state;
+        let was_viewable = old_map_state == MapState::Viewable;
+        let mut delta = ViewabilityDelta::default();
         if propagate {
-            let mut scratch = Vec::new();
             if parent_viewable {
-                self.promote_unviewable_descendants(request.window, &mut scratch);
+                if !was_viewable {
+                    delta.became_viewable.push(request.window);
+                }
+                self.promote_unviewable_descendants(request.window, &mut delta.became_viewable);
             } else {
-                self.demote_viewable_descendants(request.window, &mut scratch);
+                self.demote_viewable_descendants(request.window, &mut delta.became_unviewable);
+                if was_viewable {
+                    delta.became_unviewable.push(request.window);
+                }
             }
         }
         // Phase 3.6 Step 4a forwards XReparentWindow to the host, so
@@ -1773,6 +1834,7 @@ impl ResourceTable {
             host_xid,
             old_map_state,
             new_map_state,
+            delta,
         })
     }
 
@@ -1802,12 +1864,56 @@ impl ResourceTable {
                 depth: request.depth,
                 owner,
                 host_xid: None,
+                composite_name: false,
             },
         );
     }
 
+    /// Mark `id` as a `NameWindowPixmap` name: it owns one alias ref on its host backing.
+    pub fn mark_pixmap_composite_name(&mut self, id: ResourceId) {
+        if let Some(p) = self.pixmaps.get_mut(&id.0) {
+            p.composite_name = true;
+        }
+    }
+
     pub fn free_pixmap(&mut self, id: ResourceId) -> Option<Pixmap> {
-        self.pixmaps.remove(&id.0)
+        let removed = self.pixmaps.remove(&id.0)?;
+        if removed.composite_name {
+            self.forget_composite_names(&[id]);
+        }
+        Some(removed)
+    }
+
+    /// Drop freed names from their windows' alias lists, so a resize never retargets a dead name.
+    fn forget_composite_names(&mut self, names: &[ResourceId]) {
+        for w in self.windows.values_mut() {
+            w.composite_named_pixmaps
+                .retain(|alias| !names.contains(&alias.client_pixmap));
+        }
+    }
+
+    /// True iff a live `NameWindowPixmap` name still aliases `host_xid`.
+    #[must_use]
+    pub fn host_xid_named_by_pixmap(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.pixmaps
+            .values()
+            .any(|p| p.composite_name && p.host_xid == Some(host_xid))
+    }
+
+    /// True iff a freed name's alias ref on `host_xid` is waiting for an attribute release site.
+    #[must_use]
+    pub fn has_deferred_name_ref(&self, host_xid: crate::backend::PixmapHandle) -> bool {
+        self.deferred_name_refs.contains(&host_xid.as_raw())
+    }
+
+    /// Record that a freed name's alias ref on `host_xid` is left to the attribute release sites.
+    pub fn defer_name_ref(&mut self, host_xid: crate::backend::PixmapHandle) {
+        self.deferred_name_refs.insert(host_xid.as_raw());
+    }
+
+    /// An orphan-rule site freed `host_xid`: any deferred name ref on it is now dropped.
+    pub fn host_pixmap_freed(&mut self, host_xid: u32) {
+        self.deferred_name_refs.remove(&host_xid);
     }
 
     pub fn pixmap(&self, id: ResourceId) -> Option<&Pixmap> {
@@ -2567,6 +2673,23 @@ impl ResourceTable {
         self.pictures.get(&id.0)
     }
 
+    /// Remove every Picture, of any client, created on one of `windows`.
+    /// Returns `(host picture, host-owned pixmap)` for the backend frees.
+    pub fn remove_pictures_on_windows(
+        &mut self,
+        windows: &[ResourceId],
+    ) -> Vec<(u32, Option<u32>)> {
+        self.pictures
+            .extract_if(|_, p| p.window.is_some_and(|w| windows.contains(&w)))
+            .filter_map(|(_, p)| {
+                Some((
+                    p.host_picture_xid?.as_raw(),
+                    p.host_owned_pixmap.map(|h| h.as_raw()),
+                ))
+            })
+            .collect()
+    }
+
     pub fn create_glyphset(&mut self, id: ResourceId, state: GlyphSetState) {
         if let Some(old) = self.glyphsets.remove(&id.0) {
             let _ = self.release_host_glyphset_ref(old.host_glyphset_xid.as_raw());
@@ -2713,10 +2836,23 @@ impl ResourceTable {
         self.cursors.contains_key(&id.0)
     }
 
+    /// XFIXES `SetCursorName`. The name belongs to the cursor object, so
+    /// every XID aliasing the same host cursor (after `ChangeCursor`) sees
+    /// it, and it stays recorded against the host handle.
     pub fn set_cursor_name_atom(&mut self, id: ResourceId, atom: yserver_protocol::x11::AtomId) {
-        if let Some(c) = self.cursors.get_mut(&id.0) {
-            c.name_atom = Some(atom);
+        let Some(cursor) = self.cursors.get_mut(&id.0) else {
+            return;
+        };
+        cursor.name_atom = Some(atom);
+        let Some(host) = cursor.host_xid.map(|h| h.as_raw()) else {
+            return;
+        };
+        for c in self.cursors.values_mut() {
+            if c.host_xid.map(|h| h.as_raw()) == Some(host) {
+                c.name_atom = Some(atom);
+            }
         }
+        self.cursor_host_names.insert(host, atom);
     }
 
     #[must_use]
@@ -2724,14 +2860,70 @@ impl ResourceTable {
         self.cursors.get(&id.0)?.name_atom
     }
 
-    /// Remove a cursor from the table and return the host XID (if any)
-    /// so the caller can free it on the host. Caller's responsibility to
+    /// XFIXES name of the cursor behind host handle `host`, whether or not
+    /// a client XID still refers to it. `None` when it was never named.
+    #[must_use]
+    pub fn cursor_name_for_host(&self, host: u32) -> Option<yserver_protocol::x11::AtomId> {
+        self.cursor_host_names.get(&host).copied()
+    }
+
+    /// Host handles of every cursor named `atom` (XFIXES
+    /// `ChangeCursorByName`'s match set), sorted for a stable order.
+    #[must_use]
+    pub fn cursor_hosts_named(&self, atom: yserver_protocol::x11::AtomId) -> Vec<u32> {
+        let mut hosts: Vec<u32> = self
+            .cursor_host_names
+            .iter()
+            .filter_map(|(host, name)| (*name == atom).then_some(*host))
+            .collect();
+        hosts.sort_unstable();
+        hosts
+    }
+
+    /// XFIXES `ChangeCursor` on the resource database (Xorg
+    /// `ReplaceCursorLookup` → `ChangeResourceValue`): every cursor XID
+    /// that refers to host cursor `old_host` now refers to `source`'s
+    /// cursor object — its handle, name and animation flag. Returns
+    /// whether any XID was retargeted. The old host handle's name is
+    /// dropped: nothing displays it after the backend's replace.
+    pub fn retarget_cursor_host(&mut self, old_host: u32, source: ResourceId) -> bool {
+        let Some(src) = self.cursors.get(&source.0).cloned() else {
+            return false;
+        };
+        let mut changed = false;
+        for c in self.cursors.values_mut() {
+            if c.host_xid.map(|h| h.as_raw()) == Some(old_host) {
+                c.host_xid = src.host_xid;
+                c.name_atom = src.name_atom;
+                c.anim = src.anim;
+                changed = true;
+            }
+        }
+        self.cursor_host_names.remove(&old_host);
+        changed
+    }
+
+    /// True iff some cursor XID still refers to host cursor `host`.
+    #[must_use]
+    pub fn cursor_host_referenced(&self, host: u32) -> bool {
+        self.cursors
+            .values()
+            .any(|c| c.host_xid.map(|h| h.as_raw()) == Some(host))
+    }
+
+    /// Remove a cursor from the table and return its host XID when this
+    /// was the last XID referring to that host cursor, so the caller can
+    /// free it on the host. After XFIXES `ChangeCursor` several XIDs share
+    /// one host cursor; freeing it while another XID still names it would
+    /// release the host object under that XID. Caller's responsibility to
     /// dispatch `backend.free_cursor` — keeping the resource layer
     /// backend-agnostic.
     pub fn free_cursor(&mut self, id: ResourceId) -> Option<u32> {
         let host_xid = self.cursors.get(&id.0).and_then(|c| c.host_xid);
         self.cursors.remove(&id.0);
-        host_xid.map(|h| h.as_raw())
+        host_xid
+            .map(|h| h.as_raw())
+            .filter(|host| !self.cursor_host_referenced(*host))
     }
 
     /// Mark a cursor as animated (RENDER CreateAnimCursor product).
@@ -2786,9 +2978,14 @@ impl ResourceTable {
         client: ClientId,
     ) -> ClientRemovedResources {
         let mut freed_pixmaps = Vec::new();
+        let mut freed_names = Vec::new();
+        let mut name_ids = Vec::new();
         self.pixmaps.retain(|_, p| {
             if p.owner == client {
-                if let Some(xid) = p.host_xid {
+                if p.composite_name {
+                    name_ids.push(p.id);
+                    freed_names.extend(p.host_xid);
+                } else if let Some(xid) = p.host_xid {
                     freed_pixmaps.push(xid.as_raw());
                 }
                 false
@@ -2796,6 +2993,9 @@ impl ResourceTable {
                 true
             }
         });
+        if !name_ids.is_empty() {
+            self.forget_composite_names(&name_ids);
+        }
         self.gcs.retain(|_, g| g.owner != client);
         let mut freed_colormaps = Vec::new();
         self.colormaps.retain(|_, c| {
@@ -2819,6 +3019,11 @@ impl ResourceTable {
                 true
             }
         });
+        // Host cursors shared with a surviving XID (XFIXES `ChangeCursor`
+        // aliases) stay alive; each shared handle is released once.
+        freed_cursors.sort_unstable();
+        freed_cursors.dedup();
+        freed_cursors.retain(|host| !self.cursor_host_referenced(*host));
         let mut closed_fonts = Vec::new();
         self.fonts.retain(|_, f| {
             if f.owner == client {
@@ -2831,10 +3036,9 @@ impl ResourceTable {
         let mut freed_pictures: Vec<(u32, Option<u32>)> = Vec::new();
         self.pictures.retain(|_, p| {
             if p.client == client {
-                freed_pictures.push((
-                    p.host_picture_xid.as_raw(),
-                    p.host_owned_pixmap.map(|h| h.as_raw()),
-                ));
+                if let Some(hp) = p.host_picture_xid {
+                    freed_pictures.push((hp.as_raw(), p.host_owned_pixmap.map(|h| h.as_raw())));
+                }
                 false
             } else {
                 true
@@ -2859,6 +3063,7 @@ impl ResourceTable {
         ClientRemovedResources {
             closed_fonts,
             freed_pixmaps,
+            freed_names,
             freed_pictures,
             freed_glyphsets,
             freed_cursors,
@@ -3355,6 +3560,8 @@ pub struct Pixmap {
     pub depth: u8,
     pub owner: ClientId,
     pub host_xid: Option<crate::backend::PixmapHandle>,
+    /// A `NameWindowPixmap` name: owns one alias ref on its backing (Xorg `compext.c:260`).
+    pub composite_name: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3733,6 +3940,7 @@ mod tests {
                 depth: 24,
                 owner,
                 host_xid: Some(PixmapHandle::from_raw_for_test(0xb01)),
+                composite_name: false,
             },
         );
 
@@ -3778,6 +3986,7 @@ mod tests {
                 depth: 24,
                 owner,
                 host_xid: Some(PixmapHandle::from_raw_for_test(0xa01)),
+                composite_name: false,
             },
         );
 
@@ -3831,10 +4040,11 @@ mod tests {
             pic_id.0,
             PictureState {
                 client: owner,
-                host_picture_xid: PictureHandle::from_raw_for_test(0xa06),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(0xa06)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
 
@@ -4087,7 +4297,7 @@ mod tests {
             table.window(ResourceId(0x100002)).unwrap().map_state,
             MapState::Viewable
         );
-        let was_mapped = table.unmap_window(ResourceId(0x100002));
+        let was_mapped = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(was_mapped);
         assert_eq!(
             table.window(ResourceId(0x100002)).unwrap().map_state,
@@ -4101,7 +4311,7 @@ mod tests {
         make_window(&mut table, 0x100002);
         // Force Unviewable directly — no public setter, but the field is pub.
         table.windows.get_mut(&0x100002).unwrap().map_state = MapState::Unviewable;
-        let was_mapped = table.unmap_window(ResourceId(0x100002));
+        let was_mapped = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(was_mapped);
         assert_eq!(
             table.window(ResourceId(0x100002)).unwrap().map_state,
@@ -4118,16 +4328,16 @@ mod tests {
             table.window(ResourceId(0x100002)).unwrap().map_state,
             MapState::Unmapped
         );
-        let first = table.unmap_window(ResourceId(0x100002));
+        let first = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(!first);
-        let second = table.unmap_window(ResourceId(0x100002));
+        let second = table.unmap_window(ResourceId(0x100002)).mapping_changed;
         assert!(!second);
     }
 
     #[test]
     fn unmap_window_returns_false_for_unknown_window() {
         let mut table = ResourceTable::new();
-        let was_mapped = table.unmap_window(ResourceId(0x9999_9999));
+        let was_mapped = table.unmap_window(ResourceId(0x9999_9999)).mapping_changed;
         assert!(!was_mapped);
     }
 
@@ -4138,7 +4348,7 @@ mod tests {
             table.window(ROOT_WINDOW).unwrap().map_state,
             MapState::Viewable
         );
-        let was_mapped = table.unmap_window(ROOT_WINDOW);
+        let was_mapped = table.unmap_window(ROOT_WINDOW).mapping_changed;
         assert!(!was_mapped);
         assert_eq!(
             table.window(ROOT_WINDOW).unwrap().map_state,
@@ -4514,6 +4724,144 @@ mod tests {
         );
     }
 
+    // Viewability-delta fixture: F{ A{ A1, A2{ A2a } }, B{ B1 }, C }, a
+    // top-level G, all created unmapped. Viewable iff it and every ancestor
+    // is mapped (dix/window.c MapWindow / UnmapWindow).
+    const VD_F: u32 = 0x0010_0100;
+    const VD_A: u32 = 0x0010_0101;
+    const VD_A1: u32 = 0x0010_0102;
+    const VD_A2: u32 = 0x0010_0103;
+    const VD_A2A: u32 = 0x0010_0104;
+    const VD_B: u32 = 0x0010_0105;
+    const VD_B1: u32 = 0x0010_0106;
+    const VD_C: u32 = 0x0010_0107;
+    const VD_G: u32 = 0x0010_0108;
+
+    fn ids(raw: &[u32]) -> Vec<ResourceId> {
+        raw.iter().copied().map(ResourceId).collect()
+    }
+
+    /// Builds the fixture with A, A1, A2a, B1 and C mapped (all Unviewable,
+    /// F still unmapped); A2 and B stay unmapped.
+    fn viewability_fixture() -> ResourceTable {
+        let mut t = ResourceTable::new();
+        make_window(&mut t, VD_F);
+        make_window(&mut t, VD_G);
+        make_child(&mut t, VD_A, VD_F, 0, 0);
+        make_child(&mut t, VD_A1, VD_A, 0, 0);
+        make_child(&mut t, VD_A2, VD_A, 0, 0);
+        make_child(&mut t, VD_A2A, VD_A2, 0, 0);
+        make_child(&mut t, VD_B, VD_F, 0, 0);
+        make_child(&mut t, VD_B1, VD_B, 0, 0);
+        make_child(&mut t, VD_C, VD_F, 0, 0);
+        for w in [VD_A, VD_A1, VD_A2A, VD_B1, VD_C] {
+            let tr = t.map_window(ResourceId(w));
+            assert!(tr.mapping_changed);
+            assert!(tr.delta.is_empty(), "0x{w:x} maps under an unmapped F");
+        }
+        t
+    }
+
+    #[test]
+    fn map_window_delta_is_newly_viewable_subtree_in_pre_order() {
+        let mut t = viewability_fixture();
+        let tr = t.map_window(ResourceId(VD_F));
+        assert!(tr.mapping_changed);
+        assert_eq!(tr.delta.became_viewable, ids(&[VD_F, VD_A, VD_A1, VD_C]));
+        assert!(tr.delta.became_unviewable.is_empty());
+
+        // Mapping A2 now exposes A2a beneath it: parent before child.
+        let tr = t.map_window(ResourceId(VD_A2));
+        assert!(tr.mapping_changed);
+        assert_eq!(tr.delta.became_viewable, ids(&[VD_A2, VD_A2A]));
+        assert!(tr.delta.became_unviewable.is_empty());
+    }
+
+    #[test]
+    fn unmap_window_delta_is_viewable_subtree_in_post_order() {
+        let mut t = viewability_fixture();
+        let _ = t.map_window(ResourceId(VD_F));
+        let _ = t.map_window(ResourceId(VD_A2));
+
+        let tr = t.unmap_window(ResourceId(VD_A));
+        assert!(tr.mapping_changed);
+        assert!(tr.delta.became_viewable.is_empty());
+        assert_eq!(
+            tr.delta.became_unviewable,
+            ids(&[VD_A1, VD_A2A, VD_A2, VD_A])
+        );
+
+        let tr = t.unmap_window(ResourceId(VD_F));
+        assert!(tr.mapping_changed);
+        assert_eq!(tr.delta.became_unviewable, ids(&[VD_C, VD_F]));
+    }
+
+    #[test]
+    fn remap_of_viewable_window_has_no_transition() {
+        let mut t = viewability_fixture();
+        let _ = t.map_window(ResourceId(VD_F));
+        for w in [VD_F, VD_A, VD_C] {
+            assert_eq!(t.map_window(ResourceId(w)), MapTransition::default());
+        }
+    }
+
+    #[test]
+    fn mapping_changes_without_viewability_under_unmapped_ancestor() {
+        let mut t = viewability_fixture();
+        // Map under an unmapped parent: Unmapped -> Unviewable.
+        let tr = t.map_window(ResourceId(VD_A2));
+        assert!(tr.mapping_changed);
+        assert!(tr.delta.is_empty());
+        assert_eq!(
+            t.window(ResourceId(VD_A2)).unwrap().map_state,
+            MapState::Unviewable
+        );
+        // Unmap of an unviewable window: Unviewable -> Unmapped.
+        let tr = t.unmap_window(ResourceId(VD_A));
+        assert!(tr.mapping_changed);
+        assert!(tr.delta.is_empty());
+        assert_eq!(
+            t.window(ResourceId(VD_A)).unwrap().map_state,
+            MapState::Unmapped
+        );
+    }
+
+    #[test]
+    fn reparent_window_delta_follows_new_parent_viewability() {
+        let mut t = viewability_fixture();
+        let _ = t.map_window(ResourceId(VD_F));
+        let _ = t.map_window(ResourceId(VD_A2));
+        let reparent = |t: &mut ResourceTable, window: u32, parent: u32| {
+            t.reparent_window(ReparentWindowRequest {
+                window: ResourceId(window),
+                parent: ResourceId(parent),
+                x: 0,
+                y: 0,
+            })
+            .unwrap()
+            .delta
+        };
+
+        // Viewable A under unmapped G: the subtree leaves, child first.
+        let delta = reparent(&mut t, VD_A, VD_G);
+        assert!(delta.became_viewable.is_empty());
+        assert_eq!(delta.became_unviewable, ids(&[VD_A1, VD_A2A, VD_A2, VD_A]));
+
+        // Back under viewable F: the subtree returns, parent first.
+        let delta = reparent(&mut t, VD_A, VD_F);
+        assert_eq!(delta.became_viewable, ids(&[VD_A, VD_A1, VD_A2, VD_A2A]));
+        assert!(delta.became_unviewable.is_empty());
+
+        // Viewable -> viewable parent and an unmapped window: no change.
+        assert!(reparent(&mut t, VD_C, VD_A).is_empty());
+        assert!(reparent(&mut t, VD_B, VD_G).is_empty());
+        assert!(reparent(&mut t, VD_B, VD_F).is_empty());
+
+        // B was reparented while unmapped; mapping it now exposes B1.
+        let tr = t.map_window(ResourceId(VD_B));
+        assert_eq!(tr.delta.became_viewable, ids(&[VD_B, VD_B1]));
+    }
+
     /// #133 step 8 (P9) fixtures. A root child at (100, 200), 300x400,
     /// `border_width = 16` — awesome's configured width. Its CONTENT
     /// origin is therefore (116, 216) in root coordinates
@@ -4842,7 +5190,7 @@ mod tests {
 
             let mut results = Vec::with_capacity(n);
             for _ in 0..n {
-                results.push(table.unmap_window(target));
+                results.push(table.unmap_window(target).mapping_changed);
             }
 
             let expected_first = !matches!(initial, InitialState::Unmapped);
@@ -4859,58 +5207,34 @@ mod tests {
     }
 
     #[test]
-    fn circulate_window_raises_lowest_to_top() {
+    fn circulate_child_restacks_to_the_top_or_the_bottom() {
         let mut t = ResourceTable::new();
         make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
         make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
         make_child(&mut t, 0x400, ROOT_WINDOW.0, 0, 0);
-        let moved = t.circulate_window(ROOT_WINDOW, 0).unwrap();
-        assert_eq!(moved, ResourceId(0x400));
+        t.circulate_child(ResourceId(0x200), true);
         assert_eq!(
             t.children(ROOT_WINDOW),
-            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
         );
-    }
-
-    #[test]
-    fn circulate_window_lowers_highest_to_bottom() {
-        let mut t = ResourceTable::new();
-        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
-        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
-        let moved = t.circulate_window(ROOT_WINDOW, 1).unwrap();
-        assert_eq!(moved, ResourceId(0x200));
+        t.circulate_child(ResourceId(0x200), false);
         assert_eq!(
             t.children(ROOT_WINDOW),
-            &[ResourceId(0x300), ResourceId(0x200)]
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
         );
-    }
-
-    #[test]
-    fn circulate_window_noop_with_lt_two_children() {
-        let mut t = ResourceTable::new();
-        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
-        assert!(t.circulate_window(ROOT_WINDOW, 0).is_none());
     }
 
     #[test]
     fn circulate_raise_on_root_skips_cow() {
         let mut t = ResourceTable::new();
-        // Root children, bottom-to-top: [A=0x200 (occluded), B=0x300, COW].
-        // We need positions where A is occluded by B for Raise to act on A;
-        // for the geometry-free unit test, set both A and B at (0,0,50x50) so
-        // B occludes A.
         make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
         make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
-        let _ = t.map_window(ResourceId(0x200));
-        let _ = t.map_window(ResourceId(0x300));
         t.windows
             .get_mut(&ROOT_WINDOW.0)
             .unwrap()
             .children
             .push(COMPOSITE_OVERLAY_WINDOW);
-        // Circulate Raise on root: A should rise to "top of the non-COW slice",
-        // i.e. just below COW. COW stays last.
-        let _ = t.circulate_window(ROOT_WINDOW, 0);
+        t.circulate_child(ResourceId(0x200), true);
         let kids = &t.window(ROOT_WINDOW).unwrap().children;
         assert_eq!(
             kids.last().copied(),

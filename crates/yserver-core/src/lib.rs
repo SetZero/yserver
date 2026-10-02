@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod composite_redirects;
 pub mod core_loop;
 pub mod crossings;
 pub(crate) mod dri3;

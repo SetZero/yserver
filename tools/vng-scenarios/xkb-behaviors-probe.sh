@@ -19,7 +19,7 @@
 # which is exactly what happened during development of this scenario).
 set -u
 src=$(dirname "$0")/../xkb-behaviors-probe.c
-[ -r "$src" ] || src=/home/jos/Projects/yserver/tools/xkb-behaviors-probe.c
+[ -r "$src" ] || src=${YSERVER_REPO:?}/tools/xkb-behaviors-probe.c
 
 # A prebuilt binary is honoured if one was staged into the guest, but the
 # checked-in artifact is the .c, so build it here the way every other scenario

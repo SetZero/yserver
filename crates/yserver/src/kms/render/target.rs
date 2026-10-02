@@ -170,6 +170,11 @@ pub(crate) struct PaintTarget {
     /// optimisation: it keeps the `bw == 0` path on the identical
     /// arithmetic it had before #133.
     content: Option<vk::Rect2D>,
+    /// Whether some window in the chain has a border, i.e. `content`
+    /// came from a border term. A window painting into an ancestor's
+    /// backing also carries its bounds in `content`
+    /// ([`Self::within_window_bounds`]) without being bordered.
+    bordered: bool,
     /// The logical X11 drawable depth of the ORIGINAL draw target. This
     /// can differ from the backing storage depth when a depth-24 child
     /// paints into a depth-32 redirected frame backing.
@@ -187,7 +192,36 @@ impl PaintTarget {
             id,
             offset,
             content,
+            bordered: content.is_some(),
             x11_depth,
+        }
+    }
+
+    /// Narrow the clip to `bounds` (storage coordinates): the drawn
+    /// window's own rect intersected with every ancestor's, for a window
+    /// that paints into an ANCESTOR's backing. Xorg clips such a window
+    /// to its `clipList`, which never leaves its parent's
+    /// (`mi/mivaltree.c:390` and `:426-427`, `RegionIntersect(&childUniverse,
+    /// universe, &pChild->borderSize)`), so the window cannot paint its parent's
+    /// or its parent's siblings' pixels in the shared pixmap. Its own
+    /// storage would clip it by its extent; the shared one does not.
+    pub(crate) fn within_window_bounds(self, bounds: Option<vk::Rect2D>) -> Self {
+        let Some(bounds) = bounds else {
+            return self;
+        };
+        let content = match self.content {
+            None => bounds,
+            Some(c) => intersect_vk(c, bounds).unwrap_or(vk::Rect2D {
+                offset: c.offset,
+                extent: vk::Extent2D {
+                    width: 0,
+                    height: 0,
+                },
+            }),
+        };
+        Self {
+            content: Some(content),
+            ..self
         }
     }
 
@@ -215,7 +249,7 @@ impl PaintTarget {
     /// the content clip actually restricts the storage. Used by the
     /// direct-scanout gate (#133 step 3.5) and by tests.
     pub(crate) fn has_border_clip(self) -> bool {
-        self.content.is_some()
+        self.bordered
     }
 
     /// The content clip in storage coordinates, or `None` for "the whole

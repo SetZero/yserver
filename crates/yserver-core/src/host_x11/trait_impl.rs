@@ -90,7 +90,7 @@ impl Backend for HostX11Backend {
 
         let container = self.window_id();
         match ev {
-            HostInputEvent::Key(raw) => {
+            HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
                 self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
                     pressed: raw.pressed,
                     keycode: raw.keycode,
@@ -121,6 +121,7 @@ impl Backend for HostX11Backend {
                     // here (0). Real relative deltas come from the KMS path.
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 }));
             }
             // ynest is a nested backend fed by the parent X server's input,
@@ -171,6 +172,7 @@ impl Backend for HostX11Backend {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 }));
             }
             // Device add/remove are plumbing-only in the host-X11 backend;
@@ -1116,14 +1118,14 @@ impl Backend for HostX11Backend {
         self.with_active_origin(origin, |this| HostX11Backend::xkb_proxy(this, minor, body))
     }
 
-    fn xfixes_change_cursor_by_name(
+    fn replace_cursor(
         &mut self,
         origin: Option<OriginContext>,
-        host_cursor_xid: u32,
-        name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()> {
         self.with_active_origin(origin, |this| {
-            HostX11Backend::xfixes_change_cursor_by_name(this, host_cursor_xid, name_bytes)
+            HostX11Backend::xfixes_change_cursor(this, new_host_xid, old_host_xid)
         })
     }
 

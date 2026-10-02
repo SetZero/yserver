@@ -114,6 +114,39 @@ impl Default for IdAllocator {
     }
 }
 
+/// Xorg's per-client XKB state (`ClientRec`, xkb/xkb.c): whether the
+/// client called XkbUseExtension, and the two XkbSelectEvents detail masks
+/// Xorg keeps per client rather than per device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbClientState {
+    /// `_XkbClientInitialized`: a successful XkbUseExtension. Every other
+    /// XKB request answers BadAccess without it.
+    pub initialized: bool,
+    /// `_XkbClientIsAncient`: XkbUseExtension asked for version 0.65.
+    pub ancient: bool,
+    /// `mapNotifyMask`: the XkbMapNotify details (map parts) selected.
+    pub map_notify_mask: u16,
+    /// `newKeyboardNotifyMask`: the XkbNewKeyboardNotify details selected.
+    pub new_keyboard_notify_mask: u16,
+}
+
+/// One client's interest in one XKB device (`XkbInterestRec`): the
+/// XkbSelectEvents detail mask of every event but MapNotify and
+/// NewKeyboardNotify (which Xorg keeps per client, [`XkbClientState`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbInterest {
+    pub state: u16,
+    pub controls: u32,
+    pub indicator_state: u32,
+    pub indicator_map: u32,
+    pub names: u16,
+    pub compat: u8,
+    pub bell: u8,
+    pub action_message: u8,
+    pub access_x: u16,
+    pub extension_device: u16,
+}
+
 #[derive(Debug, Default)]
 pub struct AtomTable {
     by_name: HashMap<String, AtomId>,
@@ -165,6 +198,27 @@ impl AtomTable {
     pub fn exists(&self, atom: AtomId) -> bool {
         atom.0 != 0
             && (x11::well_known_atom_name(atom).is_some() || self.names.contains_key(&atom.0))
+    }
+
+    /// Intern `name` as atom `atom`, as a server that already interned it
+    /// at that id would have: false (and nothing changes) when the name or
+    /// the id is taken, or the id is a predefined one. Replaying recorded
+    /// requests (#171's xkbcomp captures) needs their atoms to mean the
+    /// same names.
+    pub fn intern_at(&mut self, atom: AtomId, name: &str) -> bool {
+        if atom.0 < 69
+            || x11::well_known_atom(name).is_some()
+            || self.by_name.contains_key(name)
+            || self.names.contains_key(&atom.0)
+        {
+            return false;
+        }
+        self.by_name.insert(name.to_owned(), atom);
+        self.names.insert(atom.0, name.to_owned());
+        if atom.0 >= self.next_id {
+            self.next_id = atom.0 + 1;
+        }
+        true
     }
 
     /// Register a synthetic name-atom pair at a caller-chosen id. Used
@@ -230,6 +284,10 @@ pub struct KeyGrab {
     /// grab) rather than core GrabKey — see
     /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
     pub via_xi2: bool,
+    /// First word of the XIPassiveGrabDevice event mask (XI2 event types
+    /// 0..=31, which covers every key and raw key type); 0 for a core
+    /// GrabKey. Becomes the activated grab's [`ActiveKeyboardGrab::xi2_mask`].
+    pub xi2_mask: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,6 +312,11 @@ pub struct ActiveKeyboardGrab {
     /// keyboard, or an activated XI2 passive key grab) — see
     /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
     pub via_xi2: bool,
+    /// The grab's XI2 event mask (Xorg `GrabRec.xi2mask`, first word:
+    /// event types 0..=31). Consulted where Xorg's `DeliverOneGrabbedEvent`
+    /// reads it — today the XI2 raw key events, which reach an XI2 grab
+    /// owner only if its grab mask selects them. 0 for core grabs.
+    pub xi2_mask: u32,
 }
 
 /// XI 1.x passive device grab (GrabDeviceKey / GrabDeviceButton).
@@ -361,6 +424,10 @@ pub enum QueuedInputEvent {
     HostPointer(crate::host_x11::HostPointerEvent),
     HostKey(crate::host_x11::HostKeyEvent),
     Xi1Routed(Xi1QueuedEvent),
+    /// The master-keyboard form of an XI2 raw key event, queued behind a
+    /// frozen keyboard in input order (Xorg enqueues the master's
+    /// `ET_RawKeyPress` / `ET_RawKeyRelease` like any other event).
+    RawKey(crate::core_loop::key_fanout::RawKeyEvent),
 }
 
 /// One device-tagged entry in Xorg's global `syncEvents.pending` equivalent.
@@ -577,17 +644,13 @@ pub struct ActivePointerGrab {
     /// this is the event window's MERGED xi2 selection captured at
     /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
     /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
-    /// sets `u32::MAX` — its wire mask is not parsed (pre-existing
+    /// sets `u64::MAX` — its wire mask is not parsed (pre-existing
     /// permissive delivery); core GrabPointer sets 0 (never consulted:
     /// the XI2 redirect delivers nothing for via_xi2=false grabs).
-    pub xi2_mask: u32,
+    pub xi2_mask: u64,
 }
 
-/// XComposite redirect mode. Both wire constants are accepted —
-/// `Automatic` (update=0) and `Manual` (update=1) — but the
-/// redirected-backing pixmap path is unimplemented, so no code
-/// currently branches on the variant. The record's presence is what
-/// `NameWindowPixmap` and the disconnect-cleanup paths consult.
+/// XComposite redirect mode: `Automatic` (update=0) or `Manual` (update=1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeRedirectMode {
     Manual,
@@ -763,6 +826,11 @@ pub struct KeyboardControlState {
     pub global_auto_repeat: bool,
     /// Per-key auto-repeat bitmap (keycode N → byte N>>3, bit N&7).
     pub auto_repeats: [u8; 32],
+    /// Keys whose auto-repeat a client set with `ChangeKeyboardControl`
+    /// (same layout). XKB no longer re-derives their bit on a mapping
+    /// change: Xorg's `XkbDisableComputedAutoRepeats` marks them
+    /// `XkbExplicitAutoRepeatMask`.
+    pub auto_repeats_explicit: [u8; 32],
     /// LED bitmask (led N → bit N-1). `DEFAULT_LEDS` = all off.
     pub led_mask: u32,
 }
@@ -784,8 +852,18 @@ impl KeyboardControlState {
             bell_duration: 100,
             global_auto_repeat: true,
             auto_repeats: DEFAULT_AUTO_REPEATS,
+            auto_repeats_explicit: [0; 32],
             led_mask: 0,
         }
+    }
+
+    /// Whether `keycode` auto-repeats: the global flag gates everything,
+    /// then the per-key bitmap decides (Xorg `kbdfeed->ctrl.autoRepeat`
+    /// + `autoRepeats[]`, `key_autorepeats` in dix/getevents.c).
+    #[must_use]
+    pub fn key_auto_repeats(&self, keycode: u8) -> bool {
+        self.global_auto_repeat
+            && self.auto_repeats[usize::from(keycode >> 3)] & (1 << (keycode & 7)) != 0
     }
 }
 
@@ -823,13 +901,11 @@ impl Default for PointerControlState {
     }
 }
 
-/// Per-window XComposite redirect record stored in
-/// [`ServerState::composite_redirects`]. The `owner` is the client
-/// that issued the `RedirectWindow` / `RedirectSubwindows` — used
-/// by the dispatch layer for `BadAccess` conflict detection and by
-/// `process_disconnect` to tear down redirects belonging to a
-/// departing client (L2 task B.1b).
-#[derive(Debug, Clone, Copy)]
+/// One client's XComposite redirect (Xorg `CompClientWindowRec`), kept in
+/// [`ServerState::composite_redirects`]. The `owner` is the client that
+/// issued the `RedirectWindow` / `RedirectSubwindows`; its records go with
+/// it at disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedirectRecord {
     pub mode: CompositeRedirectMode,
     pub owner: ClientId,
@@ -995,12 +1071,19 @@ pub struct ServerState {
     /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
     /// than inside `RandrState`.
     pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
+    /// RANDR 1.5 client-defined monitors in `SetMonitor` order. See
+    /// [`crate::randr::ClientMonitor`] for why this lives beside `randr`.
+    pub randr_client_monitors: Vec<crate::randr::ClientMonitor>,
     /// One bit per RANDR minor opcode whose unsupported behavior has already
     /// produced a warning. Repeated requests remain visible at debug level
     /// without flooding ordinary desktop layout reapplication logs.
     pub(crate) randr_unsupported_warned_mask: u64,
-    /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
-    pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
+    /// Xorg's per-client XKB state (`ClientRec.xkbClientFlags`,
+    /// `mapNotifyMask`, `newKeyboardNotifyMask`), by client.
+    pub xkb_clients: HashMap<u32, XkbClientState>,
+    /// Xorg's per-device XKB interest (`XkbInterestRec`, the other
+    /// XkbSelectEvents detail masks): (client, device spec) -> masks.
+    pub xkb_interests: HashMap<(u32, u16), XkbInterest>,
     /// Selection ownership: maps selection atom → (owning window,
     /// `lastTimeChanged` in ms). `lastTimeChanged` is the timestamp
     /// from the `SetSelectionOwner` request that produced this entry;
@@ -1156,6 +1239,13 @@ pub struct ServerState {
     pub xfixes_selection_masks: HashMap<(u32, ResourceId, AtomId), u32>,
     /// XFIXES cursor event masks: (client, window) -> mask.
     pub xfixes_cursor_masks: HashMap<(u32, ResourceId), u32>,
+    /// XFIXES major version each client negotiated (Xorg
+    /// `XFixesClientRec.major_version`). It gates which requests the
+    /// client may send; a client with no entry has not sent `QueryVersion`.
+    pub xfixes_client_major: HashMap<u32, u32>,
+    /// XFIXES `HideCursor` counts per client (Xorg `CursorHideCountRec`,
+    /// one screen). The sprite is hidden while this map is non-empty.
+    pub xfixes_cursor_hide_counts: HashMap<u32, u32>,
     /// SHAPE state per window. Missing entries mean the default window rectangle.
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
     /// SHAPE select-input state: (client, window) -> enabled.
@@ -1195,7 +1285,7 @@ pub struct ServerState {
     /// output is allowed to drain, the core asks the backend to submit that
     /// drawing so an external compositor cannot sample ahead of it.
     pub damage_notify_flush_pending: bool,
-    pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
+    pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
     /// pageflip advances past their target (`drain_present_completions`).
@@ -1247,6 +1337,18 @@ pub struct ServerState {
     /// `SetClientVersion`. Missing means the legacy v0 reply layout, matching
     /// Xorg's `ClientMajorVersion`.
     pub vidmode_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// XI version each client announced with XIQueryVersion (Xorg
+    /// `XIClientRec.major_version/minor_version`), kept by Xorg's rules:
+    /// the first query sets it; a later one raises it only when both are
+    /// 2.2 or newer. Absent = never queried (Xorg's 0.0). Xorg consults it
+    /// to filter XI2 raw events under a grab (`FilterRawEvents`: an XI 2.0
+    /// client gets no raw event from a grabbed device).
+    pub xi2_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// RANDR version each client last sent in QueryVersion (Xorg
+    /// `pRRClient->major_version/minor_version`, the client's own numbers).
+    /// Absent = never queried (0.0). `RRClientKnowsRates` (≥ 1.1) picks the
+    /// SetScreenConfig request size.
+    pub randr_client_versions: HashMap<ClientId, (u32, u32)>,
     /// `GLX_EXT_texture_from_pixmap` is advertised only when the backend
     /// confirmed at init that it can allocate and export a BGRA8 dma-buf.
     /// Set once from `backend.supports_dmabuf_export()` during startup;
@@ -1325,17 +1427,17 @@ pub struct ServerState {
     /// `ServerState` gives it the right lifetime under `-noreset` — as
     /// long as the server, which is as long as the orphaned overlay.
     pub cow_teardown_failed: bool,
-    /// Outstanding `XSync::AwaitFence` requests waiting on at least
-    /// one fence in the list to transition to triggered. Per the
-    /// spec the server must defer further processing of the
-    /// blocked client's requests until *any* of the listed fences
-    /// triggers; **we don't suspend the client's request stream**
-    /// (that requires deeper core-loop integration), so this map
-    /// only records the await for telemetry + a corresponding
-    /// `TriggerFence`-time `AwaitSatisfied` debug log. Real
-    /// blocking is left as a known gap — see followup §5 in
-    /// `docs/superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md`.
-    pub sync_pending_awaits: Vec<SyncPendingAwait>,
+    /// SYNC `Await` / `AwaitFence` in progress, keyed by client id. A client
+    /// with an entry is suspended (Xorg `IgnoreClient`): the core loop's
+    /// fair request queue keeps its later requests queued until the entry
+    /// is removed — the await fired, or the client left.
+    pub sync_awaits: HashMap<u32, SyncAwait>,
+    /// RECORD contexts (`core_loop::record`).
+    pub record: crate::core_loop::record::RecordState,
+    /// SERVERTIME value last evaluated against alarms and awaits; the
+    /// post-poll pass feeds `(last, now)` through the trigger tests the way
+    /// Xorg's `ServertimeWakeupHandler` calls `SyncChangeCounter`.
+    pub sync_servertime_last: Option<i64>,
     /// Cumulative XI2 scroll-axis values for the master pointer.
     /// `[0]` is valuator number 2 (vertical scroll), `[1]` is
     /// valuator number 3 (horizontal scroll). Increments by 1 per
@@ -1379,24 +1481,61 @@ pub struct KeyRepeatState {
     pub next_fire: std::time::Instant,
 }
 
-/// One outstanding `XSync::AwaitFence` request that hasn't been
-/// satisfied yet. Stored on `ServerState` until any fence in
-/// `fences` triggers.
-#[derive(Clone, Debug)]
-pub struct SyncPendingAwait {
-    pub client: ClientId,
-    pub sequence: SequenceNumber,
-    pub fences: Vec<u32>,
+/// One wait condition of a pending SYNC await (Xorg `SyncAwait`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncAwaitCondition {
+    /// `Await` on a counter: `test_value` is already resolved (a relative
+    /// wait was added to the counter's value when the request arrived).
+    Counter {
+        counter: u32,
+        test_type: u32,
+        test_value: i64,
+        event_threshold: i64,
+    },
+    /// `AwaitFence` on a fence.
+    Fence { fence: u32 },
+}
+
+impl SyncAwaitCondition {
+    /// The counter or fence this condition waits on.
+    #[must_use]
+    pub fn object(&self) -> u32 {
+        match *self {
+            Self::Counter { counter, .. } => counter,
+            Self::Fence { fence } => fence,
+        }
+    }
+}
+
+/// A suspended client's `Await` / `AwaitFence` (Xorg `SyncAwaitUnion`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SyncAwait {
+    pub conditions: Vec<SyncAwaitCondition>,
 }
 
 /// GLX context resource. We never run server-side GL — direct-
 /// rendering clients use the tag we assign at MakeCurrent to label
 /// rendering requests, but no actual GL state is tracked here.
+///
+/// The remaining fields are what Xorg's `__GLXcontext` answers
+/// `QueryContext` (`GLX_EXT_import_context`) and `IsDirect` from
+/// (glxcmds.c `DoQueryContext` / `__glXDisp_IsDirect`): the share list,
+/// the config's visual and FBConfig IDs, the screen, the render type and
+/// the client's `isDirect` flag, all recorded at creation.
 #[derive(Clone, Debug)]
 pub struct GlxContext {
     pub owner: ClientId,
+    pub screen: u32,
+    /// X visual of the context's config; 0 for a visual-less FBConfig
+    /// (Xorg `ctx->config->visualID`).
+    pub visual_id: u32,
+    /// FBConfig ID of the context's config; 0 when a GLX 1.0 visual has
+    /// no synthesised FBConfig.
     pub fbconfig: u32,
     pub render_type: u32,
+    /// `shareList` from the creation request (Xorg `ctx->share_id`).
+    pub share_list: u32,
+    pub is_direct: bool,
 }
 
 /// Which kind of drawable a `GlxDrawable` record wraps. Drives the
@@ -1437,6 +1576,17 @@ pub struct GlxDrawable {
     /// re-resolve `x_drawable → host_xid` (the resource is gone), leaking
     /// the export ref forever. `None` for the window/pbuffer cases.
     pub glx_export_host_xid: Option<u32>,
+    /// `GLX_TEXTURE_TARGET_EXT` value `GetDrawableAttributes` reports.
+    /// Xorg answers `GLX_TEXTURE_2D_EXT` only when `pGlxDraw->target` is
+    /// `GL_TEXTURE_2D`, else `GLX_TEXTURE_RECTANGLE_EXT`
+    /// (glxcmds.c:1896-1897). A GLX 1.0 `CreateGLXPixmap` never runs
+    /// `determineTextureTarget`, so its target stays 0 and Xorg reports
+    /// RECTANGLE; Mesa adopts the reported target for a GLX 1.0 pixmap
+    /// (glx_pbuffer.c `__glXGetDrawableAttribute`), because
+    /// `glXCreateGLXPixmap` takes no attribute list. Every other creation
+    /// path records `GLX_TEXTURE_2D_EXT`, the value yserver has always
+    /// reported for them.
+    pub texture_target: u32,
 }
 
 impl ServerState {
@@ -1490,8 +1640,10 @@ impl ServerState {
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
+            randr_client_monitors: Vec::new(),
             randr_unsupported_warned_mask: 0,
-            xkb_select_event_masks: HashMap::new(),
+            xkb_clients: HashMap::new(),
+            xkb_interests: HashMap::new(),
             selections: HashMap::new(),
             server_selection_events: Vec::new(),
             pointer_root: (0, 0),
@@ -1531,6 +1683,8 @@ impl ServerState {
             pointer_barriers: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
             xfixes_cursor_masks: HashMap::new(),
+            xfixes_client_major: HashMap::new(),
+            xfixes_cursor_hide_counts: HashMap::new(),
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
             present_pending_exec: BTreeMap::new(),
@@ -1542,7 +1696,7 @@ impl ServerState {
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
             damage_notify_flush_pending: false,
-            composite_redirects: HashMap::new(),
+            composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
             present_next_id: 1,
@@ -1558,9 +1712,13 @@ impl ServerState {
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
             vidmode_client_versions: HashMap::new(),
+            xi2_client_versions: HashMap::new(),
+            randr_client_versions: HashMap::new(),
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
-            sync_pending_awaits: Vec::new(),
+            sync_awaits: HashMap::new(),
+            record: crate::core_loop::record::RecordState::default(),
+            sync_servertime_last: None,
             repeat_state: None,
             dpms: DpmsState::new(false),
             screensaver: ScreenSaverState::new(),
@@ -1753,7 +1911,7 @@ impl ServerState {
             ) {
                 continue;
             }
-            let test_type = u32::from(alarm.test_type);
+            let test_type = alarm.check_type;
             if !matches!(
                 test_type,
                 x11sync::TEST_POSITIVE_TRANSITION | x11sync::TEST_POSITIVE_COMPARISON
@@ -1862,7 +2020,7 @@ impl ServerState {
 
     /// True iff `id` designates ANY live resource in ANY client-XID
     /// namespace: the 9 ResourceTable maps (via
-    /// `resources.xid_in_use`) plus the 10 extension maps that
+    /// `resources.xid_in_use`) plus the 11 extension maps that
     /// `xid_in_use` does NOT cover. XC-MISC must never report an
     /// occupied id as free — extend this (and the
     /// `xid_occupied_covers_every_namespace` test) when adding an
@@ -1881,10 +2039,11 @@ impl ServerState {
             || self.glx_contexts.contains_key(&id)
             || self.glx_drawables.contains_key(&id)
             || self.present_event_selections.contains_key(&id)
+            || self.record.contains(id)
     }
 
     /// Sorted, deduped list of occupied XIDs in `base..=base|mask`
-    /// across all 19 namespaces. O(total live resources) — called
+    /// across all 20 namespaces. O(total live resources) — called
     /// only on the rare XC-MISC GetXIDRange path.
     #[must_use]
     pub fn used_xids_in(&self, base: u32, mask: u32) -> Vec<u32> {
@@ -1901,6 +2060,7 @@ impl ServerState {
         out.extend(self.glx_contexts.keys().filter(in_range));
         out.extend(self.glx_drawables.keys().filter(in_range));
         out.extend(self.present_event_selections.keys().filter(in_range));
+        out.extend(self.record.ids().filter(|id| (*id & !mask) == base));
         out.sort_unstable();
         out.dedup();
         out
@@ -2080,15 +2240,36 @@ pub struct SyncFence {
 pub struct SyncAlarm {
     pub owner: ClientId,
     pub counter: u32,
-    /// Absolute counter value the trigger tests against. For a Relative
-    /// alarm this is resolved at create/change time (counter + value).
+    /// Absolute counter value the trigger tests against (Xorg's
+    /// `trigger.test_value`). For a Relative alarm this is resolved at
+    /// create/change time (counter + value).
     pub wait_value: i64,
+    /// The `value-type` last given (Xorg `trigger.value_type`): anything
+    /// but Absolute (0) resolves `raw_wait` relative to the counter when a
+    /// later ChangeAlarm sets the value or value type.
+    pub value_type: u32,
+    /// The `value` last given (Xorg `trigger.wait_value`), before
+    /// resolution.
+    pub raw_wait: i64,
     pub delta: i64,
-    /// `XSyncTestType` (PositiveTransition=0 … NegativeComparison=3).
-    pub test_type: u8,
+    /// The `test-type` last given (Xorg `trigger.test_type`): what
+    /// QueryAlarm reports and what the delta-sign check and "delta 0 on a
+    /// comparison goes Inactive" read. A ChangeAlarm that fails on an
+    /// invalid test type still stores it, as Xorg does.
+    pub test_type: u32,
+    /// The test the trigger actually runs (Xorg's `trigger.CheckTrigger`):
+    /// set only when a test type validates, so it can differ from
+    /// `test_type` after such a failed ChangeAlarm.
+    pub check_type: u32,
+    /// Whether the owner receives this alarm's `AlarmNotify` events
+    /// (Xorg `pAlarm->events`; what QueryAlarm reports).
     pub events: bool,
     /// `XSyncAlarmState` (Active=0, Inactive=1, Destroyed=2).
     pub state: u8,
+    /// Clients other than the owner that selected `AlarmNotify` with the
+    /// `events` attribute of a ChangeAlarm, newest first (Xorg
+    /// `pAlarm->pEventClients`; `SyncEventSelectForAlarm` prepends).
+    pub event_clients: Vec<ClientId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2274,10 +2455,14 @@ impl Default for SyncAlarm {
             owner: ClientId(0),
             counter: 0,
             wait_value: 0,
+            value_type: 0,
+            raw_wait: 0,
             delta: 0,
             test_type: 0,
+            check_type: 0,
             events: false,
             state: 0,
+            event_clients: Vec::new(),
         }
     }
 }
@@ -2319,8 +2504,10 @@ pub struct ClientState {
     /// (X11 ChangeSaveSet semantics).
     pub save_set: HashSet<ResourceId>,
     pub big_requests_enabled: bool,
-    /// XI2 event masks: (window_id, device_id) -> mask
-    pub xi2_masks: HashMap<(ResourceId, u16), u32>,
+    /// XI2 event masks: (window_id, device_id) -> mask. Bit n selects
+    /// XI2 event type n; XI 2.4 defines types up to 32
+    /// (`XI_GestureSwipeEnd`), so the mask needs more than 32 bits.
+    pub xi2_masks: HashMap<(ResourceId, u16), u64>,
     /// XI1 `XEventClass` values the client has selected via
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
@@ -2398,23 +2585,9 @@ pub struct EventTarget {
 }
 
 impl ServerState {
-    /// Stage 4e — set the COW's input shape to empty (click-through) at
-    /// materialization. Mirrors Xorg's compositor convention where the
-    /// COW's default input region passes pointer events through to
-    /// underlying root children, with descendants like the compositor's
-    /// stage receiving input directly.
-    ///
-    /// Pairs with `ResourceTable::materialize_cow_resource` — both run
-    /// from the `GetOverlayWindow` handler on the 0→1 transition.
-    pub fn materialize_cow_input_shape(&mut self) {
-        self.shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(Vec::<xfixes::RegionRect>::new());
-    }
-
-    /// Symmetric teardown for [`Self::materialize_cow_input_shape`]. Called
-    /// from the `ReleaseOverlayWindow` handler on the 1→0 transition.
+    /// Drop the COW's shapes with the overlay: Xorg frees them in
+    /// DeleteWindow, so the next overlay starts unshaped. Called from the
+    /// `ReleaseOverlayWindow` handler on the 1→0 transition.
     pub fn destroy_cow_input_shape(&mut self) {
         self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
     }
@@ -2465,6 +2638,111 @@ impl ServerState {
             .map(|(child, _, _)| child)
     }
 
+    /// The child CirculateWindow restacks — Xorg `CirculateWindow`
+    /// (`dix/window.c:2443`): RaiseLowest (0) takes the lowest mapped child a
+    /// mapped sibling above overlaps, LowerHighest (1) the highest mapped
+    /// child that overlaps a mapped sibling below. The overlay window stays
+    /// out of it, capped on top.
+    #[must_use]
+    pub fn circulate_candidate(&self, parent: ResourceId, direction: u8) -> Option<ResourceId> {
+        let kids: Vec<ResourceId> = self
+            .resources
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|w| *w != crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .collect();
+        let mapped = |w: ResourceId| {
+            self.resources
+                .window(w)
+                .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped)
+        };
+        let overlaps_any = |w: ResourceId, others: &[ResourceId]| {
+            others
+                .iter()
+                .any(|s| mapped(*s) && self.siblings_overlap(w, *s))
+        };
+        if direction == 0 {
+            (0..kids.len())
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[i + 1..]))
+                .map(|i| kids[i])
+        } else {
+            (0..kids.len())
+                .rev()
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[..i]))
+                .map(|i| kids[i])
+        }
+    }
+
+    /// Xorg `BOXES_OVERLAP` of two siblings' border-inclusive extents, cut by
+    /// their bounding shapes (`ShapeOverlap`, `dix/window.c:1975`).
+    fn siblings_overlap(&self, a: ResourceId, b: ResourceId) -> bool {
+        let (ra, rb) = (self.sibling_region(a), self.sibling_region(b));
+        ra.iter().any(|p| {
+            rb.iter()
+                .any(|q| p.0 < q.2 && q.0 < p.2 && p.1 < q.3 && q.1 < p.3)
+        })
+    }
+
+    /// A window's bounding region in its parent's coordinates, as
+    /// `(x1, y1, x2, y2)` boxes.
+    fn sibling_region(&self, window: ResourceId) -> Vec<(i32, i32, i32, i32)> {
+        let Some(w) = self.resources.window(window) else {
+            return Vec::new();
+        };
+        let bw = i32::from(w.border_width);
+        let (x1, y1) = (i32::from(w.x), i32::from(w.y));
+        let (x2, y2) = (
+            x1 + i32::from(w.width) + 2 * bw,
+            y1 + i32::from(w.height) + 2 * bw,
+        );
+        let Some(shape) = self
+            .shape_windows
+            .get(&window)
+            .and_then(|s| s.bounding.as_ref())
+        else {
+            return vec![(x1, y1, x2, y2)];
+        };
+        let (ox, oy) = (x1 + bw, y1 + bw);
+        shape
+            .iter()
+            .map(|r| {
+                let (rx, ry) = (ox + i32::from(r.x), oy + i32::from(r.y));
+                (
+                    rx.max(x1),
+                    ry.max(y1),
+                    (rx + i32::from(r.width)).min(x2),
+                    (ry + i32::from(r.height)).min(y2),
+                )
+            })
+            .filter(|b| b.0 < b.2 && b.1 < b.3)
+            .collect()
+    }
+
+    /// The `focus` flag of a crossing on `window` (core and XI2): the core
+    /// focus is PointerRoot, or `window` or one of its ancestors (Xorg
+    /// `CoreEnterLeaveEvent` / `DeviceEnterLeaveEvent`, `dix/events.c:4772`).
+    #[must_use]
+    pub fn crossing_has_focus(&self, window: ResourceId) -> bool {
+        match self.core_focus.raw {
+            0 => false,
+            1 => true,
+            focus => {
+                let mut current = window;
+                for _ in 0..256 {
+                    if current.0 == focus {
+                        return true;
+                    }
+                    match self.resources.window(current) {
+                        Some(w) if w.parent != current => current = w.parent,
+                        _ => return false,
+                    }
+                }
+                false
+            }
+        }
+    }
+
     #[must_use]
     pub fn top_level_for_target(&self, target: ResourceId) -> ResourceId {
         let mut current = target;
@@ -2505,13 +2783,9 @@ impl ServerState {
     ) -> Option<(ResourceId, i16, i16)> {
         // Strict-Xorg miSpriteTrace: iterate children top-to-bottom and
         // let hit_test_child's window_input_contains gate decide each one.
-        // The COW is no longer special once it's a real root child
-        // (Phase 2 materialization). With its default empty input shape,
-        // hit_test_child(COW) returns None and the trace continues to
-        // the next sibling — exactly matching Xorg's mi/misprite.c.
-        // When a compositor populates the COW input region via XFIXES,
-        // the gate descends naturally via pointer_target_at_inner's
-        // recursive walk.
+        // The COW is no special case: like Xorg's it is created unshaped,
+        // so it takes the pointer until the compositor empties its input
+        // region, and the trace then continues to the next sibling.
         let parent_window = self.resources.window(parent)?;
         for child_id in parent_window.children.iter().rev() {
             if let Some(hit) = self.hit_test_child(*child_id, x, y) {
@@ -2564,23 +2838,26 @@ impl ServerState {
         Some((child_id, child_x, child_y))
     }
 
+    /// Xorg `miSpriteTrace` (`mi/miwindow.c:767`): a set bounding shape
+    /// (`PointInBorderSize`) and a set input shape must both hold the point.
     fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
-        let Some(rects) = self
-            .shape_windows
-            .get(&window)
-            .and_then(|state| state.input.as_ref())
-        else {
+        let Some(shape) = self.shape_windows.get(&window) else {
             return true;
         };
-        rects.iter().any(|rect| {
-            let rx = i32::from(rect.x);
-            let ry = i32::from(rect.y);
-            let rr = rx + i32::from(rect.width);
-            let rb = ry + i32::from(rect.height);
-            let px = i32::from(x);
-            let py = i32::from(y);
-            px >= rx && py >= ry && px < rr && py < rb
-        })
+        let holds = |rects: &Option<Vec<xfixes::RegionRect>>| {
+            rects.as_ref().is_none_or(|rects| {
+                rects.iter().any(|rect| {
+                    let rx = i32::from(rect.x);
+                    let ry = i32::from(rect.y);
+                    let rr = rx + i32::from(rect.width);
+                    let rb = ry + i32::from(rect.height);
+                    let px = i32::from(x);
+                    let py = i32::from(y);
+                    px >= rx && py >= ry && px < rr && py < rb
+                })
+            })
+        };
+        holds(&shape.bounding) && holds(&shape.input)
     }
 
     /// Diagnostic label for a window: `0x<id>[<WM_CLASS>]`. WM_CLASS is
@@ -2819,6 +3096,10 @@ impl ServerState {
                 .retain(|(window, _), _| !windows.contains(window));
             client.rebuild_xi1_global_event_classes();
         }
+        // Xorg `CursorFreeWindow`: a destroyed window takes every
+        // client's XFIXES cursor selection on it along.
+        self.xfixes_cursor_masks
+            .retain(|(_, window), _| !windows.contains(window));
     }
 
     pub fn find_passive_grab(
@@ -2951,7 +3232,7 @@ pub(crate) fn xi2_mask_for_client(
     target: ResourceId,
     fallback: ResourceId,
     device_candidates: &[u16],
-) -> u32 {
+) -> u64 {
     // Per window, OR the masks a client stored under the concrete device
     // AND the `XIAllMasterDevices(1)` / `XIAllDevices(0)` wildcards —
     // mirroring Xorg's `dix/events.c::EventMaskForClient`. A client may
@@ -3223,7 +3504,11 @@ fn pointer_event_fanout_inner(
                         via_xi2: grab.via_xi2,
                         implicit: false,
                         passive: true,
-                        xi2_mask: if grab.via_xi2 { grab.event_mask } else { 0 },
+                        xi2_mask: if grab.via_xi2 {
+                            u64::from(grab.event_mask)
+                        } else {
+                            0
+                        },
                     });
                     target
                 }
@@ -3382,6 +3667,7 @@ fn pointer_event_fanout_inner(
         }
         Err(_) => return,
     };
+    let focus = state.lock().is_ok_and(|g| g.crossing_has_focus(nested_id));
 
     for target in core_targets {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
@@ -3454,6 +3740,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
             PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3472,6 +3759,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
         }
@@ -3530,6 +3818,7 @@ fn pointer_event_fanout_inner(
                 0,
                 0,
                 2,
+                focus,
             );
         } else {
             // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the
@@ -3884,9 +4173,9 @@ mod tests {
             big_requests_enabled: false,
             xi2_masks: HashMap::from([
                 // XIAllMasterDevices(1): motion/enter/touch/gesture, NO buttons.
-                ((win, 1u16), 0x381c_00c0u32),
+                ((win, 1u16), 0x381c_00c0u64),
                 // XIAllDevices(0): includes ButtonPress(4)/ButtonRelease(5).
-                ((win, 0u16), 0x19f2u32),
+                ((win, 0u16), 0x19f2u64),
             ]),
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
@@ -4354,6 +4643,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4480,7 +4770,7 @@ mod tests {
                 via_xi2: true,
                 implicit: false,
                 passive: true,
-                xi2_mask: u32::MAX,
+                xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
@@ -4517,6 +4807,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4644,7 +4935,7 @@ mod tests {
                 via_xi2: true,
                 implicit: false,
                 passive: true,
-                xi2_mask: u32::MAX,
+                xi2_mask: u64::MAX,
             });
             s.button_grabs.push(PassiveButtonGrab {
                 owner: ClientId(1),
@@ -4681,6 +4972,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4802,6 +5094,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4926,6 +5219,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -4961,6 +5255,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -5024,6 +5319,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
         );
 
@@ -5044,6 +5340,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         let hit = s.find_key_grab(win, 24, 0x0040);
         assert!(hit.is_some());
@@ -5063,6 +5360,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         assert!(s.find_key_grab(win, 24, 0x0040).is_some());
         assert!(s.find_key_grab(win, 24, 0x0000).is_some());
@@ -5082,6 +5380,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         assert!(s.find_key_grab(win, 24, 0x0040).is_some());
         assert!(s.find_key_grab(win, 99, 0x0040).is_some());
@@ -5098,6 +5397,7 @@ mod tests {
             source: ActiveKeyboardGrabSource::Explicit,
             owner_events: false,
             via_xi2: false,
+            xi2_mask: 0,
         });
         assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
         s.active_keyboard_grab = None;
@@ -5335,10 +5635,15 @@ mod tests {
         );
         let _ = state.resources.map_window(sib);
 
-        // Materialize COW (full-screen, empty input shape per Task 2.8).
+        // Materialize the full-screen COW; the compositor empties its
+        // input region.
         let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
+        state
+            .shape_windows
+            .entry(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::new());
 
         // Click at (50, 50): inside both sibling and COW geometry. COW's
         // empty input shape → hit_test_child(COW) = None → iteration
@@ -5697,30 +6002,6 @@ mod tests {
         assert_eq!(
             target, stage,
             "non-empty COW input shape lets the trace descend to stage"
-        );
-    }
-
-    #[test]
-    fn cow_default_input_shape_is_empty() {
-        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
-
-        let mut state = ServerState::new();
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        let shape = state
-            .shape_windows
-            .get(&COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW must have a shape_windows entry after materialization");
-        assert!(
-            shape.input.is_some(),
-            "COW must have a non-default input shape (set, but empty)"
-        );
-        assert_eq!(
-            shape.input.as_ref().unwrap().len(),
-            0,
-            "COW's default input shape rects are empty (click-through)"
         );
     }
 
@@ -6085,9 +6366,13 @@ mod tests {
                     counter: x11sync::IDLETIME_COUNTER,
                     wait_value: *wait,
                     delta: 0,
-                    test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                    test_type: x11sync::TEST_POSITIVE_TRANSITION,
                     events: true,
                     state: x11sync::ALARM_STATE_ACTIVE,
+                    event_clients: Vec::new(),
+                    value_type: 0,
+                    raw_wait: *wait,
+                    check_type: x11sync::TEST_POSITIVE_TRANSITION,
                 },
             );
         }
@@ -6120,9 +6405,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6139,9 +6428,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_INACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6167,9 +6460,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(
@@ -6194,9 +6491,13 @@ mod tests {
                 counter: x11sync::IDLETIME_COUNTER,
                 wait_value: 60_000,
                 delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION,
                 events: true,
                 state: x11sync::ALARM_STATE_ACTIVE,
+                event_clients: Vec::new(),
+                value_type: 0,
+                raw_wait: 60_000,
+                check_type: x11sync::TEST_POSITIVE_TRANSITION,
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
@@ -6286,10 +6587,11 @@ mod tests {
             id_picture,
             PictureState {
                 client: owner,
-                host_picture_xid: PictureHandle::from_raw_for_test(1),
+                host_picture_xid: Some(PictureHandle::from_raw_for_test(1)),
                 host_owned_pixmap: None,
                 kind: PictureKind::Sourceless,
                 drawable: None,
+                window: None,
             },
         );
         expect.push(id_picture);
@@ -6315,7 +6617,7 @@ mod tests {
         );
         expect.push(id_dri3_syncobj);
 
-        // ── 10 ServerState extension namespaces ──
+        // ── 11 ServerState extension namespaces ──
 
         // 9. xfixes_regions
         let id_xfixes = base + 10;
@@ -6410,8 +6712,12 @@ mod tests {
             id_glx_ctx,
             GlxContext {
                 owner,
+                screen: 0,
+                visual_id: 0,
                 fbconfig: 0,
                 render_type: 0,
+                share_list: 0,
+                is_direct: true,
             },
         );
         expect.push(id_glx_ctx);
@@ -6429,6 +6735,7 @@ mod tests {
                 height: 0,
                 event_mask: 0,
                 glx_export_host_xid: None,
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
         expect.push(id_glx_draw);
@@ -6445,6 +6752,11 @@ mod tests {
         );
         expect.push(id_present);
 
+        // 19. record contexts
+        let id_record = base + 20;
+        state.record.insert_for_test(id_record, owner);
+        expect.push(id_record);
+
         // ── assertions ──
 
         for id in &expect {
@@ -6452,7 +6764,7 @@ mod tests {
         }
         assert_eq!(
             expect.len(),
-            19,
+            20,
             "one seed per namespace — update when adding namespaces"
         );
         assert!(!state.xid_occupied(base + 100), "unseeded id must be free");

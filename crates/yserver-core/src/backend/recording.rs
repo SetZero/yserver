@@ -34,6 +34,13 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    /// A key event handed to `on_host_input`; `repeat` distinguishes
+    /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
+    HostKey {
+        keycode: u8,
+        pressed: bool,
+        repeat: bool,
+    },
     CreateSubwindow {
         parent: u32,
         x: i16,
@@ -47,6 +54,8 @@ pub enum RecordedCall {
     DestroySubwindow(u32),
     MapSubwindow(u32),
     UnmapSubwindow(u32),
+    RealizeWindowStorage(u32),
+    ReleaseWindowStorage(u32),
     ConfigureSubwindow {
         host_xid: u32,
         config: HostSubwindowConfig,
@@ -114,6 +123,37 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    RenderCreatePicture {
+        host_drawable: AnyHandle,
+        host_pic: u32,
+    },
+    RenderFreePicture {
+        host_pic: u32,
+    },
+    RenderComposite {
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderFillRectangles {
+        host_dst: u32,
+    },
+    CopyPlane {
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        plane: u32,
+    },
+    PaintWindowBackgroundRect {
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    },
+    ReplaceCursor {
+        old_host_xid: u32,
+        new_host_xid: u32,
+    },
+    SetCursorHidden(bool),
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
@@ -199,6 +239,10 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
+    /// Queued "the sprite now shows this cursor" report handed out by
+    /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
+    /// sprite change.
+    pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -284,6 +328,11 @@ pub struct RecordingBackend {
     /// Test controls and observations for asynchronous CRTC configuration.
     /// `None` preserves the synchronous `apply_crtc_config` path.
     pub pending_crtc_config: Option<CrtcConfigToken>,
+    /// When set, a synchronous `apply_crtc_config` reports a change and the
+    /// following `refresh_randr_state_set_time` installs it into
+    /// `state.randr`, carrying client-owned state as the KMS rebuild does.
+    pub apply_crtc_configs: bool,
+    applied_crtc_config: Option<(u32, Option<ModeSpec>, i32, i32)>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
     pub crtc_config_results:
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
@@ -326,6 +375,8 @@ pub struct RecordingBackend {
     /// Configurable region returned by RENDER paint methods so core
     /// tests can assert exact damage plumbing without a real backend.
     pub render_return_region: Vec<xfixes::RegionRect>,
+    /// When true, `render_create_picture` cannot back the Picture (returns `Ok(None)`).
+    pub render_create_picture_fails: bool,
     /// Test controls for the asynchronous Present source-wait bridge.
     pub present_source_wait: PresentSourceWait,
     pub present_syncobj_wait: PresentSourceWait,
@@ -335,6 +386,13 @@ pub struct RecordingBackend {
     /// DRI3 fence xids passed to `dri3_trigger_fence`, in call order, so
     /// teardown/lifecycle tests can assert idle-fence release.
     pub triggered_dri3_fences: Vec<u32>,
+    /// Shared-memory fences (DRI3 FenceFromFD xshmfences) by xid, with
+    /// their in-memory triggered state; tests flip it to model the client
+    /// calling `xshmfence_trigger` / `xshmfence_reset` itself.
+    pub shm_fences: std::collections::HashMap<u32, bool>,
+    /// `(xid, triggered)` of each shared-memory fence `dri3_destroy_fence`
+    /// unmapped, with its in-memory state at unmap time.
+    pub destroyed_shm_fences: Vec<(u32, bool)>,
     /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
     /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
     /// release be asserted the same way `triggered_dri3_fences` covers
@@ -451,6 +509,8 @@ pub struct RecordingBackend {
     /// result lets request-layer tests prove M2b bypasses Copy entirely.
     pub present_direct_result: bool,
     pub present_direct_candidates: Vec<PresentScanoutCandidate>,
+    /// `(event, dst_host_xid)` passed to `enqueue_present_completion`, in call order.
+    pub enqueued_present_completions: Vec<(CompletedPresentEvent, u32)>,
     /// Adversarial-review fix (arm-before-scrap): when `Some(kind)`,
     /// `arm_present_syncobj_wait` still records the call but returns
     /// `Err(io::Error::from(kind))` instead of `Ok(present_syncobj_wait)`,
@@ -480,6 +540,7 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            displayed_cursor_change: None,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -507,6 +568,8 @@ impl RecordingBackend {
             provider_output_source_changed: true,
             provider_output_source_error: None,
             pending_crtc_config: None,
+            apply_crtc_configs: false,
+            applied_crtc_config: None,
             ready_crtc_configs: Vec::new(),
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
@@ -520,12 +583,15 @@ impl RecordingBackend {
             kbd_by_name_result: None,
             xkb_mods: (0, 0, 0, 0),
             render_return_region: Vec::new(),
+            render_create_picture_fails: false,
             present_source_wait: PresentSourceWait::Ready,
             present_syncobj_wait: PresentSourceWait::Ready,
             armed_present_syncobj_waits: Vec::new(),
             ready_present_source_waits: Vec::new(),
             finished_present_source_waits: Vec::new(),
             triggered_dri3_fences: Vec::new(),
+            shm_fences: std::collections::HashMap::new(),
+            destroyed_shm_fences: Vec::new(),
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
@@ -558,6 +624,7 @@ impl RecordingBackend {
             fail_copy_area: false,
             present_direct_result: false,
             present_direct_candidates: Vec::new(),
+            enqueued_present_completions: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
             applied_device_configs: Vec::new(),
@@ -737,7 +804,26 @@ impl Backend for RecordingBackend {
 
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
+        if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
+            *triggered = true;
+        }
         Ok(())
+    }
+
+    fn dri3_fence_triggered(&self, fence_xid: u32) -> Option<bool> {
+        self.shm_fences.get(&fence_xid).copied()
+    }
+
+    fn dri3_reset_fence(&mut self, fence_xid: u32) {
+        if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
+            *triggered = false;
+        }
+    }
+
+    fn dri3_destroy_fence(&mut self, fence_xid: u32) {
+        if self.shm_fences.remove(&fence_xid).is_some() {
+            self.destroyed_shm_fences.push((fence_xid, true));
+        }
     }
 
     fn dri3_signal_syncobj(&mut self, syncobj_xid: u32, value: u64) -> std::io::Result<()> {
@@ -914,6 +1000,11 @@ impl Backend for RecordingBackend {
         self.present_skip_count += 1;
     }
 
+    fn enqueue_present_completion(&mut self, event: CompletedPresentEvent, dst_host_xid: u32) {
+        self.enqueued_present_completions
+            .push((event, dst_host_xid));
+    }
+
     fn try_present_direct(
         &mut self,
         candidate: PresentScanoutCandidate,
@@ -1030,8 +1121,19 @@ impl Backend for RecordingBackend {
     fn on_host_input(
         &mut self,
         _state: &mut crate::server::ServerState,
-        _ev: crate::core_loop::HostInputEvent,
+        ev: crate::core_loop::HostInputEvent,
     ) {
+        use crate::core_loop::HostInputEvent;
+        let (key, repeat) = match ev {
+            HostInputEvent::Key(key) => (key, false),
+            HostInputEvent::KeyRepeat(key) => (key, true),
+            _ => return,
+        };
+        self.record(RecordedCall::HostKey {
+            keycode: key.keycode,
+            pressed: key.pressed,
+            repeat,
+        });
     }
 
     fn on_page_flip_ready(
@@ -1095,7 +1197,57 @@ impl Backend for RecordingBackend {
             x,
             y,
         });
-        Ok(false)
+        if self.apply_crtc_configs {
+            self.applied_crtc_config = Some((output_id, mode, x, y));
+        }
+        Ok(self.apply_crtc_configs)
+    }
+
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        set_time: u32,
+    ) {
+        let Some((output_id, mode, x, y)) = self.applied_crtc_config.take() else {
+            return;
+        };
+        let prev = &state.randr;
+        let mut outputs = prev.outputs.clone();
+        if let Some(output) = outputs.iter_mut().find(|o| o.output_id == output_id) {
+            let resolved = mode.and_then(|m| {
+                prev.mode_table.iter().find(|t| {
+                    output.mode_ids.contains(&t.mode_id)
+                        && (t.width, t.height, t.vrefresh) == (m.width, m.height, m.vrefresh)
+                })
+            });
+            // An off KMS output reports mode 0 at 0,0 with no size.
+            let (mode_id, width, height, vrefresh) =
+                resolved.map_or((0, 0, 0, 0), |m| (m.mode_id, m.width, m.height, m.vrefresh));
+            let (x, y) = if resolved.is_some() { (x, y) } else { (0, 0) };
+            output.mode_id = mode_id;
+            output.width = width;
+            output.height = height;
+            output.vrefresh = vrefresh;
+            output.x = i16::try_from(x).unwrap_or(i16::MAX);
+            output.y = i16::try_from(y).unwrap_or(i16::MAX);
+        }
+        let screen = (
+            prev.screen_width,
+            prev.screen_height,
+            prev.width_mm,
+            prev.height_mm,
+        );
+        let transforms = prev.crtc_transforms();
+        let mode_table = prev.mode_table.clone();
+        state.randr =
+            crate::randr::RandrState::from_outputs_with_modes(set_time, outputs, mode_table);
+        state.randr.restore_crtc_transforms(transforms);
+        (
+            state.randr.screen_width,
+            state.randr.screen_height,
+            state.randr.width_mm,
+            state.randr.height_mm,
+        ) = screen;
     }
 
     fn begin_crtc_config(
@@ -1247,6 +1399,24 @@ impl Backend for RecordingBackend {
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.record(RecordedCall::UnmapSubwindow(host_xid));
+        Ok(())
+    }
+
+    fn realize_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::RealizeWindowStorage(host_xid));
+        Ok(())
+    }
+
+    fn release_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ReleaseWindowStorage(host_xid));
         Ok(())
     }
 
@@ -1633,20 +1803,44 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
+    fn paint_window_background_rect(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::PaintWindowBackgroundRect {
+            host_xid,
+            x,
+            y,
+            width,
+            height,
+        });
+        Ok(())
+    }
+
     fn copy_plane(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
+        src_host_xid: u32,
+        dst_host_xid: u32,
         _src_x: i16,
         _src_y: i16,
         _dst_x: i16,
         _dst_y: i16,
         _width: u16,
         _height: u16,
-        _plane: u32,
+        plane: u32,
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: copy_plane")
+        self.record(RecordedCall::CopyPlane {
+            src_host_xid,
+            dst_host_xid,
+            plane,
+        });
+        Ok(())
     }
 
     fn put_image(
@@ -1744,7 +1938,7 @@ impl Backend for RecordingBackend {
         _foreground: u32,
         _rectangles: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_fill_rectangle")
+        Ok(())
     }
 
     fn poly_fill_arc(
@@ -1837,18 +2031,26 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: image_text16")
     }
 
-    // RENDER — `unimplemented!()`; render_opcode() returns None so call
-    // sites fast-path out before reaching these.
+    // RENDER — Picture create/free and the Composite/FillRectangles paints are recorded;
+    // the rest are no-ops.
 
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_drawable: AnyHandle,
+        host_drawable: AnyHandle,
         _ynest_format: u32,
         _value_mask: u32,
         _values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        if self.render_create_picture_fails {
+            return Ok(None);
+        }
+        let host_pic = self.allocate_handle();
+        self.record(RecordedCall::RenderCreatePicture {
+            host_drawable,
+            host_pic,
+        });
+        Ok(PictureHandle::from_raw(host_pic))
     }
 
     fn render_change_picture(
@@ -1863,8 +2065,9 @@ impl Backend for RecordingBackend {
     fn render_free_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreePicture { host_pic });
         Ok(())
     }
 
@@ -1906,9 +2109,9 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         _op: u8,
-        _host_src: u32,
+        host_src: u32,
         _host_mask: u32,
-        _host_dst: u32,
+        host_dst: u32,
         _src_x: i16,
         _src_y: i16,
         _mask_x: i16,
@@ -1918,6 +2121,7 @@ impl Backend for RecordingBackend {
         _width: u16,
         _height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderComposite { host_src, host_dst });
         Ok(self.render_return_region.clone())
     }
 
@@ -1942,13 +2146,14 @@ impl Backend for RecordingBackend {
     fn render_fill_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_dst: u32,
+        host_dst: u32,
         _op: u8,
         _color: [u8; 8],
         _rects: &[u8],
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFillRectangles { host_dst });
         Ok(())
     }
 
@@ -2060,13 +2265,25 @@ impl Backend for RecordingBackend {
         Ok(None)
     }
 
-    fn xfixes_change_cursor_by_name(
+    fn replace_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_cursor_xid: u32,
-        _name_bytes: &[u8],
+        old_host_xid: u32,
+        new_host_xid: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::ReplaceCursor {
+            old_host_xid,
+            new_host_xid,
+        });
         Ok(())
+    }
+
+    fn set_cursor_hidden(&mut self, hidden: bool) {
+        self.record(RecordedCall::SetCursorHidden(hidden));
+    }
+
+    fn take_displayed_cursor_change(&mut self) -> Option<crate::backend::DisplayedCursor> {
+        self.displayed_cursor_change.take()
     }
 
     fn set_shape_rectangles(

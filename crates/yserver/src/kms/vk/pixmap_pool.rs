@@ -110,6 +110,20 @@ pub struct PooledPixmapImage {
 ///
 /// Indices match `OVERSIZE_BIN_THRESHOLDS` below — the helper keeps
 /// the print order stable and self-documenting.
+/// Live occupancy of the pool. See [`PixmapPool::residency`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PixmapPoolResidency {
+    /// Distinct `(w, h, format)` buckets, including emptied ones —
+    /// nothing ever removes a bucket from the map.
+    pub buckets: u64,
+    /// Of those, how many currently hold no entries.
+    pub empty_buckets: u64,
+    /// Entries held across all buckets.
+    pub entries: u64,
+    /// Lower bound on bytes held: see [`PixmapPool::residency`].
+    pub nominal_bytes: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PixmapPoolStats {
     pub total_takes_hit: u64,
@@ -118,6 +132,21 @@ pub struct PixmapPoolStats {
     pub total_returns_rejected_bucket_full: u64,
     pub total_returns_rejected_oversize: u64,
     pub total_returns_rejected_oversize_by_bucket: [u64; 4],
+}
+
+impl PixmapPoolStats {
+    /// The counters `vram churn` reports: a hit or an accepted return is
+    /// a `vkAllocateMemory` / `vkFreeMemory` the pool saved; a rejected
+    /// return (bucket full, or larger than `MAX_POOLED_DIM`) is a free.
+    #[must_use]
+    pub fn pool_counters(&self) -> crate::kms::vk::mem_accounting::PoolCounters {
+        crate::kms::vk::mem_accounting::PoolCounters {
+            hits: self.total_takes_hit,
+            misses: self.total_takes_miss,
+            kept: self.total_returns_accepted,
+            dropped: self.total_returns_rejected_bucket_full + self.total_returns_rejected_oversize,
+        }
+    }
 }
 
 /// Upper bound of each oversize-reject bin, indexed in lockstep
@@ -172,6 +201,19 @@ pub fn register_for_telemetry(pool: &Arc<PixmapPool>) {
 pub fn telemetry_snapshot() -> Option<PixmapPoolStats> {
     let weak = GLOBAL_LATEST_POOL.lock().ok()?.clone();
     weak.upgrade().map(|p| p.stats())
+}
+
+/// Live-occupancy counterpart to [`telemetry_snapshot`].
+///
+/// Reported separately from the cumulative stats because residency
+/// is the question the stats cannot answer: entries leave a bucket
+/// only via `try_take`, so `returns_accepted - takes_hit` is the
+/// only way to infer it from counters, and that is a difference of
+/// two large numbers rather than a measurement.
+#[must_use]
+pub fn residency_snapshot() -> Option<PixmapPoolResidency> {
+    let g = GLOBAL_LATEST_POOL.lock().ok()?;
+    Some(g.upgrade()?.residency())
 }
 
 pub struct PixmapPool {
@@ -234,6 +276,49 @@ impl PixmapPool {
         by_budget.clamp(PIXMAP_POOL_BUCKET_CAP_MIN, PIXMAP_POOL_BUCKET_CAP_MAX)
     }
 
+    /// What the pool is holding *right now*, as opposed to the
+    /// cumulative counters in [`PixmapPoolStats`].
+    ///
+    /// Why this exists: the pool has no eviction, no global cap and
+    /// no bucket-count cap, and `drain` runs only at shutdown, so
+    /// everything it accepts stays resident for the session. That
+    /// makes it a candidate for the ~1.4 GiB floor reported in GH
+    /// discussion 56, and the cumulative counters cannot answer it —
+    /// residency is `returns_accepted - takes_hit`, which is a
+    /// difference of two large numbers rather than a measurement.
+    ///
+    /// `nominal_bytes` is `w * h * bytes_per_pixel` summed over live
+    /// entries. It is a FLOOR, not the true cost: the allocation is
+    /// `mem_reqs.size` for an OPTIMAL-tiled image, and with no
+    /// suballocator each entry is its own kernel BO subject to a
+    /// minimum granularity. Treat it as "at least this much".
+    #[must_use]
+    pub fn residency(&self) -> PixmapPoolResidency {
+        let Ok(buckets) = self.buckets.lock() else {
+            return PixmapPoolResidency::default();
+        };
+        let mut out = PixmapPoolResidency {
+            buckets: buckets.len() as u64,
+            ..Default::default()
+        };
+        for (key, bucket) in buckets.iter() {
+            let n = bucket.len() as u64;
+            if n == 0 {
+                // A bucket emptied by `try_take` is never removed —
+                // counted separately so an all-empty map is not
+                // mistaken for held memory.
+                out.empty_buckets += 1;
+                continue;
+            }
+            out.entries += n;
+            let entry_bytes = u64::from(key.width)
+                .saturating_mul(u64::from(key.height))
+                .saturating_mul(u64::from(format_bytes_per_pixel(key.format)));
+            out.nominal_bytes = out.nominal_bytes.saturating_add(entry_bytes * n);
+        }
+        out
+    }
+
     /// Take a recycled entry for `key`, or `None` if the bucket is
     /// empty.
     pub fn try_take(&self, key: PixmapPoolKey) -> Option<PooledPixmapImage> {
@@ -246,7 +331,12 @@ impl PixmapPool {
             .expect("pixmap pool buckets mutex poisoned");
         let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
         let entry = buckets.get_mut(&key).and_then(VecDeque::pop_front);
-        if entry.is_some() {
+        if let Some(e) = entry.as_ref() {
+            // The caller recategorises again if it is not a pixmap.
+            crate::kms::vk::mem_accounting::recategorise(
+                e.memory,
+                crate::kms::vk::mem_accounting::MemCategory::Pixmap,
+            );
             stats.total_takes_hit += 1;
         } else {
             stats.total_takes_miss += 1;
@@ -283,6 +373,10 @@ impl PixmapPool {
                 .total_returns_rejected_bucket_full += 1;
             return Err(entry);
         }
+        crate::kms::vk::mem_accounting::recategorise(
+            entry.memory,
+            crate::kms::vk::mem_accounting::MemCategory::PoolIdle,
+        );
         bucket.push_back(entry);
         self.stats
             .lock()
@@ -310,7 +404,7 @@ impl PixmapPool {
         unsafe {
             self.vk.device.destroy_image_view(entry.view, None);
             self.vk.device.destroy_image(entry.image, None);
-            self.vk.device.free_memory(entry.memory, None);
+            crate::kms::vk::mem_accounting::free_memory(&self.vk.device, entry.memory);
         }
     }
 
@@ -373,6 +467,27 @@ mod tests {
     // unit-testable without a real Vulkan device. Pure-decision
     // logic (eligible, bucket-cap check, key hashing) is testable
     // standalone via these helpers.
+
+    #[test]
+    fn pool_counters_count_both_reject_paths_as_drops() {
+        let stats = PixmapPoolStats {
+            total_takes_hit: 7,
+            total_takes_miss: 3,
+            total_returns_accepted: 5,
+            total_returns_rejected_bucket_full: 2,
+            total_returns_rejected_oversize: 4,
+            total_returns_rejected_oversize_by_bucket: [0, 1, 1, 2],
+        };
+        assert_eq!(
+            stats.pool_counters(),
+            crate::kms::vk::mem_accounting::PoolCounters {
+                hits: 7,
+                misses: 3,
+                kept: 5,
+                dropped: 6,
+            }
+        );
+    }
 
     #[test]
     fn eligible_under_max_dim() {

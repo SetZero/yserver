@@ -311,8 +311,10 @@ yserver-reset-hw log="info":
         echo "";\
         echo "reset-hw: done. Please send $resetlog from this directory."'
 
+# Sources /etc/xprofile and ~/.xprofile like display managers do, so a startx
+# session gets the same environment (e.g. SSH_AUTH_SOCK) as a lightdm login.
 startx log="info":
-    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    cargo build --release --bin yserver
     bash -c '\
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
         display=0;\
@@ -323,12 +325,16 @@ startx log="info":
         xauth -f "$authfile" add ":$display" . "$cookie";\
         xauth -f "$userauth" add ":$display" . "$cookie";\
         echo "startx: using DISPLAY=:$display (server auth $authfile; cookie also added to $userauth)";\
-        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
         [ -f "$xinitrc" ] || xinitrc=/etc/X11/xinit/xinitrc;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 XAUTHORITY="$userauth" DISPLAY=":$display" sh "$xinitrc" > startx.log 2>&1;\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export XDG_SESSION_TYPE=x11 XAUTHORITY="$userauth" DISPLAY=":$display";\
+        if [ -f /etc/xprofile ]; then . /etc/xprofile; fi;\
+        if [ -f "$HOME/.xprofile" ]; then . "$HOME/.xprofile"; fi;\
+        sh "$xinitrc" > startx.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         xauth -f "$userauth" remove ":$display" 2>/dev/null;\
@@ -1050,6 +1056,86 @@ yserver-awesome-hw-audit log="info" interval="30" idle="5":
 # `grep "loop telemetry" yserver-hw-awesome.log` for the per-second rollups.
 # RUST_LOG defaults to `info` so the rollup lines come through; pass
 # `log=warn` for quieter output (but you lose the rollups — they're info!).
+# Long-run resource telemetry (vram / vram by use / gpu load / pixmap pool live) only, for
+# leaving a session up for a day; plain `log=info` recipes grow by GB/hour.
+# Contributors send the log (`gzip -k`), they don't read it. The last sample
+# is post-teardown (pool drained): read the floor from `grep -v 'entries=0'`.
+yserver-awesome-hw-resources:
+    cargo build --release --bin yserver
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 \
+            RUST_LOG="warn,yserver::resources=info" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-awesome-resources.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            DISPLAY=:7 awesome > awesome.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
+# Validation-layer session on yserver only (clients don't inherit it):
+# awesome + picom --backend glx + glxgears, stops itself after `seconds`.
+yserver-awesome-hw-validation bin="target/release/yserver" label="current" seconds="60":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    missing=""
+    for c in awesome picom glxgears; do command -v "$c" >/dev/null || missing="$missing $c"; done
+    [ -f /usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json ] || missing="$missing vulkan-validation-layers"
+    if [ -n "$missing" ]; then echo "missing:$missing"; exit 1; fi
+    if [ "{{bin}}" = "target/release/yserver" ]; then cargo build --release --bin yserver || exit 1; fi
+    log="$PWD/yserver-validation-{{label}}.vk.log"
+    rm -f "$log"
+    xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd"
+    VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+    VK_KHRONOS_VALIDATION_DEBUG_ACTION=VK_DBG_LAYER_ACTION_LOG_MSG \
+    VK_KHRONOS_VALIDATION_LOG_FILENAME="$log" \
+    VK_KHRONOS_VALIDATION_REPORT_FLAGS=error,warn \
+    VK_KHRONOS_VALIDATION_DUPLICATE_MESSAGE_LIMIT=0 \
+    RUST_LOG=warn RUST_BACKTRACE=1 "{{bin}}" > yserver-hw-validation-{{label}}.log 2>&1 &
+    ys=$!
+    sleep 2
+    unset WAYLAND_DISPLAY WAYLAND_SOCKET
+    export DISPLAY=:7 GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd"
+    awesome > awesome.log 2>&1 & aw=$!
+    sleep 2
+    picom --backend glx > picom.log 2>&1 & pc=$!
+    sleep 1
+    glxgears > /dev/null 2>&1 & gg=$!
+    sleep {{seconds}}
+    kill -TERM $gg $pc $aw 2>/dev/null; wait $gg $pc $aw 2>/dev/null
+    kill -TERM $ys 2>/dev/null; wait $ys 2>/dev/null
+    rm -rf "$xdg_rd"
+    echo "== {{label}}: $log"
+    if [ -f "$log" ]; then grep -oE '\[ [A-Za-z0-9_-]+ \]' "$log" | sort | uniq -c | sort -rn; else echo "   (no validation messages)"; fi
+
+# A/B of the above: `before` built in a worktree under target/, then the checkout.
+yserver-awesome-hw-validation-ab before="16581ab3" seconds="60":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    wt=target/validation-before
+    [ -d "$wt" ] || git worktree add --detach "$wt" {{before}} || exit 1
+    git -C "$wt" checkout -q --detach {{before}} || exit 1
+    (cd "$wt" && cargo build --release --bin yserver) || exit 1
+    just yserver-awesome-hw-validation "$wt/target/release/yserver" before {{seconds}}
+    just yserver-awesome-hw-validation target/release/yserver after {{seconds}}
+    n() { [ -f "$2" ] || { echo 0; return; }; grep -c "$1" "$2"; true; }
+    echo
+    for l in before after; do
+        f=yserver-validation-$l.vk.log
+        printf '%-7s semaphore-in-use=%s  query-not-reset=%s\n' "$l" \
+            "$(n 'currently in use by VkQueue' "$f")" "$(n 'query not reset' "$f")"
+    done
+    if [ "$(n 'currently in use by VkQueue' yserver-validation-before.vk.log)" = 0 ] \
+        && [ "$(n 'query not reset' yserver-validation-before.vk.log)" = 0 ]; then
+        echo "WARNING: 'before' shows neither error -- this box does not reach those paths; inconclusive."
+    fi
+
 yserver-awesome-hw-telemetry log="info":
     cargo build --release --bin yserver
     rm -f yserver-awesome.submit.tsv
@@ -1394,6 +1480,23 @@ yserver-wmaker-xterm-hw-trace log="debug":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
+# ============================== VNG SUITE ==============================
+
+# Registered vng scenarios (tools/vng-scenarios/suite.list); filter is a name regex.
+#   just vng-suite                 just vng-suite span venus
+vng-suite filter="all" gpu="none" binary="":
+    KERNEL={{KERNEL}} tools/vng-suite.sh --gpu {{gpu}} {{ if binary != "" { "--binary " + binary } else { "" } }} {{filter}}
+
+# Rewrite tools/vng-scenarios/goldens/ from Xorg 21.1 in the guest; review the diff like code.
+#   just vng-goldens xrandr-dpi
+vng-goldens filter="all":
+    KERNEL={{KERNEL}} tools/vng-suite.sh --gpu none --regen-goldens {{filter}}
+
+# The runner's own self-test: fail, crash, timeout and SIGINT must all fail cleanly.
+vng-suite-selftest gpu="none":
+    cargo build --bin yserver
+    KERNEL={{KERNEL}} tools/vng-scenarios/suite-selftest/run.sh {{gpu}} --binary target/debug/yserver
+
 # ============================== RENDERCHECK ==============================
 
 # Run rendercheck against yserver (KMS) inside virtme-ng.
@@ -1403,9 +1506,29 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
         --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
 
-# Run rendercheck on host
-rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
-    tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
+# Run rendercheck against yserver on this machine's KMS, from a free TTY.
+# Tally goes to rendercheck-hw.log, the server log to yserver-hw-rendercheck.log.
+rendercheck-yserver-hw timeout="900" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
+    cargo build --release --bin yserver
+    bash -c '\
+        for t in xdpyinfo xset rendercheck; do \
+            command -v $t >/dev/null || { echo "error: $t not installed" >&2; exit 2; };\
+        done;\
+        RUST_LOG=warn RUST_BACKTRACE=1 target/release/yserver > yserver-hw-rendercheck.log 2>&1 &\
+        yserver_pid=$!;\
+        for _ in $(seq 1 150); do \
+            kill -0 $yserver_pid 2>/dev/null || break;\
+            DISPLAY=:7 timeout 2 xdpyinfo >/dev/null 2>&1 && break; sleep 0.2;\
+        done;\
+        if ! DISPLAY=:7 timeout 2 xdpyinfo >/dev/null 2>&1; then \
+            kill -0 $yserver_pid 2>/dev/null && alive=running || alive=exited;\
+            echo "error: no X server answering on :7 (yserver $alive; socket: $(ls /tmp/.X11-unix/X7 2>&1))" >&2;\
+            DISPLAY=:7 timeout 2 xdpyinfo 2>&1 | head -3 >&2; tail -30 yserver-hw-rendercheck.log >&2;\
+            kill -TERM $yserver_pid 2>/dev/null; wait $yserver_pid 2>/dev/null; exit 2;\
+        fi;\
+        tools/rendercheck.sh :7 {{timeout}} {{tests}} > rendercheck-hw.log 2>&1; rc=$?;\
+        kill -TERM $yserver_pid 2>/dev/null; wait $yserver_pid 2>/dev/null;\
+        cat rendercheck-hw.log; exit $rc'
 
 # ============================== XTS ==============================
 

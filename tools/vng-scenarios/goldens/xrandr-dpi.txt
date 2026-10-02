@@ -1,0 +1,7 @@
+==> dpi.log <==
+=== before
+  dimensions:    1280x800 pixels (<startup mm> millimeters)
+  resolution:    96x96 dots per inch
+=== after xrandr --dpi 108
+  dimensions:    1280x800 pixels (301x188 millimeters)
+  resolution:    108x108 dots per inch

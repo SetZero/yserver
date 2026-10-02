@@ -10,6 +10,8 @@
 //! --ignored` under vng or on bare metal.
 
 #![cfg(target_os = "linux")]
+// Test-side client buffers, outside the server's memory ledger.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 

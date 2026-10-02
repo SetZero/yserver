@@ -1,0 +1,98 @@
+name: vng suite
+# Real yserver in a KVM guest (2D virtio-gpu + lavapipe): tools/vng-suite.sh.
+# PRs and pushes run the quick set; nightly and manual runs the whole suite.
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: scenario regex (all = everything)
+        default: all
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '17 3 * * *'
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  vng:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Runner facts
+        run: |
+          uname -a
+          lscpu | grep -E 'Model name|^CPU\(s\)|Virtualization|Hypervisor'
+          grep -o -w -E 'vmx|svm' /proc/cpuinfo | sort | uniq -c || echo "no vmx/svm flag"
+          ls -la /dev/kvm /dev/udmabuf || true
+          lsmod | grep -E 'kvm|udmabuf' || true
+      - name: Open /dev/kvm and /dev/udmabuf
+        run: |
+          if [ ! -e /dev/udmabuf ]; then
+            sudo modprobe udmabuf \
+              || { sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe udmabuf; } \
+              || echo "udmabuf unavailable"
+          fi
+          printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            'KERNEL=="udmabuf", MODE="0666"' | sudo tee /etc/udev/rules.d/99-vng.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm trigger --name-match=udmabuf
+          ls -la /dev/kvm /dev/udmabuf
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base xfonts-100dpi xfonts-75dpi \
+            qemu-system-x86 busybox-static mesa-vulkan-drivers xterm x11-xserver-utils x11-utils xdotool python3-xlib python3-pil imagemagick dbus \
+            libx11-dev libxcb1-dev libxcb-composite0-dev libxcb-damage0-dev libxcb-dri3-dev libxcb-present-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-record0-dev libxcb-render0-dev libxcb-shm0-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-xtest0-dev libxkbcommon-x11-dev \
+            wmctrl xinput x11-xkb-utils xserver-xorg-core xserver-xorg-input-libinput
+          # virtme-ng with virtiofsd: memfd guest RAM, needed for blob=on.
+          sudo apt-get install -y virtme-ng virtiofsd
+      - name: Guest kernel
+        # A generic kernel carries virtio-gpu/drm; the runner's own azure one may not.
+        # Unpacked, not installed: vng boots vmlinuz directly, so no postinst/initramfs.
+        run: |
+          img=$(apt-cache depends linux-image-generic | awk '/Depends: linux-image-[0-9]/{print $2; exit}')
+          ver=${img#linux-image-}
+          cd "$RUNNER_TEMP"
+          apt-get download "$img" "linux-modules-$ver"
+          apt-get download "linux-modules-extra-$ver" 2>/dev/null || true
+          for d in ./*.deb; do sudo dpkg -x "$d" /; done
+          sudo depmod "$ver"
+          sudo chmod 0644 "/boot/vmlinuz-$ver"
+          echo "KERNEL=/boot/vmlinuz-$ver" >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build yserver
+        run: cargo build --locked --bin yserver
+      - name: Versions
+        run: |
+          echo "guest kernel: $KERNEL"
+          qemu-system-x86_64 --version | head -1
+          vng --version
+          dpkg-query -W mesa-vulkan-drivers
+          ls /usr/share/vulkan/icd.d/
+      - name: vng suite (gpu none)
+        env:
+          QUICK: '^(xterm|span-paint|pixel-oracle|xrandr-(scale|scale-crop|dpi|monitors|monitors-2|orientation|scale-cursor)|xmodmap-caps-control|xkbcomp-upload|subwindow-move|child-clip)$'
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          case "${{ github.event_name }}" in
+            schedule) filter=all ;;
+            workflow_dispatch) filter=$SCENARIOS ;;
+            *) filter=$QUICK ;;
+          esac
+          SPAN_ROUNDS=3 tools/vng-suite.sh --gpu none --binary target/debug/yserver --out target/vng-suite/ci "$filter"
+      - name: Drop sockets before upload
+        if: always()
+        run: find target/vng-suite -type s -delete 2>/dev/null || true
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vng-suite
+          path: target/vng-suite/**
+          if-no-files-found: warn

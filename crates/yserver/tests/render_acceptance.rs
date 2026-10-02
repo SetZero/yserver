@@ -2175,7 +2175,7 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
         )
         .expect("top-level");
     let top_xid = top.as_raw();
-    b.map_subwindow(None, top_xid).expect("map top");
+    b.map_window_for_tests(top_xid).expect("map top");
 
     b.fill_rectangle(None, top_xid, 0x0000_0000, 0, 0, 100, 90)
         .expect("clear top");
@@ -2208,7 +2208,7 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
                 None,
             )
             .expect("strip child");
-        b.map_subwindow(None, child.as_raw()).expect("map child");
+        b.map_window_for_tests(child.as_raw()).expect("map child");
         for j in 0..9 {
             let grandchild = b
                 .create_subwindow(
@@ -2228,7 +2228,7 @@ fn root_fill_with_include_inferiors_matches_top_level_result() {
                     None,
                 )
                 .expect("strip grandchild");
-            b.map_subwindow(None, grandchild.as_raw())
+            b.map_window_for_tests(grandchild.as_raw())
                 .expect("map grandchild");
         }
     }
@@ -2329,7 +2329,7 @@ fn stroke_on_root_include_inferiors_reaches_redirected_toplevel_backing() {
         )
         .expect("top-level W");
     let w_xid = w.as_raw();
-    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_window_for_tests(w_xid).expect("map W");
 
     // Redirected backing for W. `get_image(w_xid)` now reads this.
     let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
@@ -2414,7 +2414,7 @@ fn stroke_root_xor_include_inferiors_no_gap_over_subwindow() {
         )
         .expect("top-level W");
     let w_xid = w.as_raw();
-    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_window_for_tests(w_xid).expect("map W");
 
     let backing = b.create_pixmap(None, 24, 200, 200).expect("W backing");
     assert!(
@@ -2447,7 +2447,7 @@ fn stroke_root_xor_include_inferiors_no_gap_over_subwindow() {
             None,
         )
         .expect("child C");
-    b.map_subwindow(None, c.as_raw()).expect("map C");
+    b.map_window_for_tests(c.as_raw()).expect("map C");
 
     // GC: IncludeInferiors + Invert.
     b.apply_draw_state(
@@ -2887,8 +2887,7 @@ fn subwindow_resize_clears_old_paint() {
     };
 
     // Create depth-32 child window at 16×16 with no bg attributes.
-    // 3f.14's allocate_window_storage fills it with transparent-
-    // black on creation.
+    // The map allocates it; bg None seeds it from the parent (the root).
     let parent = WindowHandle::from_raw(1).expect("root WindowHandle");
     let child = b
         .create_subwindow(
@@ -2909,6 +2908,7 @@ fn subwindow_resize_clears_old_paint() {
         )
         .expect("create_subwindow");
     let xid = child.as_raw();
+    b.map_window_for_tests(xid).expect("map");
 
     // Paint red into the 16×16 window so the "old paint" exists.
     // Foreground 0xFFFF0000 = ARGB(0xFF, R=0xFF, G=0, B=0).
@@ -3277,6 +3277,7 @@ fn clear_area_with_bg_pixmap_tiles_window_background() {
         )
         .expect("window");
     let xid = window.as_raw();
+    b.map_window_for_tests(xid).expect("map");
 
     b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
         .expect("window blue");
@@ -3364,6 +3365,7 @@ fn resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
         )
         .expect("window");
     let xid = window.as_raw();
+    b.map_window_for_tests(xid).expect("map");
 
     b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
         .expect("window blue");
@@ -3398,8 +3400,7 @@ fn resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
 /// (3f.10) handed back stale content — caja's drag exhibited this
 /// as widget-rect islands on black. Test: create a 16×16 depth-32
 /// subwindow, register it through the Backend trait, then
-/// get_image its xid and assert every pixel is transparent black
-/// (depth-32 safe default).
+/// get_image its xid and assert no pool garbage shows (step 5: the map seeds from the parent).
 ///
 /// We don't directly exercise the pool here — the test fixture's
 /// platform has no `pixmap_pool` attached, so fresh allocs always
@@ -3446,19 +3447,19 @@ fn window_storage_no_bg_pixel_inits_to_safe_default() {
         )
         .expect("create_subwindow");
     let child_xid = child.as_raw();
+    b.map_window_for_tests(child_xid).expect("map");
 
     let out = b
         .get_image_pixels_for_tests(child_xid, 2, 0, 0, 16, 16, !0)
         .expect("get_image")
         .expect("Some");
     assert_eq!(out.len(), 16 * 16 * 4);
-    // Depth-32 → transparent black `(0, 0, 0, 0)` per
-    // `default_window_init_color`.
+    // Background None: realize seeds over the safe default from the parent, the root's 0x505050.
     for (i, px) in out.chunks_exact(4).enumerate() {
         assert_eq!(
             &px[0..4],
-            &[0x00, 0x00, 0x00, 0x00],
-            "fresh depth-32 storage pixel #{i} must be transparent black (got {:?})",
+            &[0x50, 0x50, 0x50, 0xFF],
+            "fresh depth-32 storage pixel #{i} must hold the parent's pixels (got {:?})",
             &px[0..4],
         );
     }
@@ -3658,7 +3659,7 @@ fn unredirect_restores_the_window_leaf_from_the_backing() {
     // The restore walks the plan `plan_backing_inferiors` builds, and
     // that walk prunes unmapped subtrees (X11: an unmapped window is
     // invisible), so W has to be mapped for any of this to be reached.
-    b.map_subwindow(None, w_xid).expect("map W");
+    b.map_window_for_tests(w_xid).expect("map W");
 
     // Redirect through the production path: allocates the backing,
     // seeds it parent → B and installs the route.
@@ -3732,14 +3733,14 @@ fn unredirect_restores_a_reparented_child_leaf_not_just_the_frame() {
         .create_subwindow(None, root, 0, 0, 16, 16, 0, visual, None, None)
         .expect("create frame");
     let frame_xid = frame.as_raw();
-    b.map_subwindow(None, frame_xid).expect("map frame");
+    b.map_window_for_tests(frame_xid).expect("map frame");
     // The client's window, reparented inside the frame at (2, 3) —
     // background None, dolphin's shape.
     let client = b
         .create_subwindow(None, frame, 2, 3, 8, 8, 0, visual, None, None)
         .expect("create client");
     let client_xid = client.as_raw();
-    b.map_subwindow(None, client_xid).expect("map client");
+    b.map_window_for_tests(client_xid).expect("map client");
 
     // The compositor redirects the FRAME, not the client window.
     let backing = b
@@ -3815,6 +3816,7 @@ fn set_redirected_target_descendant_fill_lands_at_offset() {
         )
         .expect("create W");
     let w_xid = w.as_raw();
+    b.map_window_for_tests(w_xid).expect("map");
     let c = b
         .create_subwindow(
             None,
@@ -3834,6 +3836,7 @@ fn set_redirected_target_descendant_fill_lands_at_offset() {
         )
         .expect("create C");
     let c_xid = c.as_raw();
+    b.map_window_for_tests(c_xid).expect("map");
 
     // Allocate B (a pixmap) for the backing storage. Seed it black
     // so the post-fill check can detect green-at-offset.
@@ -4434,11 +4437,8 @@ fn mode_flip_preserves_backing_and_aliases() {
 //     return `BadMatch` per the X11 COMPOSITE spec, not silently
 //     succeed with an alias to whatever backing exists.
 //
-// TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
-// - existing_alias_survives_window_unmap
-//     A held NameWindowPixmap alias must keep the backing alive past
-//     a subsequent UnmapWindow(W) (no race that drops the storage
-//     when the redirect map clears).
+// existing_alias_survives_window_unmap: covered by the lib test
+// `named_pixmap_survives_unmap_and_remap_gets_new_backing`.
 
 /// Stage 4d — paint into the Composite Overlay Window via its xid
 /// after `GetOverlayWindow`, and assert the paint lands on COW
@@ -4622,6 +4622,226 @@ fn render_composite_depth24_src_samples_opaque_alpha() {
                  Pre-fix this would be 0x00 — the depth-24 src padding byte.",
             );
         }
+    }
+}
+
+/// As [`copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha`],
+/// but through a bitmap clip mask, which routes CopyArea to the GPU
+/// masked blit — a second raw-copy path with the same leak. The mask's
+/// excluded half is only checked for its colour: every pixel of the child
+/// is opaque in the backing, so alpha there is not the masked copy's to
+/// decide.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn masked_copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
+    use yserver_core::{
+        backend::{ClipState, PixmapHandle as ApplyPixmapHandle, WindowHandle},
+        host_x11::HostSubwindowVisual,
+    };
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let visual = |depth| HostSubwindowVisual::Explicit {
+        depth,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let p = b
+        .create_subwindow(None, root, 0, 0, 64, 64, 0, visual(32), None, None)
+        .expect("depth-32 parent");
+    b.map_window_for_tests(p.as_raw()).expect("map P");
+    let backing = b.create_pixmap(None, 32, 64, 64).expect("P backing");
+    assert!(b.test_set_redirected_target(p.as_raw(), backing.as_raw()));
+    let c = b
+        .create_subwindow(None, p, 8, 8, 16, 16, 0, visual(24), None, None)
+        .expect("depth-24 child");
+    b.map_window_for_tests(c.as_raw()).expect("map C");
+    b.fill_rectangle(None, backing.as_raw(), 0x0000_0000, 0, 0, 64, 64)
+        .expect("clear P backing to transparent");
+
+    let src = b.create_pixmap(None, 24, 16, 16).expect("depth-24 source");
+    b.engine_put_image_for_tests(
+        src.as_raw(),
+        ash::vk::Offset2D { x: 0, y: 0 },
+        ash::vk::Extent2D {
+            width: 16,
+            height: 16,
+        },
+        &[0x10u8, 0x20, 0x30, 0x00].repeat(16 * 16),
+        32,
+    )
+    .expect("upload source with X byte 0");
+
+    // Clip mask: top 8 rows copy, bottom 8 do not.
+    let mask = b.create_pixmap(None, 1, 16, 16).unwrap().as_raw();
+    let mut bits = vec![0u8; 4 * 16];
+    for row in 0..8 {
+        bits[row * 4] = 0xFF;
+        bits[row * 4 + 1] = 0xFF;
+    }
+    b.put_image(None, mask, 1, 16, 16, 0, 0, &bits)
+        .expect("put_image mask");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: ApplyPixmapHandle::from_raw(mask).expect("mask handle"),
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    let pre = b.telemetry().lifetime.copy_area_masked_draw;
+    b.copy_area(None, src.as_raw(), c.as_raw(), 0, 0, 0, 0, 16, 16)
+        .expect("copy into C");
+    assert_eq!(
+        b.telemetry().lifetime.copy_area_masked_draw - pre,
+        1,
+        "must exercise the masked-blit route, or this test proves nothing"
+    );
+
+    let px = b
+        .get_image_pixels_for_tests(backing.as_raw(), 2, 8, 8, 16, 16, !0)
+        .expect("get_image")
+        .expect("pixels");
+    for (i, p) in px.chunks_exact(4).enumerate() {
+        let row = i / 16;
+        if row < 8 {
+            assert_eq!(
+                &p[..3],
+                &[0x10, 0x20, 0x30],
+                "pixel {i}: masked-in colour must land"
+            );
+            assert_eq!(
+                p[3], 0xFF,
+                "pixel {i}: depth-24 child must be opaque in the depth-32 backing"
+            );
+        } else {
+            assert_eq!(
+                &p[..3],
+                &[0, 0, 0],
+                "pixel {i}: masked-out colour must not change"
+            );
+        }
+    }
+}
+
+/// A depth-24 window that paints into its depth-32 parent's redirect
+/// backing must come out OPAQUE there, whatever its source's undefined X
+/// byte says. X gives the window no alpha, and Xorg composites such a
+/// child into its parent with alpha forced to 1 (`compWindowUpdateAutomatic`,
+/// composite/compwindow.c). A GL client's buffer commonly has 0 in that
+/// byte: glxgears under awesome + picom showed through to stale frames,
+/// because a raw copy put alpha 0 into the depth-32 frame backing that
+/// picom binds with alpha.
+///
+/// The backing is cleared to transparent first, so a fix that merely
+/// masks alpha out of the write (and so keeps whatever was there) still
+/// fails.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn copy_into_depth24_child_of_depth32_backing_writes_opaque_alpha() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+
+    // Depth-32 parent P (an ARGB WM frame), redirected.
+    let p = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            64,
+            64,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("depth-32 parent");
+    b.map_window_for_tests(p.as_raw()).expect("map P");
+    let backing = b.create_pixmap(None, 32, 64, 64).expect("P backing");
+    assert!(
+        b.test_set_redirected_target(p.as_raw(), backing.as_raw()),
+        "redirect route must be recorded"
+    );
+
+    // Depth-24 child C at (8, 8): not redirected, so it paints into P's backing.
+    let c = b
+        .create_subwindow(
+            None,
+            p,
+            8,
+            8,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 24,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("depth-24 child");
+    b.map_window_for_tests(c.as_raw()).expect("map C");
+
+    // Transparent backing, after any map-time background paint.
+    b.fill_rectangle(None, backing.as_raw(), 0x0000_0000, 0, 0, 64, 64)
+        .expect("clear P backing to transparent");
+
+    // Depth-24 source whose X byte is 0, as a GL client's buffer has it.
+    // Uploaded as depth-32 bytes so nothing forces the alpha on the way in.
+    let src = b.create_pixmap(None, 24, 16, 16).expect("depth-24 source");
+    let bgra: Vec<u8> = [0x10u8, 0x20, 0x30, 0x00].repeat(16 * 16);
+    b.engine_put_image_for_tests(
+        src.as_raw(),
+        ash::vk::Offset2D { x: 0, y: 0 },
+        ash::vk::Extent2D {
+            width: 16,
+            height: 16,
+        },
+        &bgra,
+        32,
+    )
+    .expect("upload source with X byte 0");
+
+    // The PresentPixmap fallback is exactly this: CopyArea with a default GC.
+    b.copy_area(None, src.as_raw(), c.as_raw(), 0, 0, 0, 0, 16, 16)
+        .expect("copy into C");
+
+    let px = b
+        .get_image_pixels_for_tests(backing.as_raw(), 2, 8, 8, 16, 16, !0)
+        .expect("get_image")
+        .expect("pixels");
+    for (i, p) in px.chunks_exact(4).enumerate() {
+        assert_eq!(
+            [p[0], p[1], p[2]],
+            [0x10, 0x20, 0x30],
+            "pixel {i}: the copy's colour must land"
+        );
+        assert_eq!(
+            p[3], 0xFF,
+            "pixel {i}: depth-24 child must be opaque in the depth-32 backing"
+        );
     }
 }
 
@@ -8137,7 +8357,7 @@ fn two_fills_then_get_image_returns_second_fill() {
         )
         .expect("create_subwindow");
     let xid = win.as_raw();
-    b.map_subwindow(None, xid).expect("map_subwindow");
+    b.map_window_for_tests(xid).expect("map_subwindow");
 
     // XCALL fill at (20, 30, 70, 30) with fg=W_FG=1 (pixel value 1).
     let small_rect = {
@@ -8225,7 +8445,7 @@ fn compose_then_fill_then_get_image_returns_second_fill() {
         )
         .expect("create_subwindow");
     let xid = win.as_raw();
-    b.map_subwindow(None, xid).expect("map_subwindow");
+    b.map_window_for_tests(xid).expect("map_subwindow");
 
     let composite_submits_before = b.telemetry().lifetime.composite_submits;
     b.tick_maybe_composite_for_tests();
@@ -10192,6 +10412,7 @@ fn brd_bordered_window(b: &mut KmsBackend, bg: u32) -> (yserver_core::backend::W
         )
         .expect("create bordered window");
     let xid = w.as_raw();
+    b.map_window_for_tests(xid).expect("map bordered window");
     assert_eq!(
         b.storage_extent_for_tests(xid),
         Some((BRD_SW, BRD_SH)),
@@ -10269,6 +10490,7 @@ fn border_storage_is_bordered_extent_and_init_reaches_the_ring() {
             None,
         )
         .expect("create bw=0 window");
+    b.map_window_for_tests(plain.as_raw()).expect("map");
     assert_eq!(
         b.storage_extent_for_tests(plain.as_raw()),
         Some((u32::from(BRD_CW), u32::from(BRD_CH))),
@@ -10448,6 +10670,115 @@ fn redirected_titlebar_copy_preserves_border() {
     for pixel in copied.chunks_exact(4) {
         assert_eq!(pixel, &brd_bgra(BRD_GREEN));
     }
+}
+
+/// A client window C inside its redirected frame F (an xfwm4 frame under
+/// the compositor), with a child V reaching past C's bottom as GTK's
+/// scrolled bin window does. C and V paint into F's backing, which F's
+/// own pixels share: Xorg confines each to its clipList, its rect inside
+/// its parent's (`mi/mivaltree.c:390`) minus its children for
+/// ClipByChildren, and a move copies only that (`fbCopyWindow`). Nothing
+/// outside C may change, whatever C or V draws or wherever V moves.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn redirected_frame_child_paints_stay_inside_the_child() {
+    const FRAME: u32 = 0xFF20_2020;
+    const GRAY: u32 = 0xFF3B_3B3E;
+    const BLUE: u32 = 0xFF00_00FF;
+    const ORANGE: u32 = 0xFFFF_8000;
+    const F: u32 = 0x1480;
+    const C: u32 = 0x1481;
+    const V: u32 = 0x1482;
+    const GC: u32 = 0x1483;
+    let mut f = ProtoFixture::new().expect("live Vulkan");
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let window = |f: &mut ProtoFixture, wid, parent, x, y, w, h, bg| {
+        or_create_window(
+            f,
+            wid,
+            parent,
+            32,
+            x,
+            y,
+            w,
+            h,
+            0,
+            yserver_core::resources::ARGB_VISUAL.0,
+            2 | 8 | 0x2000,
+            &[bg, 0, yserver_core::resources::ARGB_COLORMAP.0],
+        );
+        wz_map(f, wid);
+    };
+    window(&mut f, F, root, 20, 30, 200, 150, FRAME);
+    let mut body = root.to_le_bytes().to_vec();
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    f.req(144, 2, &body);
+    window(&mut f, C, F, 5, 20, 190, 100, GRAY);
+    window(&mut f, V, C, 100, 10, 80, 120, BLUE);
+    let check = |f: &mut ProtoFixture, when: &str, expect: &[(u32, u32, u32)]| {
+        let (sw, _, pixels) = f.backing(F);
+        for &(x, y, pixel) in expect {
+            let at = ((y * sw + x) * 4) as usize;
+            assert_eq!(
+                &pixels[at..at + 4],
+                &brd_bgra(pixel),
+                "{when}: F's backing at ({x},{y})"
+            );
+        }
+    };
+    // Below C (F's own pixels), where V's 120 rows would reach.
+    check(
+        &mut f,
+        "V mapped",
+        &[(145, 135, FRAME), (145, 60, BLUE), (50, 60, GRAY)],
+    );
+
+    or_create_gc(&mut f, GC, C, ORANGE);
+    or_fill(&mut f, C, GC, -50, -50, 400, 400);
+    check(
+        &mut f,
+        "fill over C",
+        &[
+            (50, 10, FRAME),
+            (2, 60, FRAME),
+            (50, 60, ORANGE),
+            (145, 60, BLUE),
+            (145, 135, FRAME),
+        ],
+    );
+
+    let (w, h) = (230u16, 140u16);
+    let mut body = C.to_le_bytes().to_vec();
+    body.extend_from_slice(&GC.to_le_bytes());
+    body.extend_from_slice(&w.to_le_bytes());
+    body.extend_from_slice(&h.to_le_bytes());
+    body.extend_from_slice(&(-20i16).to_le_bytes());
+    body.extend_from_slice(&(-20i16).to_le_bytes());
+    body.extend_from_slice(&[0, 32, 0, 0]);
+    for _ in 0..u32::from(w) * u32::from(h) {
+        body.extend_from_slice(&brd_bgra(GRAY));
+    }
+    f.req(72, 2, &body);
+    check(
+        &mut f,
+        "PutImage over C",
+        &[
+            (50, 10, FRAME),
+            (198, 60, FRAME),
+            (50, 60, GRAY),
+            (145, 60, BLUE),
+            (145, 135, FRAME),
+        ],
+    );
+
+    // Scrolled up by 50: V's old rows past C's bottom are not V's to
+    // carry, and its new rows above C's top are not V's to write.
+    wz_configure(&mut f, V, 2, &[-40]);
+    check(
+        &mut f,
+        "V moved to y=-40",
+        &[(145, 10, FRAME), (145, 25, BLUE), (145, 135, FRAME)],
+    );
 }
 
 #[test]
@@ -11366,6 +11697,7 @@ fn copy_plane_source_follows_redirect_routing() {
             .expect("create W");
         (w, w.as_raw())
     };
+    b.map_window_for_tests(xid).expect("map");
     // Leaf := 0x…0001 in the low bit (plane 1 SET).
     b.fill_rectangle(None, xid, 0xFF00_0001, 0, 0, 4, 4)
         .expect("seed leaf plane-set");
@@ -11433,7 +11765,7 @@ fn border_redirect_seed_places_content_at_the_content_origin() {
     );
     b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
         .expect("client content fill");
-    b.map_subwindow(None, xid).expect("map");
+    b.map_window_for_tests(xid).expect("map");
     // The map repaints the background over the content, so restore the
     // marker colour after mapping.
     b.fill_rectangle(None, xid, BRD_GREEN, 0, 0, BRD_CW, BRD_CH)
@@ -11688,8 +12020,8 @@ fn border_render_source_on_child_of_redirected_ancestor_accumulates_the_offset()
         )
         .expect("create C");
     let c_xid = c.as_raw();
-    b.map_subwindow(None, w_xid).expect("map W");
-    b.map_subwindow(None, c_xid).expect("map C");
+    b.map_window_for_tests(w_xid).expect("map W");
+    b.map_window_for_tests(c_xid).expect("map C");
 
     // Redirect W at the bordered extent.
     let _backing = b
@@ -11902,7 +12234,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
             None,
         )
         .expect("create bare");
-    b.map_subwindow(None, bare.as_raw()).expect("map bare");
+    b.map_window_for_tests(bare.as_raw()).expect("map bare");
     b.apply_draw_state(
         None,
         &DrawState {
@@ -11938,7 +12270,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
             None,
         )
         .expect("create parent");
-    b.map_subwindow(None, parent.as_raw()).expect("map parent");
+    b.map_window_for_tests(parent.as_raw()).expect("map parent");
     for i in 0..2u16 {
         let strip = b
             .create_subwindow(
@@ -11954,7 +12286,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
                 None,
             )
             .expect("create strip");
-        b.map_subwindow(None, strip.as_raw()).expect("map strip");
+        b.map_window_for_tests(strip.as_raw()).expect("map strip");
         for j in (0..PH).step_by(6) {
             let grand = b
                 .create_subwindow(
@@ -11970,7 +12302,7 @@ fn include_inferiors_fill_leaves_the_parent_pixels_unchanged() {
                     None,
                 )
                 .expect("create grandchild");
-            b.map_subwindow(None, grand.as_raw()).expect("map grand");
+            b.map_window_for_tests(grand.as_raw()).expect("map grand");
         }
     }
     b.apply_draw_state(
@@ -12041,7 +12373,7 @@ fn include_inferiors_root_fill_reaches_a_top_level_windows_storage() {
     let w = b
         .create_subwindow(None, root, 0, 0, PW, PH, 1, visual, Some(BRD_RED), None)
         .expect("create top-level");
-    b.map_subwindow(None, w.as_raw()).expect("map");
+    b.map_window_for_tests(w.as_raw()).expect("map");
     b.configure_subwindow(
         None,
         w.as_raw(),
@@ -12121,7 +12453,7 @@ fn include_inferiors_root_fill_after_border_width_change_has_no_stale_copy() {
         .create_subwindow(None, root, 10, 5, W, H, 1, visual, Some(BRD_RED), None)
         .expect("create test window");
     let xid = w.as_raw();
-    b.map_subwindow(None, xid).expect("map");
+    b.map_window_for_tests(xid).expect("map");
     b.apply_draw_state(
         None,
         &DrawState {
@@ -12232,7 +12564,7 @@ fn include_inferiors_fanout_lands_where_a_direct_draw_lands() {
         .create_subwindow(None, root, WX, WY, W, H, BW, visual, Some(BRD_RED), None)
         .expect("create test window");
     let xid = w.as_raw();
-    b.map_subwindow(None, xid).expect("map");
+    b.map_window_for_tests(xid).expect("map");
     b.apply_draw_state(
         None,
         &DrawState {
@@ -12304,14 +12636,10 @@ struct ProtoFixture {
 
 impl ProtoFixture {
     fn new() -> Option<Self> {
-        use std::{
-            collections::{HashMap, HashSet, VecDeque},
-            os::unix::net::UnixStream,
-            sync::{Arc, Mutex, atomic::AtomicU16},
-        };
+        use std::os::unix::net::UnixStream;
         use yserver_core::{
             resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
-            server::{ClientState, ServerState},
+            server::ServerState,
         };
 
         let backend = KmsBackend::for_tests_with_vk().ok()?;
@@ -12331,34 +12659,47 @@ impl ProtoFixture {
         }
 
         let (a, b) = UnixStream::pair().ok()?;
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
-                byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0,
-                resource_id_mask: u32::MAX,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: VecDeque::new(),
-                watching_writable: false,
-                focused_window: ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
+        state.clients.insert(1, Self::client_state(a));
         Some(Self {
             state,
             backend,
             _peer: b,
             seq: 0,
         })
+    }
+
+    fn client_state(a: std::os::unix::net::UnixStream) -> yserver_core::server::ClientState {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{resources::ROOT_WINDOW, server::ClientState};
+        ClientState {
+            writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            watching_writable: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+        }
+    }
+
+    /// A second client, for tests where the compositor and the app are different clients.
+    fn add_client(&mut self, id: u32) -> std::os::unix::net::UnixStream {
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        self.state.clients.insert(id, Self::client_state(a));
+        b
     }
 
     /// The host xid the backend allocated for a core window resource.
@@ -12383,6 +12724,11 @@ impl ProtoFixture {
 
     /// Dispatch one request. `body` excludes the 4-byte header.
     fn req(&mut self, opcode: u8, data: u8, body: &[u8]) {
+        self.req_as(1, opcode, data, body);
+    }
+
+    /// [`Self::req`] from client `client`.
+    fn req_as(&mut self, client: u32, opcode: u8, data: u8, body: &[u8]) {
         use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
         assert!(
             body.len().is_multiple_of(4),
@@ -12397,7 +12743,7 @@ impl ProtoFixture {
         yserver_core::core_loop::process_request::process_request(
             &mut self.state,
             &mut self.backend,
-            ClientId(1),
+            ClientId(client),
             SequenceNumber(self.seq),
             header,
             body,
@@ -12503,6 +12849,7 @@ fn border_press_reports_negative_content_coords_on_the_wire() {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut f.state,
@@ -14514,7 +14861,8 @@ fn window_storage_init_covers_the_whole_allocation() {
             yserver_core::resources::ROOT_VISUAL.0,
             0u32,
             vec![],
-            [0u8, 0, 0, 255],
+            // Background None: realize seeds the leaf from the parent, here the root's 0x505050.
+            [80u8, 80, 80, 255],
         ),
         (
             "no background attribute, depth 32",
@@ -14522,7 +14870,7 @@ fn window_storage_init_covers_the_whole_allocation() {
             visual,
             CW_BORDER_PIXEL | CW_COLORMAP,
             vec![0u32, cmap],
-            [0, 0, 0, 0],
+            [80, 80, 80, 255],
         ),
         (
             "background-pixel = 0, depth 32",
@@ -15027,4 +15375,848 @@ fn a_shrink_keeps_the_content_at_the_border_inset() {
         [0x00, 0xFF, 0x00, 0xFF],
         "and runs to the far content corner",
     );
+}
+
+/// Window-storage step 5, through core: storage exists only while viewable, subtree-wide.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn window_storage_exists_only_while_viewable() {
+    const FRAME: u32 = 0x0069_0001;
+    const CLIENT: u32 = 0x0069_0002;
+    const INNER: u32 = 0x0069_0003;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let vis = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, FRAME, root_res, 24, 10, 10, 100, 80, 0, vis, 0, &[]);
+    or_create_window(&mut f, CLIENT, FRAME, 24, 5, 5, 60, 50, 0, vis, 0, &[]);
+    or_create_window(&mut f, INNER, CLIENT, 24, 2, 2, 20, 10, 0, vis, 0, &[]);
+    let storage = |f: &ProtoFixture| {
+        [FRAME, CLIENT, INNER].map(|w| f.backend.storage_extent_for_tests(f.host_xid(w)).is_some())
+    };
+    assert_eq!(storage(&f), [false; 3], "created unmapped: no storage");
+    wz_map(&mut f, CLIENT);
+    wz_map(&mut f, INNER);
+    assert_eq!(
+        storage(&f),
+        [false; 3],
+        "mapped under an unmapped frame: still none"
+    );
+    wz_map(&mut f, FRAME);
+    assert_eq!(
+        storage(&f),
+        [true; 3],
+        "the frame's map realizes the subtree"
+    );
+    f.req(10, 0, &FRAME.to_le_bytes()); // UnmapWindow
+    assert_eq!(
+        storage(&f),
+        [false; 3],
+        "the frame's unmap releases the subtree"
+    );
+    wz_map(&mut f, FRAME);
+    assert_eq!(storage(&f), [true; 3], "the remap realizes it again");
+}
+
+/// Window-storage step 5, through core: a resize while unmapped is allocated at map time.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn resize_while_unmapped_allocates_at_the_new_size_on_map() {
+    const W: u32 = 0x0069_0010;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let vis = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(&mut f, W, root_res, 24, 0, 0, 40, 30, 2, vis, 0, &[]);
+    wz_configure(&mut f, W, 0x4 | 0x8, &[64, 48]);
+    let host = f.host_xid(W);
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        None,
+        "no storage while unmapped"
+    );
+    wz_map(&mut f, W);
+    assert_eq!(
+        f.backend.storage_extent_for_tests(host),
+        Some((68, 52)),
+        "allocated at the new size plus the border",
+    );
+}
+
+/// Window-storage step 5, through core: a bg-None window's remap storage is seeded from its parent.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn bg_none_window_is_seeded_from_its_parent_on_remap() {
+    const PARENT: u32 = 0x0069_0020;
+    const CHILD: u32 = 0x0069_0021;
+    const GC: u32 = 0x0069_0022;
+    const CW_BACK_PIXEL: u32 = 0x0000_0002;
+    const RED: u32 = 0x00FF_0000;
+    const BLUE: u32 = 0x0000_00FF;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root_res = yserver_core::resources::ROOT_WINDOW.0;
+    let vis = yserver_core::resources::ROOT_VISUAL.0;
+    or_create_window(
+        &mut f,
+        PARENT,
+        root_res,
+        24,
+        0,
+        0,
+        60,
+        60,
+        0,
+        vis,
+        CW_BACK_PIXEL,
+        &[RED],
+    );
+    or_create_window(&mut f, CHILD, PARENT, 24, 10, 10, 20, 20, 0, vis, 0, &[]);
+    wz_map(&mut f, PARENT);
+    wz_map(&mut f, CHILD);
+    or_create_gc(&mut f, GC, CHILD, BLUE);
+    or_fill(&mut f, CHILD, GC, 0, 0, 20, 20);
+    let uniform = |f: &mut ProtoFixture| {
+        let (_, _, px) = f.backing(CHILD);
+        let first: [u8; 3] = px[..3].try_into().expect("pixel");
+        assert!(
+            px.chunks_exact(4).all(|p| p[..3] == first),
+            "child not uniform"
+        );
+        first
+    };
+    assert_eq!(
+        uniform(&mut f),
+        or_bgr(BLUE),
+        "the child holds its own paint"
+    );
+    f.req(10, 0, &CHILD.to_le_bytes()); // UnmapWindow
+    wz_map(&mut f, CHILD);
+    assert_eq!(
+        uniform(&mut f),
+        or_bgr(RED),
+        "the remap seeds from the parent"
+    );
+}
+
+/// How a TFP compositor holds the named backing of a window that is then resized.
+#[derive(Clone, Copy, Debug)]
+enum TfpHold {
+    NameOnly,
+    Glx,
+    GlxAndDri3,
+    Dri3Only,
+}
+
+/// How that compositor lets go of it.
+#[derive(Clone, Copy, Debug)]
+enum TfpTeardown {
+    DestroyGlxThenFree,
+    FreeThenDestroyGlx,
+    DestroyWindowFirst,
+    Disconnect,
+}
+
+/// Every backing the window ever had is gone: no export entry, alias hold or store entry.
+fn assert_backings_released(f: &ProtoFixture, backings: &[u32], what: &str) {
+    for &b in backings {
+        assert!(
+            !f.backend.has_export_entry(b),
+            "{what}: export entry on 0x{b:x} leaked"
+        );
+        assert!(
+            f.backend.test_alias_registry_get(b).is_none(),
+            "{what}: alias hold on 0x{b:x} leaked: {:?}",
+            f.backend.test_alias_registry_get(b),
+        );
+        assert!(
+            !f.backend.store_drawable_exists_for_tests(b),
+            "{what}: store entry for 0x{b:x} leaked"
+        );
+    }
+}
+
+/// picom-glx: NameWindowPixmap + glXCreatePixmap, then resizes rotate the backing.
+/// The GLX pixmap is retargeted onto each new backing (110f1a90); its export ref must follow.
+/// Client 1 is the compositor, client 2 owns the window.
+fn tfp_resize_scenario(hold: TfpHold, resizes: i32, teardown: TfpTeardown) -> bool {
+    const APP: u32 = 2;
+    const WIN: u32 = 0x0078_0001;
+    const PIX: u32 = 0x0078_0002;
+    const GLXPIX: u32 = 0x0078_0003;
+    let what = format!("{hold:?} resizes={resizes} {teardown:?}");
+    let Some(mut f) = ProtoFixture::new() else {
+        return false;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let mut cw = Vec::new();
+    cw.extend_from_slice(&WIN.to_le_bytes());
+    cw.extend_from_slice(&root.to_le_bytes());
+    cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+    cw.extend_from_slice(&100u16.to_le_bytes());
+    cw.extend_from_slice(&50u16.to_le_bytes());
+    cw.extend_from_slice(&0u16.to_le_bytes()); // border
+    cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+    cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+    f.req_as(APP, 1, 24, &cw);
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req(144, 2, &redirect);
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes()); // MapWindow
+    let mut name = WIN.to_le_bytes().to_vec();
+    name.extend_from_slice(&PIX.to_le_bytes());
+    f.req(144, 6, &name); // NameWindowPixmap
+    let named = |f: &ProtoFixture| {
+        f.state
+            .resources
+            .pixmap(yserver_protocol::x11::ResourceId(PIX))
+            .and_then(|p| p.host_xid)
+            .map(|h| h.as_raw())
+            .expect("named pixmap")
+    };
+    let mut backings = vec![named(&f)];
+    let glx = matches!(hold, TfpHold::Glx | TfpHold::GlxAndDri3);
+    if glx {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&PIX.to_le_bytes());
+        body.extend_from_slice(&GLXPIX.to_le_bytes());
+        f.req(148, yserver_protocol::x11::glx::CREATE_PIXMAP, &body);
+    }
+    if matches!(hold, TfpHold::GlxAndDri3 | TfpHold::Dri3Only) {
+        match f.backend.dri3_export_pixmap_buffers(backings[0]) {
+            Ok(export) => drop(export.fd), // the client's own fd; ours is the entry's dup
+            Err(err) => {
+                eprintln!("{what}: skipping, this ICD cannot export the backing: {err}");
+                return true;
+            }
+        }
+    }
+    assert_eq!(
+        f.backend.has_export_entry(backings[0]),
+        !matches!(hold, TfpHold::NameOnly),
+        "{what}: export entry on the named backing"
+    );
+    for i in 1..=resizes {
+        let mut cfg = WIN.to_le_bytes().to_vec();
+        cfg.extend_from_slice(&0x0cu16.to_le_bytes());
+        cfg.extend_from_slice(&0u16.to_le_bytes());
+        cfg.extend_from_slice(&(100 + 10 * i).to_le_bytes());
+        cfg.extend_from_slice(&(50 + 10 * i).to_le_bytes());
+        f.req_as(APP, 12, 0, &cfg);
+        let current = named(&f);
+        assert!(!backings.contains(&current), "{what}: resize {i} rotated");
+        backings.push(current);
+    }
+    let destroy_glx = |f: &mut ProtoFixture| {
+        if glx {
+            f.req(
+                148,
+                yserver_protocol::x11::glx::DESTROY_PIXMAP,
+                &GLXPIX.to_le_bytes(),
+            );
+        }
+    };
+    let free = |f: &mut ProtoFixture| f.req(54, 0, &PIX.to_le_bytes());
+    let destroy_win = |f: &mut ProtoFixture| f.req_as(APP, 4, 0, &WIN.to_le_bytes());
+    match teardown {
+        TfpTeardown::DestroyGlxThenFree => {
+            destroy_glx(&mut f);
+            free(&mut f);
+            destroy_win(&mut f);
+        }
+        TfpTeardown::FreeThenDestroyGlx => {
+            free(&mut f);
+            destroy_glx(&mut f);
+            destroy_win(&mut f);
+        }
+        TfpTeardown::DestroyWindowFirst => {
+            destroy_win(&mut f);
+            destroy_glx(&mut f);
+            free(&mut f);
+        }
+        TfpTeardown::Disconnect => {
+            yserver_core::core_loop::process_disconnect::process_disconnect(
+                &mut f.state,
+                &mut f.backend,
+                yserver_protocol::x11::ClientId(1),
+            );
+            destroy_win(&mut f);
+        }
+    }
+    for _ in 0..200 {
+        f.backend.for_tests_poll_retired();
+        if backings
+            .iter()
+            .all(|&b| !f.backend.store_drawable_exists_for_tests(b))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_backings_released(&f, &backings, &what);
+    true
+}
+
+/// A resize must not strand the pre-resize backing behind a GLX/DRI3 export ref.
+/// The DRI3 holds need an exporting ICD (RADV); lavapipe cannot export and skips them.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resized_tfp_backing_is_freed_once_the_compositor_lets_go() {
+    for hold in [
+        TfpHold::NameOnly,
+        TfpHold::Glx,
+        TfpHold::GlxAndDri3,
+        TfpHold::Dri3Only,
+    ] {
+        for resizes in [0, 1, 2] {
+            for teardown in [
+                TfpTeardown::DestroyGlxThenFree,
+                TfpTeardown::FreeThenDestroyGlx,
+                TfpTeardown::DestroyWindowFirst,
+                TfpTeardown::Disconnect,
+            ] {
+                if !tfp_resize_scenario(hold, resizes, teardown) {
+                    eprintln!("skipping: no Vk");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Who ends a redirected toplevel's life, and how.
+#[derive(Clone, Copy, Debug)]
+enum RedirectTeardown {
+    AppDestroyWindow,
+    AppDisconnect,
+    CompositorDisconnect,
+    CompositorThenAppDisconnect,
+}
+
+/// picom's RedirectSubwindows(root, Manual) over an app toplevel with a child; client 1 is the
+/// compositor, client 2 the app. Every teardown must release the toplevel's redirect backing.
+fn redirect_teardown_scenario(named: bool, teardown: RedirectTeardown) -> bool {
+    use yserver_protocol::x11::{ClientId, ResourceId};
+    const COMP: u32 = 1;
+    const APP: u32 = 2;
+    const WIN: u32 = 0x0079_0001;
+    const CHILD: u32 = 0x0079_0002;
+    const PIX: u32 = 0x0079_0003;
+    let what = format!("named={named} {teardown:?}");
+    let Some(mut f) = ProtoFixture::new() else {
+        return false;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let create = |f: &mut ProtoFixture, wid: u32, parent: u32, w: u16, h: u16| {
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&wid.to_le_bytes());
+        cw.extend_from_slice(&parent.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&w.to_le_bytes());
+        cw.extend_from_slice(&h.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        f.req_as(APP, 1, 24, &cw);
+    };
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req_as(COMP, 144, 2, &redirect);
+    create(&mut f, WIN, root, 100, 50);
+    create(&mut f, CHILD, WIN, 20, 10);
+    f.req_as(APP, 8, 0, &CHILD.to_le_bytes()); // MapWindow
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes());
+    let backing = f
+        .state
+        .resources
+        .window(ResourceId(WIN))
+        .and_then(|w| w.redirected_backing.as_ref())
+        .map(|b| b.host_pixmap.as_raw())
+        .expect("mapped redirected toplevel has a backing");
+    if named {
+        let mut name = WIN.to_le_bytes().to_vec();
+        name.extend_from_slice(&PIX.to_le_bytes());
+        f.req_as(COMP, 144, 6, &name); // NameWindowPixmap
+    }
+    let disconnect = |f: &mut ProtoFixture, client: u32| {
+        yserver_core::core_loop::process_disconnect::process_disconnect(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(client),
+        );
+    };
+    let assert_held = |f: &ProtoFixture| {
+        assert!(
+            f.backend.store_drawable_exists_for_tests(backing),
+            "{what}: the named pixmap still holds the backing"
+        );
+    };
+    match teardown {
+        RedirectTeardown::AppDestroyWindow | RedirectTeardown::AppDisconnect => {
+            if matches!(teardown, RedirectTeardown::AppDestroyWindow) {
+                f.req_as(APP, 4, 0, &WIN.to_le_bytes()); // DestroyWindow
+            } else {
+                disconnect(&mut f, APP);
+            }
+            if named {
+                assert_held(&f);
+                f.req_as(COMP, 54, 0, &PIX.to_le_bytes()); // FreePixmap
+            }
+        }
+        RedirectTeardown::CompositorDisconnect | RedirectTeardown::CompositorThenAppDisconnect => {
+            disconnect(&mut f, COMP);
+            assert!(
+                f.state.composite_redirects.is_empty(),
+                "{what}: the compositor's redirect survived it"
+            );
+            let win = f.state.resources.window(ResourceId(WIN));
+            assert!(
+                win.is_some_and(|w| w.redirected_backing.is_none()),
+                "{what}: the app's window must survive, unredirected"
+            );
+            if matches!(teardown, RedirectTeardown::CompositorThenAppDisconnect) {
+                disconnect(&mut f, APP);
+            }
+        }
+    }
+    for _ in 0..200 {
+        f.backend.for_tests_poll_retired();
+        if !f.backend.store_drawable_exists_for_tests(backing) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_backings_released(&f, &[backing], &what);
+    true
+}
+
+/// A redirected toplevel's backing is released however its app or its compositor goes away.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_redirect_backing_is_released_when_its_app_or_compositor_disconnects() {
+    for named in [false, true] {
+        for teardown in [
+            RedirectTeardown::AppDestroyWindow,
+            RedirectTeardown::AppDisconnect,
+            RedirectTeardown::CompositorDisconnect,
+            RedirectTeardown::CompositorThenAppDisconnect,
+        ] {
+            if !redirect_teardown_scenario(named, teardown) {
+                eprintln!("skipping: no Vk");
+                return;
+            }
+        }
+    }
+}
+
+/// The export-holders report shows a named GLX-bound redirect backing until it is released.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn export_holders_report_tracks_a_named_glx_backing_until_release() {
+    use yserver_core::backend::export_holders::collect_core_holders;
+    const APP: u32 = 2;
+    const WIN: u32 = 0x007a_0001;
+    const PIX: u32 = 0x007a_0002;
+    const GLXPIX: u32 = 0x007a_0003;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let mut cw = Vec::new();
+    cw.extend_from_slice(&WIN.to_le_bytes());
+    cw.extend_from_slice(&root.to_le_bytes());
+    cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+    cw.extend_from_slice(&100u16.to_le_bytes());
+    cw.extend_from_slice(&50u16.to_le_bytes());
+    cw.extend_from_slice(&0u16.to_le_bytes()); // border
+    cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+    cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+    cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+    f.req_as(APP, 1, 24, &cw);
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req(144, 2, &redirect);
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes()); // MapWindow
+    let mut name = WIN.to_le_bytes().to_vec();
+    name.extend_from_slice(&PIX.to_le_bytes());
+    f.req(144, 6, &name); // NameWindowPixmap
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_le_bytes()); // screen
+    body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+    body.extend_from_slice(&PIX.to_le_bytes());
+    body.extend_from_slice(&GLXPIX.to_le_bytes());
+    f.req(148, yserver_protocol::x11::glx::CREATE_PIXMAP, &body);
+    let backing = f
+        .state
+        .resources
+        .pixmap(yserver_protocol::x11::ResourceId(PIX))
+        .and_then(|p| p.host_xid)
+        .map(|h| h.as_raw())
+        .expect("named pixmap");
+    let report = f
+        .backend
+        .export_holders_report_for_tests(&collect_core_holders(&f.state));
+    eprintln!("{}", report.join("\n"));
+    let line = report
+        .iter()
+        .find(|l| l.starts_with(&format!("  0x{backing:x} ")))
+        .unwrap_or_else(|| panic!("backing 0x{backing:x} missing from {report:#?}"));
+    // Redirect hold + named alias + the GLX export's lifetime ref.
+    assert!(line.contains(" alias_rc=3 "), "{line}");
+    assert!(
+        line.contains(" export=[glx_refs=1 dri3_fd=n lifetime=alias] sync_dup=n "),
+        "{line}"
+    );
+    assert!(line.contains(" xid=attached "), "{line}");
+    assert!(line.contains(" redirect_of=0x"), "{line}");
+    assert!(
+        line.contains(&format!(
+            "c1:named 0x{PIX:x}(win 0x{WIN:x}) c1:glxpixmap 0x{GLXPIX:x}(of 0x{PIX:x}) \
+             c2:redirect-of win 0x{WIN:x}]"
+        )),
+        "{line}"
+    );
+    assert!(
+        f.backend
+            .report_export_holders(&|| collect_core_holders(&f.state))
+    );
+    assert!(
+        !f.backend
+            .report_export_holders(&|| collect_core_holders(&f.state))
+    );
+
+    f.req(
+        148,
+        yserver_protocol::x11::glx::DESTROY_PIXMAP,
+        &GLXPIX.to_le_bytes(),
+    );
+    f.req(54, 0, &PIX.to_le_bytes()); // FreePixmap
+    f.req_as(APP, 4, 0, &WIN.to_le_bytes()); // DestroyWindow
+    for _ in 0..200 {
+        f.backend.for_tests_poll_retired();
+        if !f.backend.store_drawable_exists_for_tests(backing) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let report = f
+        .backend
+        .export_holders_report_for_tests(&collect_core_holders(&f.state));
+    assert!(
+        !report
+            .iter()
+            .any(|l| l.starts_with(&format!("  0x{backing:x} "))),
+        "{report:#?}"
+    );
+    assert!(
+        f.backend
+            .report_export_holders(&|| collect_core_holders(&f.state))
+    );
+}
+
+/// How a compositor overlaps its `NameWindowPixmap` names on one backing.
+#[derive(Clone, Copy, Debug)]
+enum NameOverlap {
+    TwoNamesFreedInOrder,
+    HundredRenames,
+    GlxOnEachName,
+    NamesOutliveWindow,
+    CompositorDisconnect,
+    NameAsBackground,
+    RenameWhileBackgroundDeferred,
+    ResizeAfterAFreedName,
+}
+
+/// Each name owns one alias ref (Xorg `compext.c:260`); each FreePixmap drops one (`dispatch.c:1540`).
+fn name_overlap_scenario(overlap: NameOverlap) -> bool {
+    use yserver_core::backend::export_holders::collect_core_holders;
+    use yserver_protocol::x11::{ClientId, ResourceId};
+    const COMP: u32 = 1;
+    const APP: u32 = 2;
+    const WIN: u32 = 0x007b_0001;
+    const BG_WIN: u32 = 0x007b_0002;
+    const PIX0: u32 = 0x007c_0000;
+    const GLX0: u32 = 0x007d_0000;
+    let what = format!("{overlap:?}");
+    let Some(mut f) = ProtoFixture::new() else {
+        return false;
+    };
+    let _app_peer = f.add_client(APP);
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let create = |f: &mut ProtoFixture, wid: u32| {
+        let mut cw = Vec::new();
+        cw.extend_from_slice(&wid.to_le_bytes());
+        cw.extend_from_slice(&root.to_le_bytes());
+        cw.extend_from_slice(&[0, 0, 0, 0]); // x, y
+        cw.extend_from_slice(&100u16.to_le_bytes());
+        cw.extend_from_slice(&50u16.to_le_bytes());
+        cw.extend_from_slice(&0u16.to_le_bytes()); // border
+        cw.extend_from_slice(&1u16.to_le_bytes()); // InputOutput
+        cw.extend_from_slice(&0u32.to_le_bytes()); // CopyFromParent visual
+        cw.extend_from_slice(&0u32.to_le_bytes()); // no values
+        f.req_as(APP, 1, 24, &cw);
+    };
+    let mut redirect = root.to_le_bytes().to_vec();
+    redirect.extend_from_slice(&[1, 0, 0, 0]); // CompositeRedirectManual
+    f.req_as(COMP, 144, 2, &redirect);
+    create(&mut f, WIN);
+    create(&mut f, BG_WIN); // left unmapped: no backing of its own
+    f.req_as(APP, 8, 0, &WIN.to_le_bytes()); // MapWindow
+    let backing = f
+        .state
+        .resources
+        .window(ResourceId(WIN))
+        .and_then(|w| w.redirected_backing.as_ref())
+        .map(|b| b.host_pixmap.as_raw())
+        .expect("mapped redirected toplevel has a backing");
+    let name = |f: &mut ProtoFixture, i: u32| {
+        let mut body = WIN.to_le_bytes().to_vec();
+        body.extend_from_slice(&(PIX0 + i).to_le_bytes());
+        f.req_as(COMP, 144, 6, &body); // NameWindowPixmap
+        let host = f
+            .state
+            .resources
+            .pixmap(ResourceId(PIX0 + i))
+            .and_then(|p| p.host_xid)
+            .map(|h| h.as_raw());
+        assert!(host.is_some(), "name {i} aliases a backing");
+    };
+    let free = |f: &mut ProtoFixture, i: u32| f.req_as(COMP, 54, 0, &(PIX0 + i).to_le_bytes());
+    let glx_create = |f: &mut ProtoFixture, i: u32| {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&(PIX0 + i).to_le_bytes());
+        body.extend_from_slice(&(GLX0 + i).to_le_bytes());
+        f.req_as(COMP, 148, yserver_protocol::x11::glx::CREATE_PIXMAP, &body);
+    };
+    let glx_destroy = |f: &mut ProtoFixture, i: u32| {
+        f.req_as(
+            COMP,
+            148,
+            yserver_protocol::x11::glx::DESTROY_PIXMAP,
+            &(GLX0 + i).to_le_bytes(),
+        );
+    };
+    let set_bg = |f: &mut ProtoFixture, pixmap: u32| {
+        let mut body = BG_WIN.to_le_bytes().to_vec();
+        body.extend_from_slice(&1u32.to_le_bytes()); // CWBackPixmap
+        body.extend_from_slice(&pixmap.to_le_bytes());
+        f.req_as(APP, 2, 0, &body); // ChangeWindowAttributes
+    };
+    let destroy_win = |f: &mut ProtoFixture| f.req_as(APP, 4, 0, &WIN.to_le_bytes());
+    let mut backings = vec![backing];
+    let settle = |f: &mut ProtoFixture, backings: &[u32]| {
+        for _ in 0..200 {
+            f.backend.for_tests_poll_retired();
+            if backings
+                .iter()
+                .all(|&b| !f.backend.store_drawable_exists_for_tests(b))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let assert_held = |f: &ProtoFixture, why: &str| {
+        assert!(
+            f.backend.store_drawable_exists_for_tests(backing),
+            "{what}: {why} must keep the backing alive"
+        );
+    };
+    match overlap {
+        NameOverlap::TwoNamesFreedInOrder => {
+            name(&mut f, 1);
+            name(&mut f, 2);
+            free(&mut f, 1);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+        }
+        NameOverlap::HundredRenames => {
+            name(&mut f, 0);
+            for i in 1..100 {
+                name(&mut f, i);
+                free(&mut f, i - 1);
+            }
+            free(&mut f, 99);
+            destroy_win(&mut f);
+        }
+        NameOverlap::GlxOnEachName => {
+            name(&mut f, 0);
+            glx_create(&mut f, 0);
+            for i in 1..5 {
+                name(&mut f, i);
+                glx_create(&mut f, i);
+                glx_destroy(&mut f, i - 1);
+                free(&mut f, i - 1);
+            }
+            glx_destroy(&mut f, 4);
+            free(&mut f, 4);
+            destroy_win(&mut f);
+        }
+        NameOverlap::NamesOutliveWindow => {
+            for i in 0..3 {
+                name(&mut f, i);
+            }
+            destroy_win(&mut f);
+            assert_held(&f, "outstanding names");
+            for i in 0..3 {
+                free(&mut f, i);
+            }
+        }
+        NameOverlap::CompositorDisconnect => {
+            for i in 0..3 {
+                name(&mut f, i);
+            }
+            glx_create(&mut f, 2);
+            yserver_core::core_loop::process_disconnect::process_disconnect(
+                &mut f.state,
+                &mut f.backend,
+                ClientId(COMP),
+            );
+            destroy_win(&mut f);
+        }
+        NameOverlap::NameAsBackground => {
+            name(&mut f, 1);
+            name(&mut f, 2);
+            set_bg(&mut f, PIX0 + 2);
+            free(&mut f, 1);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+            settle(&mut f, &backings);
+            assert_held(&f, "a window background naming it");
+            set_bg(&mut f, 0); // None
+        }
+        NameOverlap::RenameWhileBackgroundDeferred => {
+            name(&mut f, 1);
+            set_bg(&mut f, PIX0 + 1);
+            free(&mut f, 1);
+            name(&mut f, 2);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+            settle(&mut f, &backings);
+            assert_held(&f, "a window background naming it");
+            set_bg(&mut f, 0); // None
+        }
+        NameOverlap::ResizeAfterAFreedName => {
+            name(&mut f, 1);
+            name(&mut f, 2);
+            free(&mut f, 1);
+            let mut cfg = WIN.to_le_bytes().to_vec();
+            cfg.extend_from_slice(&0x0cu16.to_le_bytes()); // width | height
+            cfg.extend_from_slice(&0u16.to_le_bytes());
+            cfg.extend_from_slice(&120u32.to_le_bytes());
+            cfg.extend_from_slice(&70u32.to_le_bytes());
+            f.req_as(APP, 12, 0, &cfg); // ConfigureWindow
+            let rotated = f
+                .state
+                .resources
+                .pixmap(ResourceId(PIX0 + 2))
+                .and_then(|p| p.host_xid)
+                .map(|h| h.as_raw())
+                .expect("live name");
+            assert_ne!(rotated, backing, "{what}: resize rotated the backing");
+            backings.push(rotated);
+            free(&mut f, 2);
+            destroy_win(&mut f);
+        }
+    }
+    settle(&mut f, &backings);
+    assert_backings_released(&f, &backings, &what);
+    let report = f
+        .backend
+        .export_holders_report_for_tests(&collect_core_holders(&f.state));
+    for b in &backings {
+        assert!(
+            !report.iter().any(|l| l.starts_with(&format!("  0x{b:x} "))),
+            "{what}: {report:#?}"
+        );
+    }
+    true
+}
+
+/// Name twice, free both, destroy: the backing goes.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn two_overlapping_names_freed_in_order_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::TwoNamesFreedInOrder) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// picom's rename-before-free, 100 times (hardware saw alias_rc=172).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_hundred_overlapping_renames_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::HundredRenames) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// picom glx: every name carries its own GLXPixmap.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn overlapping_names_each_with_a_glx_pixmap_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::GlxOnEachName) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// The window dies first; its names keep the backing until freed.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn overlapping_names_that_outlive_the_window_release_the_backing() {
+    if !name_overlap_scenario(NameOverlap::NamesOutliveWindow) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// The compositor exits with several names outstanding.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_compositor_disconnect_releases_every_outstanding_name() {
+    if !name_overlap_scenario(NameOverlap::CompositorDisconnect) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// A freed name that is still a window background defers until it is replaced.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_name_used_as_a_background_is_held_until_the_background_changes() {
+    if !name_overlap_scenario(NameOverlap::NameAsBackground) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// A resize retargets only live names; a freed one must not move a ref onto the new backing.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resize_after_a_freed_name_releases_both_backings() {
+    if !name_overlap_scenario(NameOverlap::ResizeAfterAFreedName) {
+        eprintln!("skipping: no Vk");
+    }
+}
+
+/// A second name freed while a background holds the first deferred ref.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_rename_while_a_background_holds_the_backing_does_not_leak() {
+    if !name_overlap_scenario(NameOverlap::RenameWhileBackgroundDeferred) {
+        eprintln!("skipping: no Vk");
+    }
 }

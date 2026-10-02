@@ -1,0 +1,11 @@
+# RANDR normalisation shared by the xrandr-* goldens (see golden.py).
+# mask: \(0x[0-9a-f]+\) => (<mode>) -- mode ids are server-assigned
+# mask: \bmode 0x[0-9a-f]+ => mode <mode> -- mode ids are server-assigned
+# mask: \bcrtc 0x[0-9a-f]+ => crtc <crtc> -- CRTC ids are server-assigned
+# mask: \btimestamp \d+ config \d+ => timestamp <t> config <t> -- server time
+# mask: \bmaximum \d+ x \d+ => maximum <max> -- Xorg takes the DRM mode_config limit (8192 on virtio-gpu), yserver advertises 16384
+# drop: ^xrandr: Failed to get size of gamma for output -- virtio-gpu has no gamma LUT: yserver reports size 0, Xorg a 256 ramp
+# mask: \b325mm x 203mm\b|\b320mm x 200mm\b => <mm> -- output mm: Xorg the EDID detailed timing (325x203), yserver the DRM connector (320x200)
+# mask: /325x(\d+)/203\b => /<mm>x\1/<mm> -- output mm, as above
+# mask: /320x(\d+)/200\b => /<mm>x\1/<mm> -- output mm, as above
+# mask: \b(Serial number of failed request|Current serial number in output stream): +\d+ => \1: <serial> -- client-side request count, differs between xrandr/libXrandr versions

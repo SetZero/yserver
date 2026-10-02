@@ -261,6 +261,7 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
             continue;
         }
         let _ = backend.free_pixmap(None, xid);
+        state.resources.host_pixmap_freed(xid);
     }
 }
 
@@ -423,6 +424,8 @@ pub(crate) fn reset_generation(
 
     // -- 7. Re-attach the backend to the new state. -----------------
     install_backend_root_bindings(state, backend);
+    // The fresh state carries identity transforms, as Xorg's reset does.
+    backend.randr_layout_changed(state);
 
     // -- 8. Repaint the root. ---------------------------------------
     // The fresh constructor creates a root window, but that leaves the
@@ -617,14 +620,19 @@ mod tests {
                 height: 16,
                 event_mask: 0,
                 glx_export_host_xid: Some(host_pixmap),
+                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
             },
         );
         state.glx_contexts.insert(
             base | 0x04,
             GlxContext {
                 owner: client,
+                screen: 0,
+                visual_id: 0x21,
                 fbconfig: 0x21,
                 render_type: 0x8014,
+                share_list: 0,
+                is_direct: true,
             },
         );
 
@@ -905,6 +913,9 @@ mod tests {
             mm_height: 290,
             mode_ids: vec![0x42],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         backend.randr_modes = vec![RandrMode {
             mode_id: 0x42,
