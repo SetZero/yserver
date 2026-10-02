@@ -30087,12 +30087,29 @@ fn copy_area_effective_dst_rects(
                 && c.width > 0
                 && c.height > 0
                 && !is_manual)
-                .then_some(CopyAreaSubRect {
-                    x: c.x,
-                    y: c.y,
-                    width: c.width,
-                    height: c.height,
+                .then(|| {
+                    let rect = x11::xfixes::RegionRect {
+                        x: c.x,
+                        y: c.y,
+                        width: c.width,
+                        height: c.height,
+                    };
+                    // A shaped child takes only its bounding shape out
+                    // (Xorg subtracts its `borderSize`): GDK clips a
+                    // native window inside a client-side one with it, and
+                    // the parent's button bar outside it stays drawable.
+                    crate::nested::intersect_regions(
+                        &[rect],
+                        &current_bounding_in_parent(state, *cid),
+                    )
                 })
+        })
+        .flatten()
+        .map(|r| CopyAreaSubRect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
         })
         .collect();
     if child_rects.is_empty() {
@@ -70580,6 +70597,75 @@ mod tests {
         assert_eq!(got[0].y, 0);
         assert_eq!(got[0].width, 100);
         assert_eq!(got[0].height, 80);
+    }
+
+    /// A bounding-shaped child takes only its shape out of its parent
+    /// under ClipByChildren (Xorg subtracts its `borderSize`,
+    /// `dix/window.c:1747-1770`). xfce4-settings-manager's socket S at
+    /// (8,8) 730x531 is shaped to the 450 rows of its viewport, and the
+    /// manager repaints its button bar under S's rect but outside its
+    /// shape with `CopyArea(8,464 730x36)`; measured on Xorg 21.1 by
+    /// tools/vng-scenarios/xembed-scroll-probe.c, the bar is drawn.
+    #[test]
+    fn copy_area_clip_by_children_takes_out_only_a_shaped_childs_shape() {
+        use crate::resources::MapState;
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId, shape as x11shape};
+
+        let mut state = ServerState::new();
+        let (c, s) = (ResourceId(0x0020_0101), ResourceId(0x0020_0102));
+        for (window, parent, x, y, width, height) in
+            [(c, ROOT_WINDOW, 0, 0, 746, 500), (s, c, 8, 8, 730, 531)]
+        {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        state.resources.window_mut(s).expect("socket").map_state = MapState::Viewable;
+        crate::nested::set_shape_rects(
+            &mut state,
+            s,
+            x11shape::KIND_BOUNDING,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 730,
+                height: 450,
+            }],
+        );
+        let request = yserver_protocol::x11::CopyAreaRequest {
+            src: ResourceId(0x1),
+            dst: c,
+            gc: ResourceId(0x1),
+            src_x: 0,
+            src_y: 0,
+            dst_x: 8,
+            dst_y: 464,
+            width: 730,
+            height: 36,
+        };
+        let draw_state = crate::backend::DrawState {
+            subwindow_mode: crate::backend::SubwindowMode::ClipByChildren,
+            ..Default::default()
+        };
+        let got = copy_area_effective_dst_rects(&state, c, &draw_state, &request);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].x, got[0].y, got[0].width, got[0].height),
+            (8, 464, 730, 36)
+        );
     }
 
     /// MANUALLY-redirected children must not be subtracted by

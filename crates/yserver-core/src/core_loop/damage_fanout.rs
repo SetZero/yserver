@@ -163,11 +163,32 @@ pub fn mapped_child_clip_rects(
             w.class == crate::resources::WindowClass::InputOutput
                 && w.map_state != crate::resources::MapState::Unmapped
         })
-        .map(|w| xfixes::RegionRect {
-            x: w.x,
-            y: w.y,
-            width: w.width,
-            height: w.height,
+        .flat_map(|w| {
+            let rect = xfixes::RegionRect {
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+            };
+            // A shaped child covers only its bounding shape (Xorg's
+            // `borderSize`, `dix/window.c:1747-1770`); the shape is
+            // relative to its content origin.
+            match state
+                .shape_windows
+                .get(&w.id)
+                .and_then(|s| s.bounding.as_ref())
+            {
+                Some(shape) => {
+                    let bw = i16::try_from(w.border_width).unwrap_or(i16::MAX);
+                    let shape = crate::nested::offset_rects(
+                        shape.clone(),
+                        w.x.saturating_add(bw),
+                        w.y.saturating_add(bw),
+                    );
+                    crate::nested::intersect_regions(&[rect], &shape)
+                }
+                None => vec![rect],
+            }
         })
         .collect()
 }
@@ -1738,6 +1759,39 @@ mod tests {
     /// `InputOnly` and unmapped children never contribute to the
     /// ClipByChildren region (matching Xorg's clipList). A socket
     /// "covered" only by such children still damages in full.
+    /// A bounding-shaped child covers its parent with its shape only:
+    /// a RENDER paint on the parent under the child's rect but outside
+    /// its shape (xfce4-settings-manager's button bar below its shaped
+    /// socket) is damage the compositor must hear about.
+    #[test]
+    fn mapped_child_clip_rects_use_a_childs_bounding_shape() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0210_0000);
+        let parent = add_window(&mut state, 1, 0x0210_0030, ROOT_WINDOW, 0, 0, 746, 500);
+        let socket = add_window(&mut state, 1, 0x0210_0031, parent, 8, 8, 730, 531);
+        let _ = state.resources.map_window(socket);
+        crate::nested::set_shape_rects(
+            &mut state,
+            socket,
+            yserver_protocol::x11::shape::KIND_BOUNDING,
+            vec![xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 730,
+                height: 450,
+            }],
+        );
+        assert_eq!(
+            mapped_child_clip_rects(&state, parent),
+            vec![xfixes::RegionRect {
+                x: 8,
+                y: 8,
+                width: 730,
+                height: 450,
+            }]
+        );
+    }
+
     #[test]
     fn mapped_child_clip_rects_skips_inputonly_and_unmapped() {
         let mut state = ServerState::new();
