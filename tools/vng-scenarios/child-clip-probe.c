@@ -21,7 +21,8 @@
  * plus the GraphicsExpose and NoExpose events a CopyArea produced.
  * Nothing outside C, or under H, may change.
  *
- *   cc -O1 -o probe child-clip-probe.c -lxcb -lxcb-composite -lxcb-render -lxcb-shape -lxcb-shm
+ *   cc -O1 -o probe child-clip-probe.c -lxcb -lxcb-composite -lxcb-damage \
+ *      -lxcb-render -lxcb-shape -lxcb-shm -lxcb-xfixes
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,10 +31,12 @@
 #include <sys/shm.h>
 #include <unistd.h>
 #include <xcb/composite.h>
+#include <xcb/damage.h>
 #include <xcb/render.h>
 #include <xcb/shape.h>
 #include <xcb/shm.h>
 #include <xcb/xcb.h>
+#include <xcb/xfixes.h>
 
 #define FRAME 0x202020u
 #define GRAY 0x3b3b3eu
@@ -55,6 +58,7 @@ static xcb_colormap_t cmap32;
 static xcb_render_pictformat_t fmt32;
 static xcb_window_t f, t, cw, b, h, v;
 static xcb_window_t g, cg, vg;
+
 static int redirect;
 
 static void sync_server(void)
@@ -132,6 +136,59 @@ static void events(void)
     }
 }
 
+/* A frame watched as xfwm4 watches its frames: whether its damage since
+ * the last report covers every pixel of it that changed since then. A
+ * compositor repaints only what it is told; more damage than change is
+ * allowed. The damage is reset. */
+struct watch {
+    xcb_damage_damage_t damage;
+    xcb_xfixes_region_t parts;
+    uint32_t prev[FW * FH];
+    int valid;
+};
+static struct watch f_watch, g_watch;
+
+static void watch_frame(struct watch *w, xcb_window_t frame)
+{
+    w->damage = xcb_generate_id(c);
+    xcb_damage_create(c, w->damage, frame, XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY);
+    w->parts = xcb_generate_id(c);
+    xcb_xfixes_create_region(c, w->parts, 0, NULL);
+    w->valid = 0;
+}
+
+static void report_damage(struct watch *w, const uint32_t *img)
+{
+    xcb_damage_subtract(c, w->damage, XCB_NONE, w->parts);
+    xcb_xfixes_fetch_region_reply_t *r =
+        xcb_xfixes_fetch_region_reply(c, xcb_xfixes_fetch_region(c, w->parts), NULL);
+    if (!r)
+        return;
+    xcb_rectangle_t *rects = xcb_xfixes_fetch_region_rectangles(r);
+    int n = xcb_xfixes_fetch_region_rectangles_length(r);
+    int missed = 0;
+    for (int py = 0; py < FH && w->valid; py++)
+        for (int px = 0; px < FW; px++) {
+            if ((img[py * FW + px] & 0xffffff) == (w->prev[py * FW + px] & 0xffffff))
+                continue;
+            int in = 0;
+            for (int i = 0; i < n && !in; i++)
+                in = px >= rects[i].x && px < rects[i].x + rects[i].width &&
+                     py >= rects[i].y && py < rects[i].y + rects[i].height;
+            missed += !in;
+        }
+    free(r);
+    int report = w->valid;
+    memcpy(w->prev, img, sizeof w->prev);
+    w->valid = 1;
+    if (!report)
+        return;
+    if (missed)
+        printf("  damage misses %d changed pixels\n", missed);
+    else
+        printf("  damage covers every change\n");
+}
+
 static xcb_get_image_reply_t *read_frame(xcb_window_t frame, int root_y)
 {
     xcb_drawable_t d = s->root;
@@ -186,6 +243,7 @@ static void report(const char *when)
     printf("\n  y=137:");
     runs(img, 0, 137, 5, 0, FW / 5);
     printf("\n");
+    report_damage(&f_watch, img);
     free(r);
     events();
     fflush(stdout);
@@ -340,17 +398,23 @@ static void report_g(const char *when)
     printf("\n  y=105:");
     runs(img, 0, 105, 5, 0, FW / 5);
     printf("\n");
+    report_damage(&g_watch, img);
     free(r);
     events();
     fflush(stdout);
 }
 
-static void scroll_viewport(int y, const char *when)
+/* Scroll VG to `y`: moved then reshaped, or reshaped first as GDK does
+ * (`shape_first`), which covers CG's buttons until the move. */
+static void scroll_viewport(int y, int shape_first, const char *when)
 {
     char line[96];
     uint32_t v32 = (uint32_t)y;
+    if (shape_first)
+        viewport_shape(10 - y);
     xcb_configure_window(c, vg, XCB_CONFIG_WINDOW_Y, &v32);
-    viewport_shape(10 - y);
+    if (!shape_first)
+        viewport_shape(10 - y);
     snprintf(line, sizeof line, "VG: %s", when);
     report_g(line);
     sync_server();
@@ -375,6 +439,8 @@ int main(int argc, char **argv)
     s = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
     free(xcb_composite_query_version_reply(c, xcb_composite_query_version(c, 0, 4), NULL));
     free(xcb_render_query_version_reply(c, xcb_render_query_version(c, 0, 11), NULL));
+    free(xcb_damage_query_version_reply(c, xcb_damage_query_version(c, 1, 1), NULL));
+    free(xcb_xfixes_query_version_reply(c, xcb_xfixes_query_version(c, 5, 0), NULL));
     if (redirect)
         xcb_composite_redirect_subwindows(c, s->root, XCB_COMPOSITE_REDIRECT_MANUAL);
     find_argb();
@@ -387,6 +453,7 @@ int main(int argc, char **argv)
     v = window(cw, 100, 10, 80, 120, BLUE);
     sync_server();
     usleep(300000);
+    watch_frame(&f_watch, f);
     reset();
     report("reset");
 
@@ -518,9 +585,12 @@ int main(int argc, char **argv)
     uint32_t exposure = XCB_EVENT_MASK_EXPOSURE;
     xcb_change_window_attributes(c, cg, XCB_CW_EVENT_MASK, &exposure);
     xcb_change_window_attributes(c, vg, XCB_CW_EVENT_MASK, &exposure);
+    watch_frame(&g_watch, g);
     report_g("VG: viewport shaped to its top 60 rows, CG's buttons below it");
-    scroll_viewport(-20, "scrolled up 30");
-    scroll_viewport(10, "scrolled back down 30");
+    scroll_viewport(-20, 0, "scrolled up 30");
+    scroll_viewport(10, 0, "scrolled back down 30");
+    scroll_viewport(-20, 1, "reshaped, then scrolled up 30");
+    scroll_viewport(10, 1, "reshaped, then scrolled back down 30");
 
     FILE *done = fopen("PROBE-DONE", "w");
     if (done)

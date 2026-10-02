@@ -10,7 +10,7 @@
 set -u
 set +e
 src=${YSERVER_REPO:?}/tools/vng-scenarios/child-clip-probe.c
-cc -O1 -o probe "$src" -lxcb -lxcb-composite -lxcb-render -lxcb-shape -lxcb-shm > cc.log 2>&1 || cat cc.log >&2
+cc -O1 -o probe "$src" -lxcb -lxcb-composite -lxcb-damage -lxcb-render -lxcb-shape -lxcb-shm -lxcb-xfixes > cc.log 2>&1 || cat cc.log >&2
 ./probe direct > direct.log 2>&1 && mv PROBE-DONE DIRECT-DONE
 ./probe redirect > probe.log 2>&1
 cat direct.log probe.log
