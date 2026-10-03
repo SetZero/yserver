@@ -19,7 +19,7 @@ name = "yserver"
 path = "src/bin/yserver.rs"
 
 [dependencies]
-compositor-toolkit = { git = "https://github.com/SetZero/ferrix", rev = "7b4728aa043eb5ea2d6860a82c842e9e2b036b78", optional = true }
+compositor-toolkit = { git = "https://github.com/SetZero/ferrix", rev = "ec831a5f19396c097b1bceb103026ea03ddfaa2b", optional = true }
 ash.workspace = true
 crossbeam-channel.workspace = true
 drm.workspace = true
